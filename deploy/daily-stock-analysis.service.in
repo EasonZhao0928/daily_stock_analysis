@@ -1,0 +1,22 @@
+[Unit]
+Description=Daily Stock Analysis Web Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@APP_DIR@
+EnvironmentFile=-@APP_DIR@/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@APP_DIR@/.venv/bin/python @APP_DIR@/main.py --serve-only --host @SERVICE_HOST@ --port @SERVICE_PORT@
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
