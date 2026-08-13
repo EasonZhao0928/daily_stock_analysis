@@ -109,26 +109,28 @@ jobs:
           DEPLOY_SHA="$GITHUB_SHA"
           BUNDLE_PATH="$RUNNER_TEMP/daily-stock-analysis-${DEPLOY_SHA}.bundle"
           REMOTE_BUNDLE="/tmp/daily-stock-analysis-${DEPLOY_SHA}.bundle"
+          DEPLOY_REF="refs/deploy/personal"
 
           REMOTE_SHA="$("${SSH[@]}" "$REMOTE" "git -C '$DEPLOY_PATH' rev-parse personal")"
           if [ "$REMOTE_SHA" != "$DEPLOY_SHA" ]; then
             git cat-file -e "${DEPLOY_SHA}^{commit}"
             git merge-base --is-ancestor "$REMOTE_SHA" "$DEPLOY_SHA"
-            # A merge commit can occasionally be reported as an empty
-            # incremental bundle when the server already contains the merged
-            # feature history. Fall back to a complete bundle for that case.
-            if ! git bundle create "$BUNDLE_PATH" "$DEPLOY_SHA" "^$REMOTE_SHA"; then
+            # git bundle requires a ref-like positive revision. GITHUB_SHA is
+            # a raw object ID, so materialize it as a temporary deployment ref
+            # before creating the incremental bundle.
+            git update-ref "$DEPLOY_REF" "$DEPLOY_SHA"
+            if ! git bundle create "$BUNDLE_PATH" "$DEPLOY_REF" "^$REMOTE_SHA"; then
               rm -f "$BUNDLE_PATH"
-              git bundle create "$BUNDLE_PATH" "$DEPLOY_SHA"
+              git bundle create "$BUNDLE_PATH" "$DEPLOY_REF"
             fi
             git bundle verify "$BUNDLE_PATH"
             "${SCP[@]}" "$BUNDLE_PATH" "$REMOTE:$REMOTE_BUNDLE"
             "${SSH[@]}" "$REMOTE" \
               "git bundle verify '$REMOTE_BUNDLE' >/dev/null && \
-               git -C '$DEPLOY_PATH' fetch '$REMOTE_BUNDLE' '$DEPLOY_SHA' && \
+               git -C '$DEPLOY_PATH' fetch '$REMOTE_BUNDLE' '$DEPLOY_REF' && \
                test \"\$(git -C '$DEPLOY_PATH' rev-parse FETCH_HEAD)\" = '$DEPLOY_SHA' && \
                git -C '$DEPLOY_PATH' switch personal && \
-               git -C '$DEPLOY_PATH' merge --ff-only '$DEPLOY_SHA' && \
+               git -C '$DEPLOY_PATH' merge --ff-only FETCH_HEAD && \
                rm -f '$REMOTE_BUNDLE'"
           fi
 
