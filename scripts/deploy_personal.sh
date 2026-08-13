@@ -7,7 +7,9 @@ APP_DIR="${APP_DIR:-/opt/trading-projects/code/daily_stock_analysis}"
 SERVICE_NAME="${SERVICE_NAME:-daily-stock-analysis}"
 SERVICE_HOST="${SERVICE_HOST:-127.0.0.1}"
 SERVICE_PORT="${SERVICE_PORT:-8000}"
-PIP_INDEX="${PIP_INDEX:-https://pypi.org/simple}"
+# The server's outbound route to pypi.org is bandwidth-constrained; use a
+# HTTPS mirror by default. Override PIP_INDEX when deploying elsewhere.
+PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 
 cd "$APP_DIR"
 
