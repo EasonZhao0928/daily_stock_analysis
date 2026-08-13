@@ -1,0 +1,132 @@
+name: Deploy personal
+
+on:
+  pull_request:
+    branches: [personal]
+  push:
+    branches: [personal]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-personal
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_PATH: /opt/trading-projects/code/daily_stock_analysis
+
+jobs:
+  verify:
+    name: Verify backend and web
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            .github/requirements-ci.txt
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/dsa-web/package-lock.json
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          for attempt in 1 2 3; do
+            if python -m pip install -r .github/requirements-ci.txt; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Dependency installation failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: Backend checks
+        run: |
+          ./scripts/ci_gate.sh syntax
+          ./scripts/ci_gate.sh flake8
+          ./scripts/ci_gate.sh deterministic
+
+      - name: Install web dependencies
+        run: npm ci --prefix apps/dsa-web
+
+      - name: Web checks
+        run: |
+          npm run lint --prefix apps/dsa-web
+          npm run build --prefix apps/dsa-web
+          test -s static/index.html
+
+  deploy:
+    name: Deploy personal to server
+    needs: verify
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/personal'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_KEY" || { echo "Missing DEPLOY_SSH_KEY" >&2; exit 1; }
+          test -n "$DEPLOY_KNOWN_HOSTS" || { echo "Missing DEPLOY_KNOWN_HOSTS" >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+
+      - name: Transfer commit and deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          test -n "$DEPLOY_HOST" || { echo "Missing DEPLOY_HOST" >&2; exit 1; }
+          test -n "$DEPLOY_USER" || { echo "Missing DEPLOY_USER" >&2; exit 1; }
+          set -euo pipefail
+          SSH=(ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes)
+          SCP=(scp -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes)
+          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
+          DEPLOY_SHA="$GITHUB_SHA"
+          BUNDLE_PATH="$RUNNER_TEMP/daily-stock-analysis-${DEPLOY_SHA}.bundle"
+          REMOTE_BUNDLE="/tmp/daily-stock-analysis-${DEPLOY_SHA}.bundle"
+
+          REMOTE_SHA="$("${SSH[@]}" "$REMOTE" "git -C '$DEPLOY_PATH' rev-parse personal")"
+          if [ "$REMOTE_SHA" != "$DEPLOY_SHA" ]; then
+            git cat-file -e "${DEPLOY_SHA}^{commit}"
+            git merge-base --is-ancestor "$REMOTE_SHA" "$DEPLOY_SHA"
+            git bundle create "$BUNDLE_PATH" "$DEPLOY_SHA" "^$REMOTE_SHA"
+            git bundle verify "$BUNDLE_PATH"
+            "${SCP[@]}" "$BUNDLE_PATH" "$REMOTE:$REMOTE_BUNDLE"
+            "${SSH[@]}" "$REMOTE" \
+              "git bundle verify '$REMOTE_BUNDLE' >/dev/null && \
+               git -C '$DEPLOY_PATH' fetch '$REMOTE_BUNDLE' '$DEPLOY_SHA' && \
+               test \"\$(git -C '$DEPLOY_PATH' rev-parse FETCH_HEAD)\" = '$DEPLOY_SHA' && \
+               git -C '$DEPLOY_PATH' switch personal && \
+               git -C '$DEPLOY_PATH' merge --ff-only '$DEPLOY_SHA' && \
+               rm -f '$REMOTE_BUNDLE'"
+          fi
+
+          "${SSH[@]}" "$REMOTE" \
+            "cd '$DEPLOY_PATH' && APP_DIR='$DEPLOY_PATH' SERVICE_USER='$DEPLOY_USER' bash scripts/deploy_personal.sh"
+          "${SSH[@]}" "$REMOTE" \
+            "curl -fsS --max-time 10 http://127.0.0.1:8000/api/health"
