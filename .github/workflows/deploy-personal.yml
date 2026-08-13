@@ -103,8 +103,8 @@ jobs:
           test -n "$DEPLOY_HOST" || { echo "Missing DEPLOY_HOST" >&2; exit 1; }
           test -n "$DEPLOY_USER" || { echo "Missing DEPLOY_USER" >&2; exit 1; }
           set -euo pipefail
-          SSH=(ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes)
-          SCP=(scp -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes)
+          SSH=(ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
+          SCP=(scp -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
           REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
           DEPLOY_SHA="$GITHUB_SHA"
           BUNDLE_PATH="$RUNNER_TEMP/daily-stock-analysis-${DEPLOY_SHA}.bundle"
