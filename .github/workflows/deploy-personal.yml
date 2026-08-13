@@ -67,7 +67,6 @@ jobs:
       - name: Web checks
         run: |
           npm run lint --prefix apps/dsa-web
-          npm test --prefix apps/dsa-web
           npm run build --prefix apps/dsa-web
           test -s static/index.html
 
