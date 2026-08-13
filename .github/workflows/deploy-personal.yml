@@ -114,7 +114,13 @@ jobs:
           if [ "$REMOTE_SHA" != "$DEPLOY_SHA" ]; then
             git cat-file -e "${DEPLOY_SHA}^{commit}"
             git merge-base --is-ancestor "$REMOTE_SHA" "$DEPLOY_SHA"
-            git bundle create "$BUNDLE_PATH" "$DEPLOY_SHA" "^$REMOTE_SHA"
+            # A merge commit can occasionally be reported as an empty
+            # incremental bundle when the server already contains the merged
+            # feature history. Fall back to a complete bundle for that case.
+            if ! git bundle create "$BUNDLE_PATH" "$DEPLOY_SHA" "^$REMOTE_SHA"; then
+              rm -f "$BUNDLE_PATH"
+              git bundle create "$BUNDLE_PATH" "$DEPLOY_SHA"
+            fi
             git bundle verify "$BUNDLE_PATH"
             "${SCP[@]}" "$BUNDLE_PATH" "$REMOTE:$REMOTE_BUNDLE"
             "${SSH[@]}" "$REMOTE" \
