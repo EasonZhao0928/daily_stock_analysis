@@ -79,6 +79,22 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
     "USE_PROXY",
     "PROXY_HOST",
     "PROXY_PORT",
+    # Personal WeChat iLink pairing is intentionally local/env-only.  The
+    # access token lives in Keychain/0600 credential storage, not Web UI state.
+    "WECHAT_CHANNEL_ENABLED",
+    "WECHAT_ILINK_BASE_URL",
+    "WECHAT_ILINK_TOKEN_REF",
+    "WECHAT_ALLOWLIST",
+    "WECHAT_POLL_TIMEOUT_MS",
+    # Integration rollout switches are process-start controls.  They remain
+    # explicit env/config inputs and are intentionally not editable from the
+    # generic Web settings form.
+    "PAPER_AUTO_MODE_ENABLED",
+    "EXTENDED_MARKET_DATA_ENABLED",
+    # Scheduled Paper decision cycles are a process-start control like the
+    # analysis scheduler itself, not a per-request Web setting.
+    "PAPER_SCHEDULER_ENABLED",
+    "PAPER_SCHEDULER_INTERVAL_MINUTES",
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import sqlite3
@@ -16,8 +17,18 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import QueuePool
 
 from src.agent.codex_tool_process import MAX_TOOL_RESULT_BYTES, CodexToolProcessRunner
+from src.agent.codex_app_server_transport import CodexAppServerTransport
+from src.agent.factory import get_tool_registry
 from src.agent.stock_scope import StockScope
+from src.agent.tool_surface import ToolSurface
 from src.agent.tools.execution import ToolAccessContext
+from src.agent.tools.registry import (
+    AGENT_CHAT_EXECUTION_PROFILE,
+    ToolDefinition,
+    ToolParameter,
+    ToolPolicy,
+    ToolRegistry,
+)
 
 
 def _ok_result(tool_name: str, payload: dict) -> dict:
@@ -30,6 +41,10 @@ def _ok_result(tool_name: str, payload: dict) -> dict:
         "audit": {},
         "diagnostics": {},
     }
+
+
+def _manifest_injected_echo(value: str) -> dict:
+    return {"source": "injected-registry", "value": value}
 
 
 def _escaped_result_worker(tool_name: str, arguments: dict, _context: ToolAccessContext) -> dict:
@@ -158,7 +173,10 @@ def test_three_production_tools_execute_through_spawned_worker(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "production-tools.db"))
-    runner = CodexToolProcessRunner()
+    runner = CodexToolProcessRunner(
+        tool_surface=ToolSurface(get_tool_registry()),
+        execution_profile=AGENT_CHAT_EXECUTION_PROFILE,
+    )
     cases = (
         (
             "get_analysis_context",
@@ -191,6 +209,157 @@ def test_three_production_tools_execute_through_spawned_worker(
     assert len(records) == 3
     assert all(record["alive_after"] is False for record in records)
     assert all(record["pid_alive_after"] is False for record in records)
+
+
+def test_injected_registry_manifest_is_used_and_unknown_tools_are_rejected() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="manifest_injected_echo",
+            description="Manifest injection probe.",
+            parameters=[
+                ToolParameter(name="value", type="string", description="Value"),
+            ],
+            handler=_manifest_injected_echo,
+            policy=ToolPolicy.declared(
+                read_only=True,
+                permissions=["research:read"],
+                cancellation_safe=True,
+            ),
+        )
+    )
+    runner = CodexToolProcessRunner(
+        tool_surface=ToolSurface(registry), execution_profile="research_readonly"
+    )
+    context = ToolAccessContext(
+        backend="codex_app_server",
+        deadline=time.monotonic() + 10,
+        max_result_bytes=MAX_TOOL_RESULT_BYTES,
+        redact_result=True,
+    )
+    try:
+        injected = runner.execute("manifest_injected_echo", {"value": "only-injected"}, context)
+        unknown = runner.execute("global_only_probe", {}, context)
+    finally:
+        runner.close()
+
+    assert injected["ok"] is True
+    assert json.loads(injected["result_text"]) == {
+        "source": "injected-registry",
+        "value": "only-injected",
+    }
+    assert unknown["ok"] is False
+    assert unknown["error"]["code"] == "tool_not_found"
+
+
+def test_default_process_runner_fails_closed_without_injected_registry() -> None:
+    runner = CodexToolProcessRunner()
+    try:
+        result = runner.execute(
+            "get_analysis_context",
+            {"stock_code": "600000"},
+            ToolAccessContext(deadline=time.monotonic() + 10),
+        )
+    finally:
+        runner.close()
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "tool_not_allowed"
+
+
+def test_transport_default_runner_carries_surface_manifest() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="manifest_transport_echo",
+            description="Transport manifest probe.",
+            parameters=[],
+            handler=_manifest_injected_echo,
+            policy=ToolPolicy.declared(read_only=True, cancellation_safe=True),
+        )
+    )
+    surface = ToolSurface(registry)
+    client = CodexAppServerTransport(
+        ["unused"],
+        tool_surface=surface,
+        tool_context=ToolAccessContext(),
+        execution_profile="research_readonly",
+    )
+    try:
+        manifest = client._tool_runner._registry_manifest
+        # The manifest carries the DSA Execution Profile, never the Codex
+        # sandbox permission profile ("dsa_gate_a"); conflating them silently
+        # disabled profile enforcement in the spawned worker.
+        assert manifest["execution_profile"] == "research_readonly"
+        assert [item["name"] for item in manifest["tools"]] == [
+            "manifest_transport_echo"
+        ]
+    finally:
+        client.close()
+
+
+def test_transport_never_puts_sandbox_permission_profile_in_manifest() -> None:
+    """A1 regression: the Codex sandbox profile is not a DSA ExecutionProfile.
+
+    Passing ``PERMISSION_PROFILE`` ("dsa_gate_a") through the manifest made the
+    child's ``ExecutionProfile.coerce`` fail, and the swallowed error left the
+    worker running with ``profile=None`` -- i.e. no profile enforcement at all.
+    """
+    from src.agent.codex_app_server_transport import PERMISSION_PROFILE
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="manifest_transport_echo",
+            description="Transport manifest probe.",
+            parameters=[],
+            handler=_manifest_injected_echo,
+            policy=ToolPolicy.declared(read_only=True, cancellation_safe=True),
+        )
+    )
+    client = CodexAppServerTransport(
+        ["unused"],
+        tool_surface=ToolSurface(registry),
+        tool_context=ToolAccessContext(),
+        tool_profile=PERMISSION_PROFILE,
+        execution_profile="research_readonly",
+    )
+    try:
+        manifest = client._tool_runner._registry_manifest
+        assert manifest["execution_profile"] != PERMISSION_PROFILE
+        assert manifest["execution_profile"] == "research_readonly"
+        # The sandbox profile stays on the transport, not in the tool manifest.
+        assert client.tool_profile == PERMISSION_PROFILE
+    finally:
+        client.close()
+
+
+def test_worker_fails_closed_on_unusable_execution_profile() -> None:
+    """A1 regression: an unusable profile must deny, never run unprofiled."""
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="manifest_transport_echo",
+            description="Transport manifest probe.",
+            parameters=[],
+            handler=_manifest_injected_echo,
+            policy=ToolPolicy.declared(read_only=True, cancellation_safe=True),
+        )
+    )
+    surface = ToolSurface(registry)
+
+    for bad_profile in ("dsa_gate_a", None):
+        runner = CodexToolProcessRunner(tool_surface=surface, execution_profile=bad_profile)
+        context = ToolAccessContext(
+            backend="codex_app_server",
+            deadline=time.monotonic() + 10,
+        )
+        try:
+            result = runner.execute("manifest_transport_echo", {}, context)
+        finally:
+            runner.close()
+        assert result["ok"] is False, bad_profile
+        assert result["error"]["code"] == "invalid_profile", bad_profile
 
 
 def test_running_sqlite_query_is_cancelled_and_reaped_three_times(tmp_path: Path) -> None:
@@ -282,6 +451,8 @@ def test_pool_wait_honors_deadline_and_releases_worker(tmp_path: Path) -> None:
     assert result["error"]["code"] == "timeout"
     assert 1.3 <= time.monotonic() - started < 3
     assert runner.snapshot()[-1]["pid_alive_after"] is False
+    assert result["audit"]["error_code"] == "timeout"
+    assert result["diagnostics"]["redacted"] is True
     verifier = sqlite3.connect(db_path, timeout=2)
     verifier.close()
 
@@ -320,6 +491,8 @@ def test_pre_cancelled_call_never_spawns_worker() -> None:
 
     assert result["error"]["code"] == "cancelled"
     assert runner.snapshot() == ()
+    assert result["audit"]["error_code"] == "cancelled"
+    assert result["diagnostics"]["redacted"] is True
 
 
 def test_ipc_limit_is_measured_on_raw_result_bytes_not_json_escaping() -> None:
@@ -350,6 +523,8 @@ def test_ipc_reports_output_too_large_for_raw_result_over_limit() -> None:
 
     assert result["ok"] is False
     assert result["error"]["code"] == "output_too_large"
+    assert result["audit"]["error_code"] == "output_too_large"
+    assert result["diagnostics"]["redacted"] is True
 
 
 def test_ipc_rejects_tool_surface_truncation_as_output_too_large() -> None:

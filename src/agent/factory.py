@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 # Module-level caches
 # ---------------------------------------------------------------------------
 _TOOL_REGISTRY = None
+_PAPER_TOOL_REGISTRY = None
 _SKILL_MANAGER_PROTOTYPE = None
 # Sentinel used as initial value so None (i.e. no custom dir) compares as "changed"
 # on the very first call, forcing a build rather than accidentally skipping it.
@@ -57,6 +58,7 @@ class SkillPromptState:
     skill_instructions: str
     default_skill_policy: str
     technical_skill_policy: str
+    capability_diagnostics: List[dict] = None
 
 
 def _coerce_config_int(raw_value: object, default: int, *, field_name: str | None = None) -> int:
@@ -202,14 +204,64 @@ def get_tool_registry():
     from src.agent.tools.search_tools import ALL_SEARCH_TOOLS
     from src.agent.tools.market_tools import ALL_MARKET_TOOLS
     from src.agent.tools.backtest_tools import ALL_BACKTEST_TOOLS
+    from src.agent.tools.extended_data_tools import ALL_EXTENDED_DATA_TOOLS
 
     registry = ToolRegistry()
-    for tool_fn in ALL_DATA_TOOLS + ALL_ANALYSIS_TOOLS + ALL_SEARCH_TOOLS + ALL_MARKET_TOOLS + ALL_BACKTEST_TOOLS:
+    for tool_fn in (
+        ALL_DATA_TOOLS
+        + ALL_ANALYSIS_TOOLS
+        + ALL_SEARCH_TOOLS
+        + ALL_MARKET_TOOLS
+        + ALL_BACKTEST_TOOLS
+        # Tasks 5.2-5.4 capabilities.  They report `upstream_blocked` while
+        # EXTENDED_MARKET_DATA_ENABLED is off, which is what design 3 wants:
+        # visible-but-unavailable beats a skill quietly faking the data.
+        + ALL_EXTENDED_DATA_TOOLS
+    ):
         registry.register(tool_fn)
 
     _TOOL_REGISTRY = registry
     logger.info("[AgentFactory] ToolRegistry cached (%d tools)", len(registry._tools) if hasattr(registry, "_tools") else -1)
     return _TOOL_REGISTRY
+
+
+def get_paper_tool_registry():
+    """Return the Paper-capable registry without changing the 18-tool default.
+
+    Paper tools are opt-in because they are proposal/approval capabilities,
+    not ordinary research tools.  The returned registry includes the normal
+    research/data tools plus the explicitly profiled Paper tools.
+    """
+
+    global _PAPER_TOOL_REGISTRY
+    if _PAPER_TOOL_REGISTRY is not None:
+        return _PAPER_TOOL_REGISTRY
+
+    from src.agent.tools.registry import ToolRegistry
+    from src.agent.tools.paper_tools import ALL_PAPER_TOOLS
+
+    registry = ToolRegistry()
+    for tool_def in get_tool_registry().list_tools():
+        registry.register(tool_def)
+    for tool_def in ALL_PAPER_TOOLS:
+        registry.register(tool_def)
+    _PAPER_TOOL_REGISTRY = registry
+    logger.info(
+        "[AgentFactory] Paper ToolRegistry cached (%d tools)",
+        len(registry._tools) if hasattr(registry, "_tools") else -1,
+    )
+    return _PAPER_TOOL_REGISTRY
+
+
+def get_tool_registry_for_profile(profile):
+    """Resolve the opt-in registry for a serialized Execution Profile."""
+
+    from src.agent.tools.registry import ExecutionProfile
+
+    normalized = ExecutionProfile.coerce(profile)
+    if normalized in {ExecutionProfile.PAPER_PROPOSAL, ExecutionProfile.PAPER_APPROVAL}:
+        return get_paper_tool_registry()
+    return get_tool_registry()
 
 
 def get_skill_manager(config=None):
@@ -254,7 +306,13 @@ def get_skill_manager(config=None):
     return copy.deepcopy(_SKILL_MANAGER_PROTOTYPE)
 
 
-def resolve_skill_prompt_state(config=None, skills: Optional[List[str]] = None) -> SkillPromptState:
+def resolve_skill_prompt_state(
+    config=None,
+    skills: Optional[List[str]] = None,
+    *,
+    tool_surface=None,
+    profile: str = "research_readonly",
+) -> SkillPromptState:
     """Resolve active skills and prompt fragments for analyzer / agent entrypoints."""
     if config is None:
         from src.config import get_config
@@ -293,6 +351,29 @@ def resolve_skill_prompt_state(config=None, skills: Optional[List[str]] = None) 
         skill_catalog=skill_catalog,
     )
 
+    capability_diagnostics: List[dict] = []
+    if tool_surface is not None:
+        # Avoid imposing a validation requirement on legacy test doubles and
+        # external callers that only use prompt discovery. Factory-created
+        # ToolSurface instances always use the canonical ToolRegistry.
+        from src.agent.tools.registry import ToolRegistry
+
+        registry = getattr(tool_surface, "_registry", None)
+        if isinstance(registry, ToolRegistry):
+            validated: List[str] = []
+            for skill_id in skills_to_activate:
+                decision = skill_manager.validate_required_tools(skill_id, tool_surface, profile)
+                capability_diagnostics.append(decision)
+                if decision.get("available"):
+                    validated.append(skill_id)
+                else:
+                    logger.warning(
+                        "[AgentFactory] Skill unavailable and hidden: %s (%s)",
+                        skill_id,
+                        decision.get("reason"),
+                    )
+            skills_to_activate = validated
+
     skill_manager.activate(skills_to_activate)
     logger.info("[AgentFactory] Activated skills: %s", skills_to_activate)
 
@@ -308,6 +389,7 @@ def resolve_skill_prompt_state(config=None, skills: Optional[List[str]] = None) 
         technical_skill_policy=get_default_technical_skill_policy(
             explicit_skill_selection=not use_legacy_default_prompt,
         ),
+        capability_diagnostics=capability_diagnostics,
     )
 
 
@@ -337,7 +419,10 @@ def build_agent_executor(config=None, skills: Optional[List[str]] = None):
     from src.agent.llm_adapter import LLMToolAdapter
 
     registry = get_tool_registry()
-    prompt_state = resolve_skill_prompt_state(config, skills=skills)
+    from src.agent.tool_surface import ToolSurface
+    from src.agent.tools.registry import AGENT_CHAT_EXECUTION_PROFILE
+    tool_surface = ToolSurface(registry, default_profile=AGENT_CHAT_EXECUTION_PROFILE)
+    prompt_state = resolve_skill_prompt_state(config, skills=skills, tool_surface=tool_surface)
     skill_manager = prompt_state.skill_manager
     logger.info(
         "[AgentFactory] Resolved skill prompt state: skills=%s (arch=%s, explicit=%s, legacy_default_prompt=%s)",
@@ -359,12 +444,13 @@ def build_agent_executor(config=None, skills: Optional[List[str]] = None):
         )
 
     from src.agent.executor import AgentExecutor
+    from src.agent.tool_surface import ToolSurface
     # Intentionally do not mutate config routing fields here. We only coerce
     # execution params (max_steps/timeout_seconds) from config values; provider,
     # model, base URL and channel routes stay unchanged and are consumed by
     # downstream adapter logic as-is.
     return AgentExecutor(
-        tool_registry=registry,
+        tool_registry=tool_surface,
         llm_adapter=llm_adapter,
         skill_instructions=prompt_state.skill_instructions,
         default_skill_policy=prompt_state.default_skill_policy,
@@ -407,18 +493,21 @@ def build_agent_chat_executor(config=None, skills: Optional[List[str]] = None):
         return build_agent_executor(config, skills=skills)
 
     registry = get_tool_registry()
-    prompt_state = resolve_skill_prompt_state(config, skills=skills)
+    from src.agent.tool_surface import ToolSurface
+    from src.agent.tools.registry import AGENT_CHAT_EXECUTION_PROFILE
+
+    tool_surface = ToolSurface(registry, default_profile=AGENT_CHAT_EXECUTION_PROFILE)
+    prompt_state = resolve_skill_prompt_state(config, skills=skills, tool_surface=tool_surface)
     if backend_id == "litellm":
         from src.agent.llm_adapter import LLMToolAdapter
 
         context_llm_adapter = LLMToolAdapter(config)
-        backend = LiteLLMAgentBackend(registry, context_llm_adapter)
+        backend = LiteLLMAgentBackend(tool_surface, context_llm_adapter)
     else:
         from src.agent.codex_agent_backend import CodexAgentBackend
-        from src.agent.tool_surface import ToolSurface
 
         context_llm_adapter = None
-        backend = CodexAgentBackend(ToolSurface(registry), config)
+        backend = CodexAgentBackend(tool_surface, config)
 
     return AgentChatExecutor(
         backend=backend,

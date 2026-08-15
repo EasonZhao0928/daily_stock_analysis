@@ -18,6 +18,7 @@ _NEWS_READ_POLICY = ToolPolicy.declared(
     side_effects=["network_read", "db_write_cache"],
     permissions=["news:read"],
     scope_dimensions=["stock"],
+    cancellation_safe=True,
 )
 _INTEL_READ_POLICY = ToolPolicy.declared(
     read_only=True,

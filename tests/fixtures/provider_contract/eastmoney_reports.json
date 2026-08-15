@@ -1,0 +1,24 @@
+{
+  "capability": "research_reports",
+  "captured_at": "2026-08-14T00:00:00Z",
+  "fixture_id": "eastmoney-reports-600519-v1",
+  "schema_fingerprint": "6e576d03f62364a839fd4a439454bb7b4e06ee3b4bc7fef356f2dd6c14676cf1",
+  "metadata": {
+    "redacted": true,
+    "source_domain": "eastmoney.com"
+  },
+  "network": false,
+  "payload": [
+    {
+      "attachPages": 18,
+      "emRatingName": "增持",
+      "infoCode": "redacted-report-001",
+      "orgSName": "示例证券",
+      "predictThisYearEps": 2.10,
+      "publishDate": "2026-08-13T00:00:00",
+      "title": "贵州茅台：经营质量跟踪（脱敏）"
+    }
+  ],
+  "provider": "eastmoney",
+  "source_tier": "primary"
+}

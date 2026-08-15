@@ -18,12 +18,19 @@ _MARKET_READ_POLICY = ToolPolicy.declared(
     side_effects=["network_read"],
     permissions=["market_data:read"],
 )
+_MARKET_INDEX_POLICY = ToolPolicy.declared(
+    read_only=True,
+    side_effects=["network_read"],
+    permissions=["market_data:read"],
+    cancellation_safe=True,
+)
 
 
 def _get_fetcher_manager():
     """Lazy import to avoid circular deps."""
-    from data_provider import DataFetcherManager
-    return DataFetcherManager()
+    from data_provider.runtime import get_market_data_manager
+
+    return get_market_data_manager()
 
 
 # ============================================================
@@ -61,7 +68,7 @@ get_market_indices_tool = ToolDefinition(
     ],
     handler=_handle_get_market_indices,
     category="market",
-    policy=_MARKET_READ_POLICY,
+    policy=_MARKET_INDEX_POLICY,
 )
 
 

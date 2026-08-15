@@ -16,9 +16,11 @@ const TITLES: Record<string, { title: UiTextKey; description: UiTextKey }> = {
   '/': { title: 'layout.route.home.title', description: 'layout.route.home.description' },
   '/chat': { title: 'layout.route.chat.title', description: 'layout.route.chat.description' },
   '/portfolio': { title: 'layout.route.portfolio.title', description: 'layout.route.portfolio.description' },
+  '/paper-workbench': { title: 'layout.route.paperWorkbench.title', description: 'layout.route.paperWorkbench.description' },
   '/screening': { title: 'layout.route.screening.title', description: 'layout.route.screening.description' },
   '/backtest': { title: 'layout.route.backtest.title', description: 'layout.route.backtest.description' },
   '/alerts': { title: 'layout.route.alerts.title', description: 'layout.route.alerts.description' },
+  '/shadow': { title: 'layout.route.shadow.title', description: 'layout.route.shadow.description' },
   '/usage': { title: 'layout.route.usage.title', description: 'layout.route.usage.description' },
   '/settings': { title: 'layout.route.settings.title', description: 'layout.route.settings.description' },
 };

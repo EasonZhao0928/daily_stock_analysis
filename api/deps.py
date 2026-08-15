@@ -69,6 +69,13 @@ def get_agent_chat_session_service() -> AgentChatSessionService:
     return AgentChatSessionService(DatabaseManager.get_instance())
 
 
+def get_codex_account_service():
+    """Return the process-scoped Codex account control service."""
+    from src.services.codex_account_service import CodexAccountService
+
+    return CodexAccountService.get_instance(get_config())
+
+
 def get_system_config_service(request: Request) -> SystemConfigService:
     """Get app-lifecycle shared SystemConfigService instance."""
     service = getattr(request.app.state, "system_config_service", None)

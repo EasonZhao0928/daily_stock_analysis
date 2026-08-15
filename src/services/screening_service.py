@@ -37,6 +37,9 @@ from src.services.screening.pipeline import screen as run_screening_pipeline
 from src.services.screening.source_guard import parse_source_timeout_seconds
 from src.services.screening.strategy import list_strategies as load_screening_strategies
 from src.storage import DatabaseManager
+from data_provider.supplier_runtime import get_supplier_runtime_registry
+from data_provider.eastmoney_client import BOARD_LIST_URL, EastMoneyClient
+from data_provider.screening_sources import akshare_screening_call, fetch_ths_constituents
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +80,6 @@ DSA_SCREENING_HOTSPOT_CONNECTIVITY_ERROR_MARKERS = (
     "protocolerror",
     "incompleteread",
 )
-_DSA_FETCHER_MANAGER_LOCK = threading.RLock()
-_DSA_FETCHER_MANAGER: Any = None
 _FUNDAMENTAL_BLOCKS = ("valuation", "growth", "earnings", "institution", "capital_flow", "boards")
 _SCREENING_LITELLM_COMPLETION_ROUTES: ContextVar[Optional[Tuple[Dict[str, Any], ...]]] = ContextVar(
     "screening_litellm_completion_routes",
@@ -1962,7 +1963,7 @@ class DsaEastMoneyHotspotProvider:
     """Minimal EastMoney board provider for Screening hotspot scoring."""
 
     _screening_source_calls_bounded = True
-    _BASE_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+    _BASE_URL = BOARD_LIST_URL
     _AKSHARE_CALL_TIMEOUT_SECONDS = 4.0
     _CONSTITUENT_HTTP_TIMEOUT = (1.0, 2.0)
     _CONSTITUENT_WORKER_SLOTS = threading.BoundedSemaphore(4)
@@ -2067,15 +2068,14 @@ class DsaEastMoneyHotspotProvider:
     }
 
     def __init__(self) -> None:
-        import requests
-
         self._board_changes_raw_cache: Any = None
         self._board_changes_frame_cache: Any = None
         self._constituent_cache: Dict[Tuple[str, str], Any] = {}
-        self._session = requests.Session()
-        self._request_lock = threading.RLock()
-        self._last_request_ts = 0.0
-        self._min_request_interval = 0.25
+        # EastMoney is shared with snapshot/data-provider callers.  Keep the
+        # session reference on the provider for test injection and diagnostics,
+        # but do not create a provider-local lock or timestamp gate.
+        self._eastmoney_client = EastMoneyClient(runtime=get_supplier_runtime_registry())
+        self._session = self._eastmoney_client.session
 
     @contextmanager
     def _source_call_budget(self) -> Iterator[None]:
@@ -2130,15 +2130,9 @@ class DsaEastMoneyHotspotProvider:
         time.sleep(seconds)
 
     def _eastmoney_get_once(self, url: str, **kwargs: Any) -> Any:
-        with self._request_lock:
-            elapsed = time.monotonic() - self._last_request_ts
-            if elapsed < self._min_request_interval:
-                self._sleep_within_source_budget(self._min_request_interval - elapsed)
-            kwargs["timeout"] = self._http_timeout()
-            try:
-                return self._session.get(url, **kwargs)
-            finally:
-                self._last_request_ts = time.monotonic()
+        kwargs["timeout"] = self._http_timeout()
+        remaining = self._remaining_source_timeout(sum(self._CONSTITUENT_HTTP_TIMEOUT))
+        return self._eastmoney_client.get(url, lease_timeout=remaining, **kwargs)
 
     def _eastmoney_get(self, url: str, **kwargs: Any) -> Any:
         """Retry short-lived EastMoney failures without extending each socket wait."""
@@ -2418,15 +2412,11 @@ class DsaEastMoneyHotspotProvider:
         return frame.copy()
 
     def _fetch_board_changes_raw(self) -> Any:
-        import akshare as ak
-        from data_provider.akshare_fetcher import _akshare_call_with_timeout
-
         if self._board_changes_raw_cache is not None:
             return self._board_changes_raw_cache.copy()
-        df = _akshare_call_with_timeout(
-            ak.stock_board_change_em,
+        df = akshare_screening_call(
+            "stock_board_change_em",
             timeout=self._akshare_timeout_seconds(),
-            call_name="screening.stock_board_change_em",
         )
         self._board_changes_raw_cache = df
         return df.copy() if df is not None else df
@@ -2687,14 +2677,10 @@ class DsaEastMoneyHotspotProvider:
         return sorted(events, key=lambda item: item["count"], reverse=True)
 
     def _fetch_ths_summary_event(self, topic: str) -> str:
-        import akshare as ak
-        from data_provider.akshare_fetcher import _akshare_call_with_timeout
-
         try:
-            df = _akshare_call_with_timeout(
-                ak.stock_board_concept_summary_ths,
+            df = akshare_screening_call(
+                "stock_board_concept_summary_ths",
                 timeout=self._akshare_timeout_seconds(),
-                call_name="screening.stock_board_concept_summary_ths",
             )
         except Exception:
             return ""
@@ -2711,15 +2697,11 @@ class DsaEastMoneyHotspotProvider:
         return f"{date}：{event}" if date and event else event
 
     def _fetch_ths_info(self, topic: str) -> Dict[str, str]:
-        import akshare as ak
-        from data_provider.akshare_fetcher import _akshare_call_with_timeout
-
         try:
-            df = _akshare_call_with_timeout(
-                ak.stock_board_concept_info_ths,
+            df = akshare_screening_call(
+                "stock_board_concept_info_ths",
                 symbol=topic,
                 timeout=self._akshare_timeout_seconds(),
-                call_name="screening.stock_board_concept_info_ths",
             )
         except Exception:
             return {}
@@ -2732,47 +2714,20 @@ class DsaEastMoneyHotspotProvider:
         }
 
     def _fetch_eastmoney_constituents(self, topic: str, *, source: str) -> Any:
-        import akshare as ak
-        from data_provider.akshare_fetcher import _akshare_call_with_timeout
-
-        fetch = (
-            ak.stock_board_industry_cons_em
-            if source == "industry"
-            else ak.stock_board_concept_cons_em
-        )
-        return _akshare_call_with_timeout(
-            fetch,
+        function_name = "stock_board_industry_cons_em" if source == "industry" else "stock_board_concept_cons_em"
+        return akshare_screening_call(
+            function_name,
             symbol=topic,
             timeout=self._akshare_timeout_seconds(),
-            call_name=f"screening.{fetch.__name__}",
         )
 
     def _fetch_ths_constituents(self, topic: str) -> Any:
         import pandas as pd
-        import requests
 
         code = self._resolve_ths_concept_code(topic)
         if not code:
             return pd.DataFrame()
-        response = requests.get(
-            f"https://q.10jqka.com.cn/gn/detail/code/{code}/",
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://q.10jqka.com.cn/gn/"},
-            timeout=self._http_timeout(),
-        )
-        response.raise_for_status()
-        html = response.content.decode("gbk", "ignore")
-        rows = []
-        seen = set()
-        for match in re.finditer(r">(\d{6})<.*?>([^<>\n]{2,12})<", html, re.S):
-            code_text = match.group(1)
-            name_text = re.sub(r"\s+", "", match.group(2))
-            if code_text in seen or not name_text or re.search(r"\d", name_text):
-                continue
-            seen.add(code_text)
-            rows.append({"code": code_text, "name": name_text})
-            if len(rows) >= 80:
-                break
-        return pd.DataFrame(rows)
+        return fetch_ths_constituents(code, timeout=self._http_timeout())
 
     def _resolve_ths_concept_code(self, topic: str) -> str:
         df = self._fetch_ths_concept_names()
@@ -2795,13 +2750,9 @@ class DsaEastMoneyHotspotProvider:
         return ""
 
     def _fetch_ths_concept_names(self) -> Any:
-        import akshare as ak
-        from data_provider.akshare_fetcher import _akshare_call_with_timeout
-
-        return _akshare_call_with_timeout(
-            ak.stock_board_concept_name_ths,
+        return akshare_screening_call(
+            "stock_board_concept_name_ths",
             timeout=self._akshare_timeout_seconds(),
-            call_name="screening.stock_board_concept_name_ths",
         )
 
     def _fallback_constituents(self, topic: str) -> Any:
@@ -3261,14 +3212,9 @@ def _env_text(value: Any) -> str:
 
 
 def _get_dsa_fetcher_manager() -> Any:
-    global _DSA_FETCHER_MANAGER
-    if _DSA_FETCHER_MANAGER is None:
-        with _DSA_FETCHER_MANAGER_LOCK:
-            if _DSA_FETCHER_MANAGER is None:
-                from data_provider import DataFetcherManager
+    from data_provider.runtime import get_market_data_manager
 
-                _DSA_FETCHER_MANAGER = DataFetcherManager()
-    return _DSA_FETCHER_MANAGER
+    return get_market_data_manager()
 
 
 def _fetch_dsa_hotspot_rankings(source: str, limit: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:

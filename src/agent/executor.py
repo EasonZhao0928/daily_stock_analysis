@@ -27,6 +27,7 @@ from src.agent.provider_trace import persist_provider_trace_turns
 from src.agent.runner import run_agent_loop, parse_dashboard_json
 from src.agent.runtime_facts import AgentRuntimeFacts
 from src.agent.stock_scope import StockScope, resolve_stock_scope
+from src.agent.tool_surface import ToolSurface
 from src.storage import get_db
 from src.agent.tools.registry import ToolRegistry
 from src.report_language import normalize_report_language
@@ -657,7 +658,15 @@ class AgentExecutor:
         max_steps: int = 10,
         timeout_seconds: Optional[float] = None,
     ):
-        self.tool_registry = tool_registry
+        self.tool_surface = (
+            tool_registry
+            if isinstance(tool_registry, ToolSurface)
+            else ToolSurface(tool_registry, legacy_runner_compat=True)
+        )
+        # Compatibility read-only reference for callers that introspect the
+        # legacy executor.  All declarations and execution below use the
+        # ToolSurface; this alias is never an execution seam.
+        self.tool_registry = getattr(self.tool_surface, "_registry", tool_registry)
         self.llm_adapter = llm_adapter
         self.skill_instructions = skill_instructions
         self.default_skill_policy = default_skill_policy
@@ -700,7 +709,7 @@ class AgentExecutor:
         )
 
         # Build tool declarations in OpenAI format (litellm handles all providers)
-        tool_decls = self.tool_registry.to_openai_tools()
+        tool_decls = self.tool_surface.list_tools("openai")
 
         # Initialize conversation
         messages: List[Dict[str, Any]] = [
@@ -749,7 +758,7 @@ class AgentExecutor:
         # Persist the user turn immediately so the session appears in history during processing
         user_message_id = conversation_manager.add_message(session_id, "user", message)
 
-        tool_decls = self.tool_registry.to_openai_tools()
+        tool_decls = self.tool_surface.list_tools("openai")
         result = self._run_loop(
             messages,
             tool_decls,
@@ -811,7 +820,7 @@ class AgentExecutor:
         """
         loop_result = run_agent_loop(
             messages=messages,
-            tool_registry=self.tool_registry,
+            tool_surface=self.tool_surface,
             llm_adapter=self.llm_adapter,
             max_steps=self.max_steps,
             progress_callback=progress_callback,

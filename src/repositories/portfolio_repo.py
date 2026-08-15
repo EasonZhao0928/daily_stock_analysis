@@ -6,6 +6,7 @@ Provides DB access helpers for portfolio account/events/snapshot tables.
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -21,6 +22,7 @@ from src.storage import (
     PortfolioCorporateAction,
     PortfolioDailySnapshot,
     PortfolioFxRate,
+    PortfolioLedgerOutbox,
     PortfolioPosition,
     PortfolioPositionLot,
     PortfolioTrade,
@@ -42,6 +44,10 @@ class PortfolioBusyError(Exception):
     """Raised when SQLite write serialization cannot acquire the ledger lock."""
 
 
+class VirtualFillConflictError(Exception):
+    """Raised when one fill id is reused with different immutable facts."""
+
+
 class PortfolioRepository:
     """DB access layer for portfolio P0 domain."""
 
@@ -59,7 +65,12 @@ class PortfolioRepository:
         market: str,
         base_currency: str,
         owner_id: Optional[str] = None,
+        account_kind: str = "manual",
+        controller_kind: str = "manual",
+        external_execution_enabled: bool = False,
     ) -> PortfolioAccount:
+        if external_execution_enabled:
+            raise ValueError("external execution is disabled for Paper Accounts")
         with self.db.get_session() as session:
             row = PortfolioAccount(
                 owner_id=owner_id,
@@ -68,6 +79,10 @@ class PortfolioRepository:
                 market=market,
                 base_currency=base_currency,
                 is_active=True,
+                account_kind=str(account_kind or "manual"),
+                controller_kind=str(controller_kind or "manual"),
+                # External execution is hard-disabled in the current scope.
+                external_execution_enabled=False,
             )
             session.add(row)
             session.commit()
@@ -135,28 +150,50 @@ class PortfolioRepository:
     # ------------------------------------------------------------------
     @contextmanager
     def portfolio_write_session(self):
-        session = self.db.get_session()
-        try:
-            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        except OperationalError as exc:
-            session.close()
-            if self._is_sqlite_locked_error(exc):
-                raise PortfolioBusyError("Portfolio ledger is busy; please retry shortly.") from exc
-            raise
+        """Open the single transactional boundary for portfolio writes.
 
-        try:
+        ``BEGIN IMMEDIATE`` serializes SQLite writers at the database level;
+        ``DatabaseManager.ledger_write_lock`` additionally closes the gap
+        between validation reads and the eventual insert for repository
+        instances sharing one process.  Every event writer and projection
+        refresh uses this context, so rollback also restores invalidated
+        position/lot/snapshot rows.
+        """
+        with self.db.ledger_write_lock():
+            session = self.db.get_session()
+            try:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            except OperationalError as exc:
+                session.close()
+                if self._is_sqlite_locked_error(exc):
+                    raise PortfolioBusyError("Portfolio ledger is busy; please retry shortly.") from exc
+                raise
+
+            try:
+                yield session
+                session.commit()
+            except OperationalError as exc:
+                session.rollback()
+                if self._is_sqlite_locked_error(exc):
+                    raise PortfolioBusyError("Portfolio ledger is busy; please retry shortly.") from exc
+                raise
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    @contextmanager
+    def ledger_cycle(self):
+        """Run one event/replay/projection cycle in the write transaction.
+
+        The public name makes the boundary explicit for the service layer;
+        callers receive a session only to perform the repository's
+        ``*_in_session`` operations inside the cycle.  Commit and rollback
+        remain owned here rather than being composed by API/import adapters.
+        """
+        with self.portfolio_write_session() as session:
             yield session
-            session.commit()
-        except OperationalError as exc:
-            session.rollback()
-            if self._is_sqlite_locked_error(exc):
-                raise PortfolioBusyError("Portfolio ledger is busy; please retry shortly.") from exc
-            raise
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
 
     def add_trade(
         self,
@@ -460,6 +497,175 @@ class PortfolioRepository:
         session.delete(row)
         session.flush()
         return True
+
+    # ------------------------------------------------------------------
+    # Virtual-fill ledger outbox
+    # ------------------------------------------------------------------
+    def enqueue_virtual_fill(
+        self,
+        *,
+        account_id: int,
+        fill_id: str,
+        payload: Dict[str, Any],
+    ) -> PortfolioLedgerOutbox:
+        """Persist one immutable virtual fill in ``pending`` state.
+
+        Re-enqueueing the same account/fill id with the same canonical
+        payload is an idempotent read. Reusing the id with different facts is
+        rejected before any new row is created.
+        """
+        fill_id_norm = str(fill_id or "").strip()
+        if not fill_id_norm:
+            raise ValueError("fill_id is required")
+        trade_uid = f"paper:{fill_id_norm}"
+        payload_text = json.dumps(
+            dict(payload or {}),
+            sort_keys=True,
+            ensure_ascii=False,
+            default=self._json_default,
+            separators=(",", ":"),
+        )
+
+        with self.ledger_cycle() as session:
+            account = self.get_account_in_session(
+                session=session,
+                account_id=account_id,
+                include_inactive=False,
+            )
+            if account is None:
+                raise ValueError(f"Active account not found: {account_id}")
+
+            row = session.execute(
+                select(PortfolioLedgerOutbox).where(
+                    and_(
+                        PortfolioLedgerOutbox.account_id == account_id,
+                        PortfolioLedgerOutbox.fill_id == fill_id_norm,
+                    )
+                ).limit(1)
+            ).scalar_one_or_none()
+            if row is not None:
+                if row.payload != payload_text or row.trade_uid != trade_uid:
+                    raise VirtualFillConflictError(
+                        f"Virtual fill already exists with different facts: account_id={account_id}, "
+                        f"fill_id={fill_id_norm}"
+                    )
+                session.expunge(row)
+                return row
+
+            row = PortfolioLedgerOutbox(
+                account_id=account_id,
+                fill_id=fill_id_norm,
+                trade_uid=trade_uid,
+                payload=payload_text,
+                status="pending",
+                attempt_count=0,
+            )
+            session.add(row)
+            try:
+                session.flush()
+            except IntegrityError as exc:
+                raise VirtualFillConflictError(
+                    f"Virtual fill already exists: account_id={account_id}, fill_id={fill_id_norm}"
+                ) from exc
+            session.refresh(row)
+            session.expunge(row)
+            return row
+
+    def get_virtual_fill_outbox(
+        self,
+        *,
+        outbox_id: Optional[int] = None,
+        account_id: Optional[int] = None,
+        fill_id: Optional[str] = None,
+    ) -> Optional[PortfolioLedgerOutbox]:
+        """Load one outbox row by id or account/fill identity."""
+        if outbox_id is None and (account_id is None or not str(fill_id or "").strip()):
+            raise ValueError("outbox_id or account_id + fill_id is required")
+        with self.db.get_session() as session:
+            conditions = []
+            if outbox_id is not None:
+                conditions.append(PortfolioLedgerOutbox.id == int(outbox_id))
+            else:
+                conditions.extend(
+                    [
+                        PortfolioLedgerOutbox.account_id == int(account_id),
+                        PortfolioLedgerOutbox.fill_id == str(fill_id).strip(),
+                    ]
+                )
+            return session.execute(
+                select(PortfolioLedgerOutbox).where(and_(*conditions)).limit(1)
+            ).scalar_one_or_none()
+
+    def list_pending_virtual_fills(self, *, account_id: Optional[int] = None) -> List[PortfolioLedgerOutbox]:
+        """Return durable pending fills in creation order for retry workers."""
+        with self.db.get_session() as session:
+            query = select(PortfolioLedgerOutbox).where(PortfolioLedgerOutbox.status == "pending")
+            if account_id is not None:
+                query = query.where(PortfolioLedgerOutbox.account_id == int(account_id))
+            rows = session.execute(
+                query.order_by(PortfolioLedgerOutbox.created_at.asc(), PortfolioLedgerOutbox.id.asc())
+            ).scalars().all()
+            return list(rows)
+
+    def mark_virtual_fill_applied(
+        self,
+        *,
+        outbox_id: int,
+        ledger_event_id: Optional[int],
+    ) -> Optional[PortfolioLedgerOutbox]:
+        """Advance pending outbox state to applied, idempotently."""
+        with self.ledger_cycle() as session:
+            row = session.execute(
+                select(PortfolioLedgerOutbox).where(PortfolioLedgerOutbox.id == int(outbox_id)).limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            if row.status != "applied":
+                row.status = "applied"
+                row.ledger_event_id = int(ledger_event_id) if ledger_event_id is not None else None
+                row.applied_at = datetime.now()
+                row.last_error = None
+                session.flush()
+            session.refresh(row)
+            session.expunge(row)
+            return row
+
+    def record_virtual_fill_failure(
+        self,
+        *,
+        outbox_id: int,
+        error: str,
+    ) -> Optional[PortfolioLedgerOutbox]:
+        """Record a failed projection attempt while keeping the fill pending."""
+        with self.ledger_cycle() as session:
+            row = session.execute(
+                select(PortfolioLedgerOutbox).where(PortfolioLedgerOutbox.id == int(outbox_id)).limit(1)
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            if row.status == "pending":
+                row.attempt_count = int(row.attempt_count or 0) + 1
+                row.last_error = str(error or "virtual fill projection failed")
+                row.updated_at = datetime.now()
+                session.flush()
+            session.refresh(row)
+            session.expunge(row)
+            return row
+
+    def get_trade_id_by_uid(self, *, account_id: int, trade_uid: str) -> Optional[int]:
+        """Resolve an existing trade id for idempotent outbox recovery."""
+        uid = str(trade_uid or "").strip()
+        if not uid:
+            return None
+        with self.db.get_session() as session:
+            return session.execute(
+                select(PortfolioTrade.id).where(
+                    and_(
+                        PortfolioTrade.account_id == int(account_id),
+                        PortfolioTrade.trade_uid == uid,
+                    )
+                ).limit(1)
+            ).scalar_one_or_none()
 
     # ------------------------------------------------------------------
     # Event reads
@@ -872,58 +1078,76 @@ class PortfolioRepository:
         lots: Iterable[Dict[str, Any]],
         valuation_currency: str,
     ) -> None:
-        with self.db.get_session() as session:
-            session.execute(
-                delete(PortfolioPosition).where(
-                    and_(
-                        PortfolioPosition.account_id == account_id,
-                        PortfolioPosition.cost_method == cost_method,
-                    )
-                )
-            )
-            session.execute(
-                delete(PortfolioPositionLot).where(
-                    and_(
-                        PortfolioPositionLot.account_id == account_id,
-                        PortfolioPositionLot.cost_method == cost_method,
-                    )
-                )
+        with self.portfolio_write_session() as session:
+            self.replace_positions_and_lots_in_session(
+                session=session,
+                account_id=account_id,
+                cost_method=cost_method,
+                positions=positions,
+                lots=lots,
+                valuation_currency=valuation_currency,
             )
 
-            for item in positions:
-                session.add(
-                    PortfolioPosition(
-                        account_id=account_id,
-                        cost_method=cost_method,
-                        symbol=item["symbol"],
-                        market=item["market"],
-                        currency=item["currency"],
-                        quantity=float(item["quantity"]),
-                        avg_cost=float(item["avg_cost"]),
-                        total_cost=float(item["total_cost"]),
-                        last_price=float(item["last_price"]),
-                        market_value_base=float(item["market_value_base"]),
-                        unrealized_pnl_base=float(item["unrealized_pnl_base"]),
-                        valuation_currency=valuation_currency,
-                    )
+    def replace_positions_and_lots_in_session(
+        self,
+        *,
+        session: Any,
+        account_id: int,
+        cost_method: str,
+        positions: Iterable[Dict[str, Any]],
+        lots: Iterable[Dict[str, Any]],
+        valuation_currency: str,
+    ) -> None:
+        """Replace replay projections without opening or committing a session."""
+        session.execute(
+            delete(PortfolioPosition).where(
+                and_(
+                    PortfolioPosition.account_id == account_id,
+                    PortfolioPosition.cost_method == cost_method,
                 )
-
-            for lot in lots:
-                session.add(
-                    PortfolioPositionLot(
-                        account_id=account_id,
-                        cost_method=cost_method,
-                        symbol=lot["symbol"],
-                        market=lot["market"],
-                        currency=lot["currency"],
-                        open_date=lot["open_date"],
-                        remaining_quantity=float(lot["remaining_quantity"]),
-                        unit_cost=float(lot["unit_cost"]),
-                        source_trade_id=lot.get("source_trade_id"),
-                    )
+            )
+        )
+        session.execute(
+            delete(PortfolioPositionLot).where(
+                and_(
+                    PortfolioPositionLot.account_id == account_id,
+                    PortfolioPositionLot.cost_method == cost_method,
                 )
+            )
+        )
 
-            session.commit()
+        for item in positions:
+            session.add(
+                PortfolioPosition(
+                    account_id=account_id,
+                    cost_method=cost_method,
+                    symbol=item["symbol"],
+                    market=item["market"],
+                    currency=item["currency"],
+                    quantity=float(item["quantity"]),
+                    avg_cost=float(item["avg_cost"]),
+                    total_cost=float(item["total_cost"]),
+                    last_price=float(item["last_price"]),
+                    market_value_base=float(item["market_value_base"]),
+                    unrealized_pnl_base=float(item["unrealized_pnl_base"]),
+                    valuation_currency=valuation_currency,
+                )
+            )
+
+        for lot in lots:
+            session.add(
+                PortfolioPositionLot(
+                    account_id=account_id,
+                    cost_method=cost_method,
+                    symbol=lot["symbol"],
+                    market=lot["market"],
+                    currency=lot["currency"],
+                    open_date=lot["open_date"],
+                    remaining_quantity=float(lot["remaining_quantity"]),
+                    unit_cost=float(lot["unit_cost"]),
+                    source_trade_id=lot.get("source_trade_id"),
+                )
+            )
 
     def _invalidate_account_cache_in_session(self, *, session: Any, account_id: int, from_date: date) -> None:
         session.execute(
@@ -952,6 +1176,12 @@ class PortfolioRepository:
                 "database table is locked",
             )
         )
+
+    @staticmethod
+    def _json_default(value: Any) -> str:
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        raise TypeError(f"Unsupported JSON value: {type(value).__name__}")
 
     @staticmethod
     def _translate_trade_integrity_error(
@@ -993,48 +1223,82 @@ class PortfolioRepository:
         fx_stale: bool,
         payload: str,
     ) -> None:
-        with self.db.get_session() as session:
-            existing = session.execute(
-                select(PortfolioDailySnapshot).where(
-                    and_(
-                        PortfolioDailySnapshot.account_id == account_id,
-                        PortfolioDailySnapshot.snapshot_date == snapshot_date,
-                        PortfolioDailySnapshot.cost_method == cost_method,
-                    )
-                ).limit(1)
-            ).scalar_one_or_none()
+        with self.portfolio_write_session() as session:
+            self.upsert_daily_snapshot_in_session(
+                session=session,
+                account_id=account_id,
+                snapshot_date=snapshot_date,
+                cost_method=cost_method,
+                base_currency=base_currency,
+                total_cash=total_cash,
+                total_market_value=total_market_value,
+                total_equity=total_equity,
+                unrealized_pnl=unrealized_pnl,
+                realized_pnl=realized_pnl,
+                fee_total=fee_total,
+                tax_total=tax_total,
+                fx_stale=fx_stale,
+                payload=payload,
+            )
 
-            if existing is None:
-                session.add(
-                    PortfolioDailySnapshot(
-                        account_id=account_id,
-                        snapshot_date=snapshot_date,
-                        cost_method=cost_method,
-                        base_currency=base_currency,
-                        total_cash=total_cash,
-                        total_market_value=total_market_value,
-                        total_equity=total_equity,
-                        unrealized_pnl=unrealized_pnl,
-                        realized_pnl=realized_pnl,
-                        fee_total=fee_total,
-                        tax_total=tax_total,
-                        fx_stale=fx_stale,
-                        payload=payload,
-                    )
+    def upsert_daily_snapshot_in_session(
+        self,
+        *,
+        session: Any,
+        account_id: int,
+        snapshot_date: date,
+        cost_method: str,
+        base_currency: str,
+        total_cash: float,
+        total_market_value: float,
+        total_equity: float,
+        unrealized_pnl: float,
+        realized_pnl: float,
+        fee_total: float,
+        tax_total: float,
+        fx_stale: bool,
+        payload: str,
+    ) -> None:
+        existing = session.execute(
+            select(PortfolioDailySnapshot).where(
+                and_(
+                    PortfolioDailySnapshot.account_id == account_id,
+                    PortfolioDailySnapshot.snapshot_date == snapshot_date,
+                    PortfolioDailySnapshot.cost_method == cost_method,
                 )
-            else:
-                existing.base_currency = base_currency
-                existing.total_cash = total_cash
-                existing.total_market_value = total_market_value
-                existing.total_equity = total_equity
-                existing.unrealized_pnl = unrealized_pnl
-                existing.realized_pnl = realized_pnl
-                existing.fee_total = fee_total
-                existing.tax_total = tax_total
-                existing.fx_stale = fx_stale
-                existing.payload = payload
-                existing.updated_at = datetime.now()
-            session.commit()
+            ).limit(1)
+        ).scalar_one_or_none()
+
+        if existing is None:
+            session.add(
+                PortfolioDailySnapshot(
+                    account_id=account_id,
+                    snapshot_date=snapshot_date,
+                    cost_method=cost_method,
+                    base_currency=base_currency,
+                    total_cash=total_cash,
+                    total_market_value=total_market_value,
+                    total_equity=total_equity,
+                    unrealized_pnl=unrealized_pnl,
+                    realized_pnl=realized_pnl,
+                    fee_total=fee_total,
+                    tax_total=tax_total,
+                    fx_stale=fx_stale,
+                    payload=payload,
+                )
+            )
+        else:
+            existing.base_currency = base_currency
+            existing.total_cash = total_cash
+            existing.total_market_value = total_market_value
+            existing.total_equity = total_equity
+            existing.unrealized_pnl = unrealized_pnl
+            existing.realized_pnl = realized_pnl
+            existing.fee_total = fee_total
+            existing.tax_total = tax_total
+            existing.fx_stale = fx_stale
+            existing.payload = payload
+            existing.updated_at = datetime.now()
 
     def replace_positions_lots_and_snapshot(
         self,
@@ -1057,96 +1321,70 @@ class PortfolioRepository:
         valuation_currency: str,
     ) -> None:
         """Atomically refresh position cache and daily snapshot in one transaction."""
-        with self.db.get_session() as session:
-            session.execute(
-                delete(PortfolioPosition).where(
-                    and_(
-                        PortfolioPosition.account_id == account_id,
-                        PortfolioPosition.cost_method == cost_method,
-                    )
-                )
+        with self.portfolio_write_session() as session:
+            self.replace_positions_lots_and_snapshot_in_session(
+                session=session,
+                account_id=account_id,
+                snapshot_date=snapshot_date,
+                cost_method=cost_method,
+                base_currency=base_currency,
+                total_cash=total_cash,
+                total_market_value=total_market_value,
+                total_equity=total_equity,
+                unrealized_pnl=unrealized_pnl,
+                realized_pnl=realized_pnl,
+                fee_total=fee_total,
+                tax_total=tax_total,
+                fx_stale=fx_stale,
+                payload=payload,
+                positions=positions,
+                lots=lots,
+                valuation_currency=valuation_currency,
             )
-            session.execute(
-                delete(PortfolioPositionLot).where(
-                    and_(
-                        PortfolioPositionLot.account_id == account_id,
-                        PortfolioPositionLot.cost_method == cost_method,
-                    )
-                )
-            )
 
-            for item in positions:
-                session.add(
-                    PortfolioPosition(
-                        account_id=account_id,
-                        cost_method=cost_method,
-                        symbol=item["symbol"],
-                        market=item["market"],
-                        currency=item["currency"],
-                        quantity=float(item["quantity"]),
-                        avg_cost=float(item["avg_cost"]),
-                        total_cost=float(item["total_cost"]),
-                        last_price=float(item["last_price"]),
-                        market_value_base=float(item["market_value_base"]),
-                        unrealized_pnl_base=float(item["unrealized_pnl_base"]),
-                        valuation_currency=valuation_currency,
-                    )
-                )
-
-            for lot in lots:
-                session.add(
-                    PortfolioPositionLot(
-                        account_id=account_id,
-                        cost_method=cost_method,
-                        symbol=lot["symbol"],
-                        market=lot["market"],
-                        currency=lot["currency"],
-                        open_date=lot["open_date"],
-                        remaining_quantity=float(lot["remaining_quantity"]),
-                        unit_cost=float(lot["unit_cost"]),
-                        source_trade_id=lot.get("source_trade_id"),
-                    )
-                )
-
-            existing = session.execute(
-                select(PortfolioDailySnapshot).where(
-                    and_(
-                        PortfolioDailySnapshot.account_id == account_id,
-                        PortfolioDailySnapshot.snapshot_date == snapshot_date,
-                        PortfolioDailySnapshot.cost_method == cost_method,
-                    )
-                ).limit(1)
-            ).scalar_one_or_none()
-
-            if existing is None:
-                session.add(
-                    PortfolioDailySnapshot(
-                        account_id=account_id,
-                        snapshot_date=snapshot_date,
-                        cost_method=cost_method,
-                        base_currency=base_currency,
-                        total_cash=total_cash,
-                        total_market_value=total_market_value,
-                        total_equity=total_equity,
-                        unrealized_pnl=unrealized_pnl,
-                        realized_pnl=realized_pnl,
-                        fee_total=fee_total,
-                        tax_total=tax_total,
-                        fx_stale=fx_stale,
-                        payload=payload,
-                    )
-                )
-            else:
-                existing.base_currency = base_currency
-                existing.total_cash = total_cash
-                existing.total_market_value = total_market_value
-                existing.total_equity = total_equity
-                existing.unrealized_pnl = unrealized_pnl
-                existing.realized_pnl = realized_pnl
-                existing.fee_total = fee_total
-                existing.tax_total = tax_total
-                existing.fx_stale = fx_stale
-                existing.payload = payload
-                existing.updated_at = datetime.now()
-
-            session.commit()
+    def replace_positions_lots_and_snapshot_in_session(
+        self,
+        *,
+        session: Any,
+        account_id: int,
+        snapshot_date: date,
+        cost_method: str,
+        base_currency: str,
+        total_cash: float,
+        total_market_value: float,
+        total_equity: float,
+        unrealized_pnl: float,
+        realized_pnl: float,
+        fee_total: float,
+        tax_total: float,
+        fx_stale: bool,
+        payload: str,
+        positions: Iterable[Dict[str, Any]],
+        lots: Iterable[Dict[str, Any]],
+        valuation_currency: str,
+    ) -> None:
+        """Replace all replay projections without opening a second transaction."""
+        self.replace_positions_and_lots_in_session(
+            session=session,
+            account_id=account_id,
+            cost_method=cost_method,
+            positions=positions,
+            lots=lots,
+            valuation_currency=valuation_currency,
+        )
+        self.upsert_daily_snapshot_in_session(
+            session=session,
+            account_id=account_id,
+            snapshot_date=snapshot_date,
+            cost_method=cost_method,
+            base_currency=base_currency,
+            total_cash=total_cash,
+            total_market_value=total_market_value,
+            total_equity=total_equity,
+            unrealized_pnl=unrealized_pnl,
+            realized_pnl=realized_pnl,
+            fee_total=fee_total,
+            tax_total=tax_total,
+            fx_stale=fx_stale,
+            payload=payload,
+        )

@@ -50,6 +50,7 @@ def test_alerts_doc_defines_required_contract_entities() -> None:
         "notification_policy",
         "observed_value",
         "data_timestamp",
+        "source_event_id",
         "trigger_id",
         "latency_ms",
         "cooldown_until",
@@ -168,7 +169,8 @@ def test_alerts_doc_defines_p4_notification_and_cooldown_scope() -> None:
         "`alert_notifications`",
         "`rule_id + target + data_source + data_timestamp`",
         "同一数据点去重",
-        "`data_timestamp` 缺失时不做去重",
+        "`data_timestamp` 缺失时，如果同时没有 `source_event_id` 则不做去重",
+        "不再把 opaque event ID 哈希伪装成时间戳",
         "`__cooldown__`",
         "`__cooldown_read_failed__`",
         "`__noise_suppressed__`",
@@ -320,6 +322,7 @@ def test_alerts_doc_defines_p8_user_and_deployment_boundaries() -> None:
         "Desktop 不新增原生告警管理界面",
         "`triggered`、`skipped`、`degraded`、`failed`",
         "`rule_id + target + data_source + data_timestamp`",
+        "source_event_id",
         "回滚 P8 只需 revert 文档、配置说明和 Web 文案改动",
     ):
         assert token in doc

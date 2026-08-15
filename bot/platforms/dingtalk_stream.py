@@ -20,7 +20,6 @@ https://github.com/open-dingtalk/dingtalk-stream-sdk-python
 """
 
 import logging
-import inspect
 import threading
 from datetime import datetime
 from typing import Optional, Callable, Any
@@ -39,6 +38,11 @@ except ImportError:
     logger.warning("[DingTalk Stream] 请运行: pip install dingtalk-stream")
 
 from bot.models import BotMessage, BotResponse, ChatType
+from bot.conversation import (
+    CallbackChannelAdapter,
+    ConversationChannelRuntime,
+    envelope_from_bot_message,
+)
 
 
 class DingtalkStreamHandler:
@@ -56,6 +60,37 @@ class DingtalkStreamHandler:
         """
         self._on_message = on_message
         self._logger = logger
+        self._reply_sender: Optional[Callable[[Any, BotResponse], bool]] = None
+        self._adapter = CallbackChannelAdapter("dingtalk", self._send_response)
+        self._runtime = ConversationChannelRuntime(
+            channel="dingtalk",
+            on_message=self._on_message,
+            max_workers=8,
+        )
+        self._runtime.start(self._adapter)
+
+    def _send_response(self, envelope, response: BotResponse) -> bool:
+        sender = self._reply_sender
+        incoming = envelope.reply_context.get("incoming")
+        if sender is None or incoming is None:
+            self._logger.warning("[DingTalk Stream] reply context unavailable")
+            return False
+        return bool(sender(incoming, response))
+
+    def _enqueue_message(self, bot_message: BotMessage, incoming: Any) -> bool:
+        """Queue a parsed message while retaining the opaque SDK context."""
+        conversation_id = bot_message.chat_id or bot_message.user_id or bot_message.message_id
+        if bot_message.chat_type == ChatType.GROUP:
+            conversation_id = f"{conversation_id}:{bot_message.user_id or 'unknown-user'}"
+        envelope = envelope_from_bot_message(
+            bot_message,
+            conversation_id=conversation_id,
+            reply_context={"incoming": incoming},
+        )
+        accepted = self._adapter.emit(envelope)
+        if not accepted:
+            self._logger.debug("[DingTalk Stream] 消息被 Conversation Channel 拒绝")
+        return accepted
 
     @staticmethod
     def _truncate_log_content(text: str, max_len: int = 200) -> str:
@@ -96,23 +131,10 @@ class DingtalkStreamHandler:
 
                     if bot_message:
                         self._parent._log_incoming_message(bot_message)
-                        # 调用消息处理回调
-                        response = self._parent._on_message(bot_message)
-                        if inspect.isawaitable(response):
-                            response = await response
-
-                        # 发送回复
-                        if response and response.text:
-                            # 构建 @用户 前缀（群聊场景下需要在文本中包含 @用户名）
-                            if response.at_user and incoming.sender_nick:
-                                if response.markdown:
-                                    self.reply_markdown(
-                                        title="股票分析助手",
-                                        text=f"@{incoming.sender_nick} " + response.text,
-                                        incoming_message=incoming
-                                    )
-                                else:
-                                    self.reply_text(response.text, incoming)
+                        # The shared runtime owns async dispatch, FIFO and
+                        # deduplication.  The SDK context remains in memory
+                        # solely for the eventual reply.
+                        self._parent._enqueue_message(bot_message, incoming)
 
                     return AckMessage.STATUS_OK, 'OK'
 
@@ -121,9 +143,37 @@ class DingtalkStreamHandler:
                     self.logger.exception(e)
                     return AckMessage.STATUS_SYSTEM_EXCEPTION, str(e)
 
+            def _send_reply(self, incoming: Any, response: BotResponse) -> bool:
+                if not response or not response.text:
+                    return True
+                text = response.text
+                if response.at_user and getattr(incoming, "sender_nick", None):
+                    text = f"@{incoming.sender_nick} " + text
+                if response.markdown:
+                    result = self.reply_markdown(
+                        title="股票分析助手",
+                        text=text,
+                        incoming_message=incoming,
+                    )
+                else:
+                    result = self.reply_text(text, incoming)
+                # SDK versions differ in whether reply helpers return a bool;
+                # treat a non-false return as success.
+                return result is not False
+
         def create_handler(self) -> '_ChatbotHandler':
             """创建 SDK 需要的处理器实例"""
-            return self._ChatbotHandler(self)
+            handler = self._ChatbotHandler(self)
+            self._reply_sender = handler._send_reply
+            return handler
+
+    def shutdown(self, wait: bool = False) -> None:
+        """Stop accepting messages and release shared runtime workers."""
+        self._runtime.stop(wait=wait)
+
+    def health(self):
+        """Return the shared Conversation Channel health snapshot."""
+        return self._runtime.health()
 
     def _parse_stream_message(self, incoming: Any, raw_data: dict) -> Optional[BotMessage]:
         """
@@ -232,6 +282,7 @@ class DingtalkStreamClient:
 
         self._client: Optional[dingtalk_stream.DingTalkStreamClient] = None
         self._background_thread: Optional[threading.Thread] = None
+        self._message_handler: Optional[DingtalkStreamHandler] = None
         self._running = False
 
     def _create_message_handler(self) -> Callable[[BotMessage], Any]:
@@ -263,6 +314,7 @@ class DingtalkStreamClient:
 
         # 注册消息处理器
         handler = DingtalkStreamHandler(self._create_message_handler())
+        self._message_handler = handler
         self._client.register_callback_handler(
             dingtalk_stream.chatbot.ChatbotMessage.TOPIC,
             handler.create_handler()
@@ -309,6 +361,8 @@ class DingtalkStreamClient:
     def stop(self) -> None:
         """停止客户端"""
         self._running = False
+        if self._message_handler is not None:
+            self._message_handler.shutdown(wait=False)
         logger.info("[DingTalk Stream] 客户端已停止")
 
     @property

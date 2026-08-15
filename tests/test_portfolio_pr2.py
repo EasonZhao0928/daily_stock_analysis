@@ -24,6 +24,7 @@ import src.auth as auth
 from api.app import create_app
 from src.config import Config
 from src.services.decision_signal_service import DecisionSignalService
+from src.services.portfolio_ledger_types import LedgerCommand, LedgerReceipt
 from src.services.portfolio_import_service import PortfolioImportService
 from src.services.portfolio_risk_service import PortfolioRiskService
 from src.services.portfolio_service import PortfolioBusyError, PortfolioService
@@ -181,6 +182,43 @@ class PortfolioPr2TestCase(unittest.TestCase):
         self.assertEqual(first_hash["duplicate_count"], 1)
         self.assertEqual(second_hash["inserted_count"], 0)
 
+    def test_import_adapter_submits_ledger_command(self) -> None:
+        account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+        record = {
+            "trade_date": "2026-01-02",
+            "symbol": "600519",
+            "side": "buy",
+            "quantity": 10,
+            "price": 100,
+            "fee": 1,
+            "tax": 0,
+            "trade_uid": "HT-SEAM-001",
+            "dedup_hash": "seam-hash-001",
+            "market": "cn",
+            "currency": "CNY",
+        }
+
+        with patch.object(
+            self.import_service.portfolio_service,
+            "submit",
+            wraps=self.import_service.portfolio_service.submit,
+        ) as submit:
+            result = self.import_service.commit_trade_records(
+                account_id=aid,
+                broker="huatai",
+                records=[record],
+            )
+
+        self.assertEqual(result["inserted_count"], 1)
+        self.assertEqual(result["failed_count"], 0)
+        command = submit.call_args.args[0]
+        self.assertIsInstance(command, LedgerCommand)
+        self.assertEqual(command.account_id, aid)
+        self.assertEqual(command.kind, "trade")
+        self.assertEqual(command.payload["trade_uid"], "HT-SEAM-001")
+        self.assertEqual(command.payload["dedup_hash"], "seam-hash-001")
+
     def test_import_side_parser_avoids_false_sell_match(self) -> None:
         csv_text = (
             "成交日期,证券代码,买卖标志,成交数量,成交均价,成交编号\n"
@@ -311,8 +349,12 @@ class PortfolioPr2TestCase(unittest.TestCase):
 
         with patch.object(
             self.import_service.portfolio_service,
-            "record_trade",
-            side_effect=PortfolioBusyError("Portfolio ledger is busy; please retry shortly."),
+            "submit",
+            return_value=LedgerReceipt.rejected(
+                event_type="trade",
+                error_code="portfolio_busy",
+                message="Portfolio ledger is busy; please retry shortly.",
+            ),
         ):
             result = self.import_service.commit_trade_records(
                 account_id=aid,
@@ -721,6 +763,17 @@ class PortfolioPr2TestCase(unittest.TestCase):
             amount=1000.0,
             currency="USD",
         )
+        self.service.record_trade(
+            account_id=aid,
+            symbol="AAPL",
+            trade_date=date(2026, 1, 1),
+            side="buy",
+            quantity=1,
+            price=100.0,
+            market="us",
+            currency="USD",
+        )
+        self._save_close("AAPL", date(2026, 1, 2), 100.0)
         self.service.repo.save_fx_rate(
             from_currency="USD",
             to_currency="CNY",
@@ -744,6 +797,19 @@ class PortfolioPr2TestCase(unittest.TestCase):
         self.assertIsNotNone(latest)
         self.assertTrue(bool(latest.is_stale))
         self.assertAlmostEqual(float(latest.rate), 7.0, places=6)
+
+        snapshot = self.service.get_portfolio_snapshot(
+            account_id=aid,
+            as_of=date(2026, 1, 2),
+            cost_method="fifo",
+        )
+        account_snapshot = snapshot["accounts"][0]
+        position = account_snapshot["positions"][0]
+        self.assertTrue(account_snapshot["fx_stale"])
+        self.assertAlmostEqual(account_snapshot["total_cash"], 6300.0, places=6)
+        self.assertAlmostEqual(account_snapshot["total_market_value"], 700.0, places=6)
+        self.assertAlmostEqual(account_snapshot["total_equity"], 7000.0, places=6)
+        self.assertAlmostEqual(position["market_value_base"], 700.0, places=6)
 
     def test_fx_refresh_disabled_returns_real_pair_count_without_fetching(self) -> None:
         account = self.service.create_account(name="US", broker="Demo", market="us", base_currency="CNY")
@@ -857,6 +923,123 @@ class PortfolioPr2TestCase(unittest.TestCase):
         self.assertEqual(payload["updated_count"], 0)
         self.assertEqual(payload["stale_count"], 0)
         self.assertEqual(payload["error_count"], 1)
+
+    def test_portfolio_event_endpoints_keep_current_payload_shapes(self) -> None:
+        create_resp = self.client.post(
+            "/api/v1/portfolio/accounts",
+            json={"name": "Main", "broker": "Demo", "market": "cn", "base_currency": "CNY"},
+        )
+        self.assertEqual(create_resp.status_code, 200)
+        account_id = create_resp.json()["id"]
+
+        account_list = self.client.get("/api/v1/portfolio/accounts")
+        self.assertEqual(account_list.status_code, 200)
+        self.assertEqual(account_list.json()["accounts"][0]["id"], account_id)
+
+        cash_resp = self.client.post(
+            "/api/v1/portfolio/cash-ledger",
+            json={
+                "account_id": account_id,
+                "event_date": "2026-01-01",
+                "direction": "in",
+                "amount": 10000,
+                "currency": "CNY",
+            },
+        )
+        trade_resp = self.client.post(
+            "/api/v1/portfolio/trades",
+            json={
+                "account_id": account_id,
+                "symbol": "600519",
+                "trade_date": "2026-01-02",
+                "side": "buy",
+                "quantity": 10,
+                "price": 100,
+                "fee": 0,
+                "tax": 0,
+                "market": "cn",
+                "currency": "CNY",
+                "trade_uid": "api-trade-001",
+            },
+        )
+        corporate_action_resp = self.client.post(
+            "/api/v1/portfolio/corporate-actions",
+            json={
+                "account_id": account_id,
+                "symbol": "600519",
+                "effective_date": "2026-01-03",
+                "action_type": "cash_dividend",
+                "market": "cn",
+                "currency": "CNY",
+                "cash_dividend_per_share": 1.0,
+            },
+        )
+        self.assertEqual(cash_resp.status_code, 200, cash_resp.text)
+        self.assertEqual(trade_resp.status_code, 200, trade_resp.text)
+        self.assertEqual(corporate_action_resp.status_code, 200, corporate_action_resp.text)
+        self.assertEqual(set(cash_resp.json()), {"id"})
+        self.assertEqual(set(trade_resp.json()), {"id"})
+        self.assertEqual(set(corporate_action_resp.json()), {"id"})
+
+        duplicate_trade = self.client.post(
+            "/api/v1/portfolio/trades",
+            json={
+                "account_id": account_id,
+                "symbol": "600519",
+                "trade_date": "2026-01-02",
+                "side": "buy",
+                "quantity": 10,
+                "price": 100,
+                "fee": 0,
+                "tax": 0,
+                "market": "cn",
+                "currency": "CNY",
+                "trade_uid": "api-trade-001",
+            },
+        )
+        self.assertEqual(duplicate_trade.status_code, 409, duplicate_trade.text)
+        self.assertEqual(duplicate_trade.json()["error"], "conflict")
+
+        trades = self.client.get(
+            "/api/v1/portfolio/trades",
+            params={"account_id": account_id, "page": 1, "page_size": 20},
+        )
+        cash_ledger = self.client.get(
+            "/api/v1/portfolio/cash-ledger",
+            params={"account_id": account_id, "page": 1, "page_size": 20},
+        )
+        corporate_actions = self.client.get(
+            "/api/v1/portfolio/corporate-actions",
+            params={"account_id": account_id, "page": 1, "page_size": 20},
+        )
+        for response in (trades, cash_ledger, corporate_actions):
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(set(response.json()), {"items", "total", "page", "page_size"})
+        self.assertEqual(trades.json()["items"][0]["trade_uid"], "api-trade-001")
+        self.assertEqual(cash_ledger.json()["items"][0]["direction"], "in")
+        self.assertEqual(corporate_actions.json()["items"][0]["action_type"], "cash_dividend")
+
+        self._save_close("600519", date(2026, 1, 3), 110.0)
+        snapshot = self.client.get(
+            "/api/v1/portfolio/snapshot",
+            params={
+                "account_id": account_id,
+                "as_of": "2026-01-03",
+                "cost_method": "fifo",
+                "include_realtime": "false",
+            },
+        )
+        self.assertEqual(snapshot.status_code, 200, snapshot.text)
+        payload = snapshot.json()
+        self.assertEqual(payload["as_of"], "2026-01-03")
+        self.assertEqual(payload["cost_method"], "fifo")
+        self.assertEqual(payload["account_count"], 1)
+        account_snapshot = payload["accounts"][0]
+        self.assertAlmostEqual(account_snapshot["total_cash"], 9010.0, places=6)
+        self.assertAlmostEqual(account_snapshot["total_market_value"], 1100.0, places=6)
+        self.assertAlmostEqual(account_snapshot["total_equity"], 10110.0, places=6)
+        self.assertEqual(account_snapshot["positions"][0]["quantity"], 10.0)
+        self.assertAlmostEqual(account_snapshot["positions"][0]["last_price"], 110.0, places=6)
 
     def test_import_and_risk_endpoints(self) -> None:
         create_resp = self.client.post(

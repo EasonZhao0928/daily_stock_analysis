@@ -14,7 +14,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
-from api.deps import get_agent_chat_session_service
+from api.deps import get_agent_chat_session_service, get_codex_account_service
+from api.v1.schemas.agent import (
+    CodexAccountActionResponse,
+    CodexAccountCancelRequest,
+    CodexAccountLoginRequest,
+    CodexAccountLoginResponse,
+    CodexAccountStatusResponse,
+)
 from api.v1.schemas.system_config import AgentBackendStatusResponse
 from src.config import get_config
 from src.services.agent_chat_session_service import AgentChatSessionService
@@ -137,6 +144,94 @@ async def get_agent_status():
     """Return the current effective Chat backend status for the Chat page."""
     payload = await asyncio.to_thread(_get_agent_chat_status, get_config())
     return _agent_status_response(payload)
+
+
+def _require_codex_account_backend() -> None:
+    """Reject account control when the selected Agent backend is not Codex."""
+    from src.services.agent_backend_status_service import evaluate_agent_backend_config
+
+    evaluation = evaluate_agent_backend_config(get_config())
+    if evaluation["backend"] != "codex_app_server":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "capability_unsupported",
+                "message": "Codex account control requires AGENT_BACKEND=codex_app_server",
+            },
+        )
+    if not evaluation["available"]:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": evaluation["error_code"] or "capability_unsupported",
+                "message": evaluation["message"] or "Codex App Server is unavailable",
+            },
+        )
+
+
+def _codex_account_http_error(exc: Exception) -> HTTPException:
+    code = getattr(exc, "code", "protocol_error")
+    if code in {"invalid_request", "protocol_error"}:
+        status_code = 400
+    elif code in {"capability_unsupported", "command_not_found", "service_closed"}:
+        status_code = 503
+    else:
+        status_code = 409
+    return HTTPException(
+        status_code=status_code,
+        detail={"error": code, "message": str(exc)},
+    )
+
+
+@router.get("/account", response_model=CodexAccountStatusResponse)
+@router.get("/account/status", response_model=CodexAccountStatusResponse, include_in_schema=False)
+async def get_codex_account_status(service=Depends(get_codex_account_service)):
+    """Return token-free Codex account and rolling rate-limit state."""
+    _require_codex_account_backend()
+    try:
+        payload = await asyncio.to_thread(service.status)
+    except Exception as exc:
+        raise _codex_account_http_error(exc) from exc
+    return CodexAccountStatusResponse.model_validate(payload)
+
+
+@router.post("/account/login", response_model=CodexAccountLoginResponse)
+async def start_codex_account_login(
+    request: CodexAccountLoginRequest,
+    service=Depends(get_codex_account_service),
+):
+    """Start a browser or device-code login without receiving credentials."""
+    _require_codex_account_backend()
+    try:
+        payload = await asyncio.to_thread(service.start_login, request.mode)
+    except Exception as exc:
+        raise _codex_account_http_error(exc) from exc
+    return CodexAccountLoginResponse.model_validate(payload)
+
+
+@router.post("/account/login/cancel", response_model=CodexAccountActionResponse)
+async def cancel_codex_account_login(
+    request: CodexAccountCancelRequest,
+    service=Depends(get_codex_account_service),
+):
+    """Cancel one pending Codex login by its opaque login ID."""
+    _require_codex_account_backend()
+    try:
+        payload = await asyncio.to_thread(service.cancel_login, request.login_id)
+    except Exception as exc:
+        raise _codex_account_http_error(exc) from exc
+    return CodexAccountActionResponse.model_validate(payload)
+
+
+@router.post("/account/logout", response_model=CodexAccountActionResponse)
+async def logout_codex_account(service=Depends(get_codex_account_service)):
+    """Ask App Server to remove its managed account session."""
+    _require_codex_account_backend()
+    try:
+        payload = await asyncio.to_thread(service.logout)
+    except Exception as exc:
+        raise _codex_account_http_error(exc) from exc
+    return CodexAccountActionResponse.model_validate(payload)
 
 
 def _agent_status_response(payload: Dict[str, Any]) -> AgentBackendStatusResponse:

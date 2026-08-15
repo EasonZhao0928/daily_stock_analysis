@@ -1,0 +1,22 @@
+name: research_discipline
+display_name: 研究纪律
+description: 约束研究过程的时间点、来源层级、证据引用和事实推断边界。
+summary: 任何结论都要能回到冻结时间点的证据。
+version: 1.0.0
+category: research
+risk-level: low
+evidence-policy: required
+required-capabilities: [evidence:read, market_data:read]
+required_tools: [get_analysis_context, search_stock_news, get_daily_history]
+aliases: [证据纪律, 研究规范]
+instructions: |
+  ## 时间点
+  - 先锁定 as-of/cutoff，再读取行情、新闻和公告；禁止使用 cutoff 之后的信息解释过去的决定。
+  - 区分交易日、披露日、发布时间和检索时间。
+
+  ## 证据分层
+  - 官方披露 > 原始数据接口 > 多源一致报道 > 单篇研报/新闻 > 未验证传言。
+  - 对冲突来源并列展示，不通过平均或补零消除冲突。
+
+  ## 交付检查
+  - 事实、推断、未知分别列出；每项关键事实带 evidence ref 或 source diagnostics。

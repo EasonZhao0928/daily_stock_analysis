@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { agentApi } from '../agent';
 
-const get = vi.hoisted(() => vi.fn());
+const { get, post } = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn() }));
 
 vi.mock('../index', () => ({
   default: {
     get,
-    post: vi.fn(),
+    post,
     delete: vi.fn(),
   },
 }));
@@ -14,6 +14,7 @@ vi.mock('../index', () => ({
 describe('agentApi', () => {
   beforeEach(() => {
     get.mockReset();
+    post.mockReset();
   });
 
   it('uses the shared camelCase Agent backend status contract', async () => {
@@ -76,5 +77,63 @@ describe('agentApi', () => {
     const result = await agentApi.getChatSessionMessages('legacy-session');
 
     expect(result.session_state.selected_skill_ids).toBeNull();
+  });
+
+  it('reads the token-free Codex account status and nested rate-limit windows', async () => {
+    get.mockResolvedValueOnce({
+      data: {
+        account: {
+          status: 'authenticated',
+          auth_method: 'chatgpt',
+          email: 'investor@example.test',
+          plan_type: 'plus',
+          requires_openai_auth: false,
+        },
+        rate_limits: {
+          snapshots: [{
+            limit_id: 'codex',
+            primary: {
+              bucket: 'primary',
+              used_percent: 12,
+              window_duration_minutes: 300,
+              resets_at: 1700000000,
+            },
+          }],
+        },
+        rate_limit_error_code: null,
+        notifications: [],
+      },
+    });
+
+    const result = await agentApi.getCodexAccountStatus();
+
+    expect(get).toHaveBeenCalledWith('/api/v1/agent/account');
+    expect(result.account.planType).toBe('plus');
+    expect(result.rateLimits?.snapshots[0].primary?.resetsAt).toBe(1700000000);
+  });
+
+  it('uses opaque login IDs for browser login, cancellation, and logout actions', async () => {
+    post
+      .mockResolvedValueOnce({
+        data: {
+          mode: 'browser',
+          status: 'pending',
+          login_id: 'login-1',
+          auth_url: 'https://auth.example.test',
+        },
+      })
+      .mockResolvedValueOnce({ data: { status: 'cancelled' } })
+      .mockResolvedValueOnce({ data: { status: 'signed_out' } });
+
+    const login = await agentApi.startCodexLogin();
+    const cancelled = await agentApi.cancelCodexLogin(login.loginId);
+    const logout = await agentApi.logoutCodexAccount();
+
+    expect(login.loginId).toBe('login-1');
+    expect(cancelled.status).toBe('cancelled');
+    expect(logout.status).toBe('signed_out');
+    expect(post).toHaveBeenNthCalledWith(1, '/api/v1/agent/account/login', { mode: 'browser' });
+    expect(post).toHaveBeenNthCalledWith(2, '/api/v1/agent/account/login/cancel', { login_id: 'login-1' });
+    expect(post).toHaveBeenNthCalledWith(3, '/api/v1/agent/account/logout');
   });
 });

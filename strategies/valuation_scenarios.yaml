@@ -1,0 +1,22 @@
+name: valuation_scenarios
+display_name: 估值情景
+description: 用历史区间、增长假设和一致预期构造可审计的估值情景，而非单点预测。
+summary: 所有估值都要显式列出假设、单位和敏感性。
+version: 1.0.0
+category: research
+risk-level: high
+evidence-policy: required
+required-capabilities: [market_data:read, evidence:read]
+required_tools: [get_stock_info, get_financial_statement, get_consensus_estimate, get_daily_history, search_comprehensive_intel]
+aliases: [估值, 估值情景, PE情景]
+instructions: |
+  ## 假设
+  - 明确基准/乐观/保守的收入、利润、现金流、估值倍数和有效期。
+  - 说明估值输入是历史事实、市场报价还是分析假设，单位统一。
+
+  ## 敏感性
+  - 展示增长率、利润率、倍数和折现/风险折价变化对结果的影响。
+  - 结果用区间和触发条件表达；缺失或陈旧输入时输出不可用原因。
+
+  ## 风险
+  - 识别预期下修、流动性、行业周期、公司治理和估值压缩风险，不构成自动下单指令。

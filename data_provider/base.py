@@ -14,13 +14,15 @@
 3. 指数退避重试机制
 """
 
+import inspect
 import logging
 import random
 import time
-from threading import BoundedSemaphore, RLock, Thread
+from threading import BoundedSemaphore, RLock, Thread, local
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Callable, Optional, List, Tuple, Dict, Any
+from typing import Callable, Optional, List, Tuple, Dict, Any, Mapping
 
 import pandas as pd
 import numpy as np
@@ -31,6 +33,20 @@ from src.services.run_diagnostics import record_provider_run, record_provider_ru
 from .fundamental_adapter import AkshareFundamentalAdapter
 from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
 from .realtime_types import CircuitBreaker
+from .market_clock import MarketClock
+from .market_data_types import DataEnvelope, DataQuery, DataStatus, SourcePolicy
+from .extended_capabilities import (
+    EXTENDED_CAPABILITIES,
+    ExtendedCapabilityAdapter,
+    extended_market_data_enabled,
+)
+from .supplier_runtime import get_supplier_runtime_registry, supplier_family_for_name
+from . import security_id as _security_id
+
+SecurityId = _security_id.SecurityId
+SecurityIdError = _security_id.SecurityIdError
+normalize_security_id = _security_id.normalize_security_id
+parse_security_id = _security_id.parse_security_id
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -634,18 +650,27 @@ class DataFetcherManager:
     _concept_rankings_cache_lock = RLock()
     _concept_rankings_cache: Dict[int, Tuple[float, List[Dict], List[Dict]]] = {}
 
-    def __init__(self, fetchers: Optional[List[BaseFetcher]] = None):
+    def __init__(
+        self,
+        fetchers: Optional[List[BaseFetcher]] = None,
+        *,
+        supplier_runtime: Any = None,
+        extended_capability_adapter: Any = None,
+    ):
         """
         初始化管理器
         
         Args:
             fetchers: 数据源列表（可选，默认按优先级自动创建）
         """
+        self._supplier_runtime = supplier_runtime
+        self._extended_capability_adapter = extended_capability_adapter or ExtendedCapabilityAdapter()
         self._fetchers: List[BaseFetcher] = []
         self._fetchers_lock = RLock()
         self._fetchers_by_name: Dict[str, BaseFetcher] = {}
         self._fetcher_call_locks: Dict[int, RLock] = {}
         self._fetcher_call_locks_lock = RLock()
+        self._request_context = local()
         self._stock_name_cache: Dict[str, str] = {}
         self._stock_name_cache_lock = RLock()
         
@@ -676,6 +701,8 @@ class DataFetcherManager:
             self._fetcher_call_locks = {}
         if not hasattr(self, "_fetcher_call_locks_lock") or self._fetcher_call_locks_lock is None:
             self._fetcher_call_locks_lock = RLock()
+        if not hasattr(self, "_request_context") or self._request_context is None:
+            self._request_context = local()
         if not hasattr(self, "_stock_name_cache") or self._stock_name_cache is None:
             self._stock_name_cache = {}
         if not hasattr(self, "_stock_name_cache_lock") or self._stock_name_cache_lock is None:
@@ -742,10 +769,28 @@ class DataFetcherManager:
             return lock
 
     def _call_fetcher_method(self, fetcher: BaseFetcher, method_name: str, *args, **kwargs):
-        """Serialize shared fetcher state access through manager-owned per-instance locks."""
+        """Serialize adapter state and coordinate the process-wide supplier family gate."""
+        # A few lightweight manager test doubles are created through ``__new__``
+        # so they can inject only the routing state they exercise.  Keep this
+        # central call path compatible with that supported lazy-initialisation
+        # pattern before reading the per-thread fan-out flag.
+        self._ensure_concurrency_guards()
         method = getattr(fetcher, method_name)
-        with self._get_fetcher_call_lock(fetcher):
-            return method(*args, **kwargs)
+        configured_family = getattr(fetcher, "supplier_family", None)
+        fetcher_name = getattr(fetcher, "name", fetcher.__class__.__name__)
+        family = supplier_family_for_name(configured_family or fetcher_name)
+        runtime = getattr(self, "_supplier_runtime", None) or get_supplier_runtime_registry()
+        with runtime.request(family) as lease:
+            if getattr(self._request_context, "serialize_fetcher_calls", True):
+                with self._get_fetcher_call_lock(fetcher):
+                    result = method(*args, **kwargs)
+            else:
+                # Realtime quote fan-out uses independent symbol requests.  It
+                # may bypass the adapter-instance lock while retaining the
+                # shared supplier runtime gate/session/circuit controls above.
+                result = method(*args, **kwargs)
+            lease.observe_response(result)
+            return result
 
     @classmethod
     def _filter_daily_fetchers_for_market(
@@ -1242,6 +1287,246 @@ class DataFetcherManager:
             self._fetchers.append(fetcher)
             self._fetchers.sort(key=lambda f: f.priority)
             self._refresh_fetcher_indexes_locked()
+
+    # New callers use this narrow capability seam.  The legacy methods below
+    # remain intact while their callers migrate, so route behavior can be
+    # tested without changing the established daily/realtime return shapes.
+    _CAPABILITY_METHODS = {
+        "daily_data": "get_daily_data",
+        "realtime_quote": "get_realtime_quote",
+    }
+
+    def _ensure_market_data_runtime(self) -> None:
+        """Initialize route-only guards for lightweight test managers too."""
+        self._ensure_concurrency_guards()
+        if not hasattr(self, "_fundamental_timeout_slots") or self._fundamental_timeout_slots is None:
+            self._fundamental_timeout_slots = BoundedSemaphore(8)
+
+    @staticmethod
+    def _route_source_key(source: str) -> str:
+        return str(source or "").strip().lower().replace("_", "").replace("-", "")
+
+    @classmethod
+    def _route_source_matches(cls, fetcher: BaseFetcher, source: str) -> bool:
+        source_key = cls._route_source_key(source)
+        fetcher_key = cls._route_source_key(fetcher.name).replace("fetcher", "")
+        aliases = {
+            "akshareem": "akshare",
+            "aksharesina": "akshare",
+            "akshareqq": "akshare",
+        }
+        return source_key in {fetcher_key, cls._route_source_key(fetcher.name)} or aliases.get(source_key) == fetcher_key
+
+    def _route_fetchers(self, capability: str, policy: SourcePolicy) -> List[BaseFetcher]:
+        fetchers = self._filter_fetchers_by_capability(self._get_fetchers_snapshot(), capability)
+        if not policy.source_chain:
+            return fetchers
+        ordered: List[BaseFetcher] = []
+        for source in policy.source_chain:
+            match = next((f for f in fetchers if self._route_source_matches(f, source)), None)
+            if match is not None and match not in ordered:
+                ordered.append(match)
+        return ordered
+
+    def _invoke_capability_fetcher(
+        self, fetcher: BaseFetcher, query: DataQuery, source: str = ""
+    ) -> Any:
+        method_name = self._CAPABILITY_METHODS[query.capability]
+        method = getattr(fetcher, method_name, None)
+        if not callable(method):
+            raise DataSourceUnavailableError(f"{fetcher.name} does not implement {query.capability}")
+        code = query.security_id.canonical_code
+        if query.capability == "realtime_quote" and fetcher.name == "AkshareFetcher":
+            source_key = self._route_source_key(source)
+            source_name = {"akshareem": "em", "aksharesina": "sina", "akshareqq": "tencent"}.get(source_key)
+            if source_name:
+                return self._call_fetcher_method(fetcher, method_name, stock_code=code, source=source_name)
+        window = self._capability_window_kwargs(method, query)
+        return self._call_fetcher_method(fetcher, method_name, stock_code=code, **window)
+
+    @staticmethod
+    def _window_date_text(value: Any) -> str:
+        """Render a query bound as the ``YYYYMMDD`` form fetchers expect."""
+        return value.strftime("%Y%m%d")
+
+    @staticmethod
+    def _capability_window_kwargs(method: Any, query: DataQuery) -> Dict[str, Any]:
+        """Forward the query's history window to fetchers that accept it.
+
+        Only parameters the target method actually declares are passed, so
+        adapters with narrower signatures keep working unchanged.
+        """
+        if query.start is None and query.limit is None and query.as_of is None:
+            return {}
+        try:
+            accepted = set(inspect.signature(method).parameters)
+        except (TypeError, ValueError):
+            return {}
+        window: Dict[str, Any] = {}
+        if query.start is not None and "start_date" in accepted:
+            window["start_date"] = DataFetcherManager._window_date_text(query.start)
+        if query.as_of is not None and "end_date" in accepted:
+            window["end_date"] = DataFetcherManager._window_date_text(query.as_of)
+        if query.limit is not None and "days" in accepted and "start_date" not in window:
+            window["days"] = int(query.limit)
+        return window
+
+    @staticmethod
+    def _route_result_is_empty(value: Any) -> bool:
+        if isinstance(value, (list, tuple, dict, set, str, bytes)):
+            return len(value) == 0
+        empty = getattr(value, "empty", None)
+        if empty is not None:
+            try:
+                return bool(empty)
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    def _route_envelope(
+        self,
+        query: DataQuery,
+        result: Any,
+        source: str,
+        source_tier: str,
+        fallback_chain: Tuple[str, ...],
+        retrieved_at: datetime,
+    ) -> DataEnvelope:
+        if isinstance(result, DataEnvelope):
+            return replace(result, fallback_chain=fallback_chain)
+        status = DataStatus.VALID_EMPTY if self._route_result_is_empty(result) else DataStatus.OK
+        return DataEnvelope(
+            capability=query.capability,
+            security_id=query.security_id,
+            data=result,
+            source=source,
+            source_tier=source_tier,
+            as_of=query.as_of,
+            retrieved_at=retrieved_at,
+            status=status,
+            fallback_chain=fallback_chain,
+        )
+
+    def _route_failure_envelope(
+        self,
+        query: DataQuery,
+        status: DataStatus,
+        fallback_chain: Tuple[str, ...],
+        source: str = "market_data",
+        source_tier: str = "validation",
+        details: Optional[Mapping[str, Any]] = None,
+    ) -> DataEnvelope:
+        return DataEnvelope(
+            capability=query.capability,
+            security_id=query.security_id,
+            data=None,
+            source=source,
+            source_tier=source_tier,
+            as_of=query.as_of,
+            retrieved_at=datetime.now(timezone.utc),
+            status=status,
+            quality_flags=(status.value,),
+            fallback_chain=fallback_chain,
+            provenance=details or {},
+        )
+
+    @staticmethod
+    def _apply_route_freshness(
+        envelope: DataEnvelope, query: DataQuery, policy: SourcePolicy
+    ) -> DataEnvelope:
+        if policy.stale_threshold is None or not isinstance(envelope.as_of, datetime):
+            return envelope
+        try:
+            clock = MarketClock(query.market, stale_threshold=policy.stale_threshold)
+            return envelope.with_freshness(clock)
+        except Exception as exc:
+            logger.debug("[数据源路由] stale 判定不可用: %s", exc)
+            return envelope
+
+    @staticmethod
+    def _route_market_closed(query: DataQuery, policy: SourcePolicy) -> bool:
+        if not policy.trading_hours_only or query.as_of is None:
+            return False
+        try:
+            clock = MarketClock(query.market)
+            if isinstance(query.as_of, datetime):
+                return not clock.is_open(query.as_of)
+            return not clock.is_trading_day(query.as_of)
+        except Exception as exc:
+            logger.debug("[数据源路由] market closed 判定不可用: %s", exc)
+            return False
+
+    def fetch(self, query: DataQuery, policy: Optional[SourcePolicy] = None) -> DataEnvelope:
+        """Fetch one capability through the priority/fallback route.
+
+        ``timeout_seconds`` applies to each provider attempt.  A timed-out
+        provider is abandoned by the daemon worker and the independent next
+        source is tried.  Empty successful payloads stop the route as
+        ``valid_empty``; ``None``/exceptions are treated as upstream failure.
+        """
+        if not isinstance(query, DataQuery):
+            raise TypeError("query must be DataQuery")
+        policy = SourcePolicy() if policy is None else policy
+        if not isinstance(policy, SourcePolicy):
+            raise TypeError("policy must be SourcePolicy or None")
+        if query.capability in EXTENDED_CAPABILITIES:
+            if not extended_market_data_enabled():
+                # R10.4: unaccepted capabilities stay behind an explicit flag.
+                # Report the capability as blocked instead of quietly serving it.
+                return self._route_failure_envelope(
+                    query, DataStatus.UPSTREAM_BLOCKED, policy.source_chain
+                )
+            adapter = getattr(self, "_extended_capability_adapter", None) or ExtendedCapabilityAdapter()
+            self._extended_capability_adapter = adapter
+            return adapter.fetch(query, policy)
+        if query.capability not in self._CAPABILITY_METHODS:
+            return self._route_failure_envelope(query, DataStatus.UPSTREAM_BLOCKED, policy.source_chain)
+        self._ensure_market_data_runtime()
+        if not query.security_id.is_reliable:
+            return self._route_failure_envelope(query, DataStatus.SYMBOL_INVALID, ())
+        if self._route_market_closed(query, policy):
+            return self._route_failure_envelope(query, DataStatus.MARKET_CLOSED, ())
+
+        fetchers = self._route_fetchers(query.capability, policy)
+        attempted: List[str] = []
+        errors: Dict[str, str] = {}
+        last_fallback: Optional[DataEnvelope] = None
+        for index, fetcher in enumerate(fetchers):
+            attempted.append(fetcher.name)
+            tier = "primary" if index == 0 else "fallback"
+            source_token = next(
+                (source for source in policy.source_chain if self._route_source_matches(fetcher, source)),
+                fetcher.name,
+            )
+            started = datetime.now(timezone.utc)
+            result, error, _ = self._run_with_timeout(
+                lambda f=fetcher, source=source_token: self._invoke_capability_fetcher(f, query, source),
+                float(policy.timeout_seconds),
+                f"{query.capability}:{fetcher.name}",
+            )
+            if error is not None or result is None:
+                errors[fetcher.name] = error or "empty upstream result"
+                continue
+            envelope = self._route_envelope(query, result, fetcher.name, tier, tuple(attempted), started)
+            envelope = self._apply_route_freshness(envelope, query, policy)
+            if envelope.status is DataStatus.STALE_SYMBOL and policy.allow_stale:
+                return envelope
+            if envelope.should_fallback:
+                last_fallback = envelope
+                continue
+            return envelope
+
+        if last_fallback is not None:
+            return replace(last_fallback, fallback_chain=tuple(attempted))
+        details = {"errors": errors} if errors else None
+        return self._route_failure_envelope(
+            query,
+            DataStatus.UPSTREAM_BLOCKED,
+            tuple(attempted) or policy.source_chain,
+            source=attempted[-1] if attempted else "market_data",
+            source_tier="fallback" if len(attempted) > 1 else "primary",
+            details=details,
+        )
     
     def get_daily_data(
         self, 
@@ -1722,7 +2007,33 @@ class DataFetcherManager:
         setattr(quote, "is_stale", stale_seconds > int(ttl))
         return quote
     
-    def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
+    def get_realtime_quote(
+        self,
+        stock_code: str,
+        *,
+        log_final_failure: bool = True,
+        concurrent: bool = False,
+    ):
+        """Fetch one realtime quote with optional symbol-level fan-out.
+
+        ``concurrent=True`` is reserved for independent realtime symbol
+        requests.  It keeps the process-wide SupplierRuntime lease (rate,
+        circuit and shared session) but avoids serializing every symbol behind
+        one adapter instance lock.  All other calls retain the historical
+        serialized adapter behavior.
+        """
+        self._ensure_concurrency_guards()
+        previous = getattr(self._request_context, "serialize_fetcher_calls", True)
+        self._request_context.serialize_fetcher_calls = not bool(concurrent)
+        try:
+            return self._get_realtime_quote(
+                stock_code,
+                log_final_failure=log_final_failure,
+            )
+        finally:
+            self._request_context.serialize_fetcher_calls = previous
+
+    def _get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
         """
         获取实时行情数据（自动故障切换）
         
@@ -2329,7 +2640,7 @@ class DataFetcherManager:
                     provider=fetcher.name,
                     operation="get_belong_board",
                 )
-                raw_data = fetcher.get_belong_board(stock_code)
+                raw_data = self._call_fetcher_method(fetcher, "get_belong_board", stock_code)
                 boards = self._normalize_belong_boards(raw_data)
                 if boards:
                     record_provider_run(
@@ -2466,7 +2777,7 @@ class DataFetcherManager:
             tickflow_fetcher = self._get_tickflow_fetcher()
             if tickflow_fetcher is not None:
                 try:
-                    data = tickflow_fetcher.get_main_indices(region=region)
+                    data = self._call_fetcher_method(tickflow_fetcher, "get_main_indices", region=region)
                     if data:
                         logger.info("[TickFlowFetcher] 获取指数行情成功")
                         return data
@@ -2474,15 +2785,16 @@ class DataFetcherManager:
                     logger.warning(f"[TickFlowFetcher] 获取指数行情失败: {e}")
 
         for fetcher in self._fetchers:
-            if region == "cn" and fetcher.name == "TickFlowFetcher":
+            fetcher_name = getattr(fetcher, "name", fetcher.__class__.__name__)
+            if region == "cn" and fetcher_name == "TickFlowFetcher":
                 continue
             try:
-                data = fetcher.get_main_indices(region=region)
+                data = self._call_fetcher_method(fetcher, "get_main_indices", region=region)
                 if data:
-                    logger.info(f"[{fetcher.name}] 获取指数行情成功")
+                    logger.info(f"[{fetcher_name}] 获取指数行情成功")
                     return data
             except Exception as e:
-                logger.warning(f"[{fetcher.name}] 获取指数行情失败: {e}")
+                logger.warning(f"[{fetcher_name}] 获取指数行情失败: {e}")
                 continue
         return []
 
@@ -2493,7 +2805,7 @@ class DataFetcherManager:
         if tickflow_fetcher is not None:
             started_at = time.monotonic()
             try:
-                data = tickflow_fetcher.get_market_stats()
+                data = self._call_fetcher_method(tickflow_fetcher, "get_market_stats")
                 elapsed = time.monotonic() - started_at
                 if data:
                     logger.info(
@@ -2524,7 +2836,7 @@ class DataFetcherManager:
                 continue
             started_at = time.monotonic()
             try:
-                data = fetcher.get_market_stats()
+                data = self._call_fetcher_method(fetcher, "get_market_stats")
                 elapsed = time.monotonic() - started_at
                 if data:
                     logger.info(
@@ -2999,7 +3311,7 @@ class DataFetcherManager:
                 inst_timeout = max(stage_timeout - (time.time() - start_ts), 0.0)
                 if inst_timeout > 0:
                     tw_record, inst_err, _inst_ms = self._run_with_retry(
-                        lambda: fetcher.get_institutional_net(stock_code),
+                        lambda: self._call_fetcher_method(fetcher, "get_institutional_net", stock_code),
                         inst_timeout,
                         "fundamental_tw_institution",
                     )
@@ -3603,7 +3915,7 @@ class DataFetcherManager:
 
                 start = time.time()
                 try:
-                    data = fetcher.get_sector_rankings(n)
+                    data = self._call_fetcher_method(fetcher, "get_sector_rankings", n)
                     duration_ms = int((time.time() - start) * 1000)
                     if data and data[0] is not None and data[1] is not None:
                         source_chain.append(
@@ -3681,7 +3993,7 @@ class DataFetcherManager:
             bottom: List[Dict] = []
             for fetcher in self._get_fetchers_snapshot():
                 try:
-                    data = fetcher.get_concept_rankings(normalized_n)
+                    data = self._call_fetcher_method(fetcher, "get_concept_rankings", normalized_n)
                     if data and (data[0] or data[1]):
                         top = data[0] or []
                         bottom = data[1] or []
@@ -3715,7 +4027,7 @@ class DataFetcherManager:
         last_error = ""
         for fetcher in self._fetchers:
             try:
-                data = fetcher.get_hot_stocks(n)
+                data = self._call_fetcher_method(fetcher, "get_hot_stocks", n)
                 if data:
                     logger.info(f"[{fetcher.name}] 获取人气股成功")
                     return data[:n]
@@ -3737,7 +4049,7 @@ class DataFetcherManager:
         last_error = ""
         for fetcher in self._fetchers:
             try:
-                data = fetcher.get_limit_up_pool(date=date, n=n)
+                data = self._call_fetcher_method(fetcher, "get_limit_up_pool", date=date, n=n)
                 if data:
                     logger.info(f"[{fetcher.name}] 获取涨停池成功")
                     return data[:n]

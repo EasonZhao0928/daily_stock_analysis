@@ -17,6 +17,7 @@ import time
 from typing import Any, Callable, Dict, Hashable, List, Optional, Set, Tuple
 
 from data_provider import DataFetcherManager
+from data_provider.runtime import get_market_data_manager
 
 from src.schemas.market_structure import (
     MarketStructureDataQuality,
@@ -55,7 +56,7 @@ class MarketHotspotService:
         failure_cache_ttl_seconds: Optional[float] = None,
         success_cache_ttl_seconds: Optional[float] = None,
     ) -> None:
-        self.fetcher_manager = fetcher_manager or DataFetcherManager()
+        self.fetcher_manager = fetcher_manager or get_market_data_manager()
         self._ranking_fetch_timeout_seconds = ranking_fetch_timeout_seconds
         self._failure_cache_ttl_seconds = self._coerce_cache_ttl(
             DEFAULT_RANKING_CACHE_FAILURE_TTL_SECONDS

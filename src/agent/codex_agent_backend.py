@@ -8,6 +8,7 @@ from typing import Any, Callable, Optional
 
 from src.agent.agent_backend import (
     AGENT_BACKEND_ERROR_CODES,
+    NO_STOCK_SCOPE_INSTRUCTION as _NO_STOCK_SCOPE_INSTRUCTION,
     AgentBackend,
     AgentRunRequest,
     AgentRunResult,
@@ -32,11 +33,6 @@ _BASE_INSTRUCTIONS = (
     "coding-agent defaults do not. Never modify files, request approval, or use unregistered tools. "
     "Only the tools shown for this turn are safe to cancel; never imply access to live quotes, news, "
     "portfolio data, or recalculation tools when they are not listed."
-)
-_NO_STOCK_SCOPE_INSTRUCTION = (
-    "No stock scope was established for this turn. Do not call any DSA tool that requires a "
-    "stock_code. If the user asks about a specific stock, ask them in plain language to provide "
-    "or select an exact stock code. Non-stock market tools remain available."
 )
 
 _PUBLIC_ERROR_MESSAGES = {
@@ -138,6 +134,10 @@ class CodexAgentBackend(AgentBackend):
                 tool_event_callback=on_tool_event,
                 deadline=deadline,
                 cancel_event=request.cancel_event,
+                tool_profile=PERMISSION_PROFILE,
+                # The DSA Execution Profile comes from the surface itself, so
+                # this transport authorizes exactly like the LiteLLM one.
+                execution_profile=self.tool_surface.default_profile,
                 max_tool_calls=request.max_steps,
             ) as client:
                 client.request_timeout = remaining_timeout()

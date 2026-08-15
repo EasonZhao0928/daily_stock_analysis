@@ -7,8 +7,8 @@ import asyncio
 import json
 import logging
 import re
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Mapping, Optional
 
 from src.agent.events import (
     EventMonitor,
@@ -31,8 +31,10 @@ from src.services.portfolio_alerts import (
     DRY_RUN_TARGET_TIMEOUT_SECONDS,
     DRY_RUN_TOTAL_TIMEOUT_SECONDS,
     PORTFOLIO_ALERT_TYPES,
+    PAPER_ALERT_TYPES,
     SYMBOL_BATCH_TARGET_SCOPES,
     PortfolioRiskAlert,
+    PaperEventAlert,
     RuntimeAlertPayload,
     StaticAlertEvaluation,
     aggregate_dry_run_results,
@@ -41,9 +43,12 @@ from src.services.portfolio_alerts import (
     evaluate_static_alert,
     expand_symbol_targets,
     make_portfolio_risk_payload,
+    make_paper_event_payload,
     make_static_payload,
     normalize_batch_target_scope_target,
     normalize_portfolio_alert_parameters,
+    normalize_paper_alert_parameters,
+    evaluate_paper_event_alert,
     portfolio_effective_target,
     result_to_target_result,
 )
@@ -74,12 +79,18 @@ from src.utils.sanitize import sanitize_diagnostic_text
 
 LEGACY_RUNTIME_ALERT_TYPES = frozenset({"price_cross", "price_change_percent", "volume_spike"})
 SYMBOL_ALERT_TYPES = LEGACY_RUNTIME_ALERT_TYPES | TECHNICAL_ALERT_TYPES
-SUPPORTED_ALERT_TYPES = SYMBOL_ALERT_TYPES | PORTFOLIO_ALERT_TYPES | MARKET_ALERT_TYPES
-SUPPORTED_TARGET_SCOPES = frozenset({"single_symbol", "watchlist", "portfolio_holdings", "portfolio_account", "market"})
+SUPPORTED_ALERT_TYPES = SYMBOL_ALERT_TYPES | PORTFOLIO_ALERT_TYPES | MARKET_ALERT_TYPES | PAPER_ALERT_TYPES
+SUPPORTED_TARGET_SCOPES = frozenset({"single_symbol", "watchlist", "portfolio_holdings", "portfolio_account", "market", "paper_account"})
 SUPPORTED_SEVERITIES = frozenset({"info", "warning", "critical"})
 NULLABLE_RULE_UPDATE_FIELDS = frozenset({"cooldown_policy", "notification_policy"})
 
 logger = logging.getLogger(__name__)
+
+# Opaque Paper/Shadow event IDs are mapped into this reserved window so a
+# derived trigger timestamp is never confused with an observed market one.
+# No real market data predates it.
+_SURROGATE_EPOCH = datetime(1900, 1, 1)
+_SURROGATE_WINDOW_SECONDS = 50 * 365 * 24 * 60 * 60
 
 
 class AlertServiceError(ValueError):
@@ -178,7 +189,7 @@ class AlertService:
         monitor = EventMonitor()
         try:
             if len(payloads) == 1 and row.target_scope == "single_symbol":
-                result = asyncio.run(self._evaluate_rule(payloads[0].rule, monitor, daily_cache=None))
+                result = asyncio.run(self.evaluate_rule(payloads[0].rule, monitor, daily_cache=None))
                 return self._dry_run_response_for_single(payloads[0], result, target_scope=row.target_scope)
             results = asyncio.run(self._evaluate_runtime_payloads(payloads, monitor))
             return aggregate_dry_run_results(rule_id, row.target_scope, results)
@@ -223,7 +234,242 @@ class AlertService:
             return await asyncio.to_thread(evaluate_market_light_alert, rule, cache=daily_cache)
         if isinstance(rule, StaticAlertEvaluation):
             return evaluate_static_alert(rule)
+        if isinstance(rule, PaperEventAlert):
+            return evaluate_paper_event_alert(rule)
         return self._evaluation_error(rule, f"unsupported runtime alert type: {rule.alert_type}")
+
+    async def evaluate_rule(
+        self,
+        rule: Any,
+        monitor: Optional[EventMonitor] = None,
+        daily_cache: Optional[Dict[Any, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Public evaluation seam used by API/tests and AlertWorker.
+
+        Runtime callers must not reach into the private dispatcher; this
+        wrapper also keeps future cycle instrumentation in one place.
+        """
+
+        return await self._evaluate_rule(rule, monitor or EventMonitor(), daily_cache=daily_cache)
+
+    def run_cycle(
+        self,
+        *,
+        config: Optional[Any] = None,
+        include_disabled: bool = False,
+        persist: bool = True,
+        notifier: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate persisted alert payloads through one public cycle API.
+
+        Trigger persistence/notification policy remains compatible with the
+        existing worker; this method owns payload expansion and evaluation so
+        alternate schedulers can consume the same characterization contract.
+        """
+
+        if config is None:
+            from src.config import get_config
+
+            config = get_config()
+        rows = (
+            self.repo.list_rules(page=1, page_size=1000)[0]
+            if include_disabled
+            else self.repo.list_enabled_rules(limit=1000)
+        )
+        payloads: List[RuntimeAlertPayload] = []
+        for row in rows:
+            payloads.extend(self.build_runtime_payloads(row, config=config))
+        monitor = EventMonitor()
+        results = asyncio.run(self._evaluate_runtime_payloads(payloads, monitor)) if payloads else []
+        cycle = {
+            "loaded": len(payloads),
+            "evaluated": len(results),
+            "items": results,
+        }
+        if persist and results:
+            cycle.update(self._persist_cycle_results(results, notifier=notifier))
+        else:
+            cycle.update({"recorded": 0, "triggered": sum(1 for item in results if item.get("triggered")), "notified": 0, "notification_attempts": 0, "cooldown_suppressed": 0})
+        return cycle
+
+    def _persist_cycle_results(self, results: List[Dict[str, Any]], *, notifier: Optional[Any] = None) -> Dict[str, int]:
+        """Persist trigger/dedupe/cooldown/notification state for one cycle.
+
+        This is deliberately behind the public ``run_cycle`` seam so workers
+        and future schedulers cannot bypass trigger history or cooldown rules.
+        """
+        stats = {"recorded": 0, "triggered": 0, "notified": 0, "notification_attempts": 0, "cooldown_suppressed": 0}
+        for result in results:
+            status = str(result.get("record_status") or "failed")
+            if status not in {"triggered", "skipped", "degraded", "failed"}:
+                continue
+            fields = {
+                "rule_id": int(result.get("rule_id") or 0) or None,
+                "target": str(result.get("target") or "?"),
+                "observed_value": self._optional_float(result.get("observed_value")),
+                "threshold": self._optional_float(result.get("threshold")),
+                "reason": self._sanitize_text(result.get("reason") or result.get("message")),
+                "data_source": result.get("data_source"),
+                "data_timestamp": self._coerce_data_timestamp(result.get("data_timestamp")),
+                "source_event_id": self._extract_source_event_id(result),
+                "status": status,
+                "diagnostics": self._sanitize_text(result.get("diagnostics")),
+            }
+            try:
+                if (
+                    status == "triggered"
+                    and fields["rule_id"]
+                    and (fields["data_timestamp"] or fields["source_event_id"])
+                ):
+                    _row, created = self.repo.create_trigger_if_absent(fields)
+                else:
+                    _row = self.repo.create_trigger(fields)
+                    created = True
+                if created:
+                    stats["recorded"] += 1
+            except Exception as exc:
+                logger.warning("[AlertService] trigger write failed: %s", self._sanitize_text(str(exc)))
+                continue
+            if status != "triggered":
+                continue
+            stats["triggered"] += 1
+            rule_id = fields["rule_id"]
+            if not rule_id:
+                continue
+            now = datetime.now()
+            rule_record = self.repo.get_rule(rule_id)
+            severity = str(rule_record.severity) if rule_record is not None and rule_record.severity else None
+            try:
+                active = self.repo.get_active_cooldown(
+                    rule_id=rule_id,
+                    target=fields["target"],
+                    severity=severity,
+                    now=now,
+                )
+            except Exception:
+                active = None
+            if active is not None:
+                stats["cooldown_suppressed"] += 1
+                continue
+            if notifier is None:
+                continue
+            try:
+                dispatch = notifier.send_with_results(
+                    result.get("message") or result.get("reason") or "Alert triggered",
+                    route_type="alert",
+                )
+                attempts = list(dispatch.channel_results or [])
+                if not attempts:
+                    attempts = [type("Attempt", (), {"channel": "__dispatch__", "success": bool(dispatch.success), "error_code": None, "retryable": True, "latency_ms": None, "diagnostics": dispatch.message})()]
+                for index, attempt in enumerate(attempts, start=1):
+                    self.repo.record_notification_attempt(
+                        {
+                            "trigger_id": getattr(_row, "id", None),
+                            "channel": str(attempt.channel or "__dispatch__")[:32],
+                            "attempt": index,
+                            "success": bool(attempt.success),
+                            "error_code": attempt.error_code,
+                            "retryable": bool(attempt.retryable),
+                            "latency_ms": self._optional_int(attempt.latency_ms),
+                            "diagnostics": self._sanitize_text(attempt.diagnostics or dispatch.message),
+                        }
+                    )
+                    stats["notification_attempts"] += 1
+                if bool(dispatch.success):
+                    cooldown_seconds = 24 * 60 * 60
+                    if rule_record is not None:
+                        policy = self._load_json(rule_record.cooldown_policy, default={}) or {}
+                        try:
+                            cooldown_seconds = max(0, int(policy.get("cooldown_seconds", cooldown_seconds)))
+                        except (TypeError, ValueError):
+                            cooldown_seconds = 24 * 60 * 60
+                    self.repo.upsert_cooldown(
+                        rule_id=rule_id,
+                        rule_key=result.get("key"),
+                        target=fields["target"],
+                        severity=severity,
+                        last_triggered_at=now,
+                        cooldown_until=now + timedelta(seconds=cooldown_seconds),
+                        reason=fields["reason"],
+                    )
+                    stats["notified"] += 1
+            except Exception as exc:
+                logger.warning("[AlertService] notification attempt failed: %s", self._sanitize_text(str(exc)))
+        return stats
+
+    @staticmethod
+    def _optional_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def is_surrogate_data_timestamp(value: Any) -> bool:
+        """Whether ``value`` is a derived event surrogate, not observed data."""
+        if not isinstance(value, datetime):
+            return False
+        naive = value.replace(tzinfo=None) if value.tzinfo else value
+        return _SURROGATE_EPOCH <= naive < _SURROGATE_EPOCH + timedelta(
+            seconds=_SURROGATE_WINDOW_SECONDS
+        )
+
+    @staticmethod
+    def _coerce_data_timestamp(value: Any) -> Optional[datetime]:
+        """Keep trigger timestamps DB-compatible while preserving event dedupe.
+
+        Paper/Shadow event rules may put an opaque ``event_id`` in
+        ``data_timestamp`` for historical compatibility.  Opaque values are
+        intentionally not converted into a hash-derived timestamp: the
+        trigger row stores their lossless identity in ``source_event_id`` and
+        leaves the observed timestamp null.  Real ISO/date values continue to
+        use the DateTime column.
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _extract_source_event_id(result: Mapping[str, Any]) -> Optional[str]:
+        """Return a lossless opaque event identity for trigger deduplication."""
+        direct = result.get("source_event_id")
+        diagnostics = result.get("diagnostics")
+        if direct is None and isinstance(diagnostics, Mapping):
+            direct = diagnostics.get("event_id")
+        if direct is None:
+            raw_timestamp = result.get("data_timestamp")
+            text = str(raw_timestamp or "").strip()
+            if text:
+                try:
+                    datetime.fromisoformat(text.replace("Z", "+00:00"))
+                except ValueError:
+                    direct = text
+        if direct is None:
+            return None
+        text = str(direct).strip()
+        return text[:128] or None
+
+    @staticmethod
+    def _optional_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     async def _evaluate_runtime_payloads(
         self,
@@ -237,7 +483,7 @@ class AlertService:
             async with semaphore:
                 try:
                     result = await asyncio.wait_for(
-                        self._evaluate_rule(payload.rule, monitor, daily_cache=daily_cache),
+                        self.evaluate_rule(payload.rule, monitor, daily_cache=daily_cache),
                         timeout=DRY_RUN_TARGET_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
@@ -436,9 +682,9 @@ class AlertService:
 
     async def _evaluate_volume(self, rule: VolumeAlert) -> Dict[str, Any]:
         def _fetch_daily_data():
-            from data_provider import DataFetcherManager
+            from data_provider.runtime import get_market_data_manager
 
-            return DataFetcherManager().get_daily_data(rule.stock_code, days=20)
+            return get_market_data_manager().get_daily_data(rule.stock_code, days=20)
 
         try:
             result = await asyncio.to_thread(_fetch_daily_data)
@@ -531,9 +777,9 @@ class AlertService:
         cache_key = (rule.stock_code, requested_days)
 
         def _fetch_daily_data():
-            from data_provider import DataFetcherManager
+            from data_provider.runtime import get_market_data_manager
 
-            return DataFetcherManager().get_daily_data(rule.stock_code, days=requested_days)
+            return get_market_data_manager().get_daily_data(rule.stock_code, days=requested_days)
 
         try:
             if daily_cache is not None and cache_key in daily_cache:
@@ -701,6 +947,9 @@ class AlertService:
             if rule.alert_type == "market_light_score_drop":
                 return float(rule.parameters.get("min_drop", 0) or 0)
             return None
+        if isinstance(rule, PaperEventAlert):
+            value = rule.parameters.get("threshold")
+            return float(value) if value is not None else None
         return None
 
     @staticmethod
@@ -715,6 +964,8 @@ class AlertService:
             return "portfolio_risk"
         if isinstance(rule, MarketLightAlert):
             return MARKET_LIGHT_DATA_SOURCE
+        if isinstance(rule, PaperEventAlert):
+            return "paper_account" if rule.alert_type.startswith("paper_") else "shadow_research"
         return None
 
     @classmethod
@@ -918,6 +1169,12 @@ class AlertService:
 
     @staticmethod
     def _validate_scope_alert_type(target_scope: str, alert_type: str) -> None:
+        if target_scope == "paper_account":
+            if alert_type not in PAPER_ALERT_TYPES:
+                raise AlertServiceError("paper_account only supports paper/shadow alert types")
+            return
+        if alert_type in PAPER_ALERT_TYPES:
+            raise AlertServiceError("paper/shadow alert types require target_scope=paper_account")
         if target_scope == "market":
             if alert_type not in MARKET_ALERT_TYPES:
                 raise AlertServiceError("market target_scope only supports market alert types")
@@ -941,6 +1198,17 @@ class AlertService:
                 return normalize_market_alert_region(target)
             except ValueError as exc:
                 raise AlertServiceError(str(exc)) from exc
+        if target_scope == "paper_account":
+            target_text = target.strip()
+            if target_text == "all":
+                return "all"
+            try:
+                account_id = int(target_text)
+            except (TypeError, ValueError) as exc:
+                raise AlertServiceError("paper account target must be a positive integer or all") from exc
+            if account_id <= 0:
+                raise AlertServiceError("paper account target must be positive")
+            return str(account_id)
         try:
             normalized = normalize_batch_target_scope_target(target_scope, target)
             if target_scope in {"portfolio_holdings", "portfolio_account"}:
@@ -989,6 +1257,12 @@ class AlertService:
             except ValueError as exc:
                 raise AlertServiceError(str(exc)) from exc
 
+        if alert_type in PAPER_ALERT_TYPES:
+            try:
+                return normalize_paper_alert_parameters(alert_type, parameters)
+            except ValueError as exc:
+                raise AlertServiceError(str(exc)) from exc
+
         raise UnsupportedAlertTypeError(f"unsupported alert_type for Alert API: {alert_type}")
 
     @staticmethod
@@ -1021,6 +1295,9 @@ class AlertService:
 
         if data["alert_type"] in MARKET_ALERT_TYPES:
             return [make_market_light_payload(parent_key=parent_key, data=data, config=config)]
+
+        if data["alert_type"] in PAPER_ALERT_TYPES:
+            return [make_paper_event_payload(parent_key=parent_key, data=data)]
 
         if data["target_scope"] in SYMBOL_BATCH_TARGET_SCOPES:
             if config is None:
@@ -1221,6 +1498,7 @@ class AlertService:
             "reason": row.reason,
             "data_source": row.data_source,
             "data_timestamp": row.data_timestamp.isoformat() if row.data_timestamp else None,
+            "source_event_id": row.source_event_id,
             "triggered_at": row.triggered_at.isoformat() if row.triggered_at else None,
             "status": row.status,
             "diagnostics": self._sanitize_text(row.diagnostics) if row.diagnostics else None,
@@ -1306,6 +1584,8 @@ class AlertService:
             return f"{target} market light status {statuses}"
         if alert_type == "market_light_score_drop":
             return f"{target} market light score drop {parameters['min_drop']}"
+        if alert_type in PAPER_ALERT_TYPES:
+            return f"{target} {alert_type}"
         return f"{target} {alert_type}"
 
     @staticmethod

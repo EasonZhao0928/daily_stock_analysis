@@ -71,6 +71,8 @@ class ToolAccessContext:
     max_result_bytes: Optional[int] = None
     redact_result: bool = False
     audit_context: Dict[str, Any] = field(default_factory=dict)
+    account_scope: Any = None
+    symbol_scope: Any = None
 
 
 class ToolExecutionCancelled(Exception):
@@ -302,13 +304,104 @@ def redact_external_tool_result(result: Any) -> str:
 def execute_runner_tool_call(
     *,
     tool_call: Any,
-    tool_registry: ToolRegistry,
+    tool_registry: Optional[ToolRegistry] = None,
+    tool_surface: Any = None,
     stock_scope: Any = None,
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
 ) -> tuple[Any, str, bool, float, bool, Optional[Dict[str, Any]]]:
-    """Execute a single tool call using the legacy runner semantics."""
+    """Execute one call through ToolSurface, retaining the legacy fallback.
+
+    ``tool_registry`` remains accepted for callers outside the shared runner,
+    but the runner passes ``tool_surface`` so validation, scope and the
+    structured result envelope have one authoritative implementation.
+
+    The Execution Profile is carried by the ToolSurface itself, so LiteLLM and
+    Codex authorize against the same profile without every caller re-supplying
+    it.
+    """
     t0 = time.time()
     cache_key = _build_tool_cache_key(tool_call.name, tool_call.arguments)
+
+    if tool_surface is not None:
+        if cache_key and non_retriable_tool_results is not None and cache_key in non_retriable_tool_results:
+            dur = round(time.time() - t0, 2)
+            logger.info(
+                "Tool '%s' skipped via non-retriable cache for arguments=%s",
+                tool_call.name,
+                tool_call.arguments,
+            )
+            cached_text = non_retriable_tool_results[cache_key]
+            cached_guard = None
+            try:
+                cached_payload = json.loads(cached_text)
+                if cached_payload.get("error") == "stock_scope_violation":
+                    cached_guard = {
+                        "error": "stock_scope_violation",
+                        "expected_stock_code": cached_payload.get("expected_stock_code", ""),
+                        "requested_stock_code": cached_payload.get("requested_stock_code", ""),
+                        "allowed_stock_codes": cached_payload.get("allowed_stock_codes", []),
+                        "retriable": False,
+                    }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            return tool_call, cached_text, False, dur, True, cached_guard
+
+        context = ToolAccessContext(
+            stock_scope=stock_scope,
+            backend="litellm",
+            # LiteLLM is an external roundtrip just like Codex; keep the
+            # same ToolSurface secret-redaction contract on both adapters.
+            redact_result=True,
+        )
+        result = tool_surface.execute_tool(
+            tool_call.name,
+            tool_call.arguments,
+            context,
+        )
+        result_dict = dict(result)
+        result_str = str(result_dict.get("result_text", ""))
+        ok = bool(result_dict.get("ok"))
+        error = result_dict.get("error") or {}
+        if error.get("code") in {"tool_not_found", "invalid_tool_name"}:
+            # Keep the legacy runner's diagnostic wording while retaining the
+            # ToolSurface stable error code and envelope.
+            try:
+                not_found_payload = json.loads(result_str)
+                if error.get("code") == "invalid_tool_name":
+                    not_found_payload["error"] = "Tool not found in registry."
+                    result_str = serialize_tool_result(not_found_payload)
+                elif not_found_payload.get("error") == "Tool not found.":
+                    not_found_payload["error"] = "Tool not found in registry."
+                    result_str = serialize_tool_result(not_found_payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        guard_result = None
+        if error.get("code") == "stock_scope_violation":
+            details = error.get("details") or {}
+            if {
+                "expected_stock_code",
+                "requested_stock_code",
+                "allowed_stock_codes",
+            } & set(details):
+                guard_result = {
+                    "error": "stock_scope_violation",
+                    "expected_stock_code": details.get("expected_stock_code", ""),
+                    "requested_stock_code": details.get("requested_stock_code", ""),
+                    "allowed_stock_codes": details.get("allowed_stock_codes", []),
+                    "retriable": False,
+                }
+        non_retriable = (
+            (not ok and error.get("retriable") is False)
+            or _is_non_retriable_tool_result(result_dict.get("result"))
+        )
+        if cache_key and non_retriable_tool_results is not None and non_retriable:
+            non_retriable_tool_results[cache_key] = result_str
+        dur = round(time.time() - t0, 2)
+        return tool_call, result_str, ok, dur, False, guard_result
+
+    if tool_registry is None:
+        raise ValueError("tool_registry or tool_surface is required")
+
     guard_result = _guard_tool_stock_scope(tool_registry, tool_call.name, tool_call.arguments, stock_scope)
     if guard_result is not None:
         dur = round(time.time() - t0, 2)

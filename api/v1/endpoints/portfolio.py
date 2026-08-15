@@ -36,6 +36,13 @@ from api.v1.schemas.portfolio import (
     PortfolioTradeCreateRequest,
 )
 from src.services.task_queue import get_task_queue
+from src.services.portfolio_ledger_types import (
+    LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+    LEDGER_ERROR_DUPLICATE_TRADE_UID,
+    LEDGER_ERROR_OVERSELL,
+    LEDGER_ERROR_PORTFOLIO_BUSY,
+    LedgerCommand,
+)
 from src.services.portfolio_import_service import PortfolioImportService
 from src.services.portfolio_risk_service import PortfolioRiskService
 from src.services.portfolio_service import (
@@ -61,6 +68,35 @@ def _internal_error(message: str, exc: Exception) -> HTTPException:
 
 def _conflict_error(*, error: str, message: str) -> HTTPException:
     return api_error(409, error, message)
+
+
+def _submit_ledger_command(service: PortfolioService, command: LedgerCommand) -> dict:
+    """Submit an API event through the Account Ledger seam.
+
+    The HTTP response contracts stay unchanged, while receipt rejection is
+    translated to the legacy endpoint exception taxonomy in one place.
+    """
+    receipt = service.submit(command)
+    if receipt.accepted and receipt.event_id is not None:
+        return {"id": int(receipt.event_id)}
+
+    message = receipt.message or receipt.error_code or "Ledger command rejected"
+    if receipt.error_code == LEDGER_ERROR_PORTFOLIO_BUSY:
+        raise PortfolioBusyError(message)
+    if receipt.error_code == LEDGER_ERROR_OVERSELL:
+        details = receipt.details
+        raise PortfolioOversellError(
+            symbol=str(details.get("symbol") or ""),
+            trade_date=details.get("trade_date"),
+            requested_quantity=float(details.get("requested_quantity", 0.0)),
+            available_quantity=float(details.get("available_quantity", 0.0)),
+        )
+    if receipt.error_code in {
+        LEDGER_ERROR_DUPLICATE_TRADE_UID,
+        LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+    }:
+        raise PortfolioConflictError(message, code=receipt.error_code)
+    raise ValueError(message)
 
 
 def _serialize_import_record(item: dict) -> PortfolioImportTradeItem:
@@ -169,19 +205,25 @@ def delete_account(account_id: int):
 def create_trade(request: PortfolioTradeCreateRequest) -> PortfolioEventCreatedResponse:
     service = PortfolioService()
     try:
-        data = service.record_trade(
-            account_id=request.account_id,
-            symbol=request.symbol,
-            trade_date=request.trade_date,
-            side=request.side,
-            quantity=request.quantity,
-            price=request.price,
-            fee=request.fee,
-            tax=request.tax,
-            market=request.market,
-            currency=request.currency,
-            trade_uid=request.trade_uid,
-            note=request.note,
+        data = _submit_ledger_command(
+            service,
+            LedgerCommand(
+                account_id=request.account_id,
+                kind="trade",
+                payload={
+                    "symbol": request.symbol,
+                    "trade_date": request.trade_date,
+                    "side": request.side,
+                    "quantity": request.quantity,
+                    "price": request.price,
+                    "fee": request.fee,
+                    "tax": request.tax,
+                    "market": request.market,
+                    "currency": request.currency,
+                    "trade_uid": request.trade_uid,
+                    "note": request.note,
+                },
+            ),
         )
         return PortfolioEventCreatedResponse(**data)
     except PortfolioBusyError as exc:
@@ -259,13 +301,19 @@ def delete_trade(trade_id: int) -> PortfolioDeleteResponse:
 def create_cash_ledger(request: PortfolioCashLedgerCreateRequest) -> PortfolioEventCreatedResponse:
     service = PortfolioService()
     try:
-        data = service.record_cash_ledger(
-            account_id=request.account_id,
-            event_date=request.event_date,
-            direction=request.direction,
-            amount=request.amount,
-            currency=request.currency,
-            note=request.note,
+        data = _submit_ledger_command(
+            service,
+            LedgerCommand(
+                account_id=request.account_id,
+                kind="cash_ledger",
+                payload={
+                    "event_date": request.event_date,
+                    "direction": request.direction,
+                    "amount": request.amount,
+                    "currency": request.currency,
+                    "note": request.note,
+                },
+            ),
         )
         return PortfolioEventCreatedResponse(**data)
     except PortfolioBusyError as exc:
@@ -337,16 +385,22 @@ def delete_cash_ledger(entry_id: int) -> PortfolioDeleteResponse:
 def create_corporate_action(request: PortfolioCorporateActionCreateRequest) -> PortfolioEventCreatedResponse:
     service = PortfolioService()
     try:
-        data = service.record_corporate_action(
-            account_id=request.account_id,
-            symbol=request.symbol,
-            effective_date=request.effective_date,
-            action_type=request.action_type,
-            market=request.market,
-            currency=request.currency,
-            cash_dividend_per_share=request.cash_dividend_per_share,
-            split_ratio=request.split_ratio,
-            note=request.note,
+        data = _submit_ledger_command(
+            service,
+            LedgerCommand(
+                account_id=request.account_id,
+                kind="corporate_action",
+                payload={
+                    "symbol": request.symbol,
+                    "effective_date": request.effective_date,
+                    "action_type": request.action_type,
+                    "market": request.market,
+                    "currency": request.currency,
+                    "cash_dividend_per_share": request.cash_dividend_per_share,
+                    "split_ratio": request.split_ratio,
+                    "note": request.note,
+                },
+            ),
         )
         return PortfolioEventCreatedResponse(**data)
     except PortfolioBusyError as exc:

@@ -119,11 +119,33 @@ class DesktopBackendPackagingAssetsTestCase(unittest.TestCase):
         strategies_dir = self.repo_root / "strategies"
         strategy_names = sorted(path.stem for path in strategies_dir.glob("*.yaml"))
 
-        self.assertEqual(len(strategy_names), 15)
-        self.assertIn("bottom_volume", strategy_names)
-        self.assertIn("chan_theory", strategy_names)
-        self.assertIn("ma_golden_cross", strategy_names)
-        self.assertIn("wave_theory", strategy_names)
+        self.assertEqual(
+            strategy_names,
+            [
+                "bottom_volume",
+                "box_oscillation",
+                "bull_trend",
+                "chan_theory",
+                "deep_company_research",
+                "dragon_head",
+                "emotion_cycle",
+                "event_driven",
+                "expectation_repricing",
+                "financial_statement_quality",
+                "growth_quality",
+                "hot_theme",
+                "ma_golden_cross",
+                "one_yang_three_yin",
+                "ownership_and_flow",
+                "research_discipline",
+                "shadow_account_review",
+                "shrink_pullback",
+                "trade_review",
+                "valuation_scenarios",
+                "volume_breakout",
+                "wave_theory",
+            ],
+        )
 
     def test_backend_pyinstaller_scripts_include_strategies_data_directory(self):
         macos_script = (self.repo_root / "scripts" / "build-backend-macos.sh").read_text(

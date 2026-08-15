@@ -300,6 +300,126 @@ class FundamentalSnapshot(Base):
         return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
 
 
+class ResearchEvidence(Base):
+    """Bounded structured announcement/research evidence.
+
+    ``content_hash`` is the exact-content deduplication key.  A PDF or other
+    long document is represented by ``artifact_ref``; ``payload`` is reserved
+    for the small normalized metadata/summary used by research tools.
+    """
+
+    __tablename__ = 'research_evidence'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    evidence_id = Column(String(64), nullable=False, unique=True, index=True)
+    kind = Column(String(32), nullable=False, index=True)
+    code = Column(String(16), index=True)
+    title = Column(String(500), nullable=False)
+    published_at = Column(DateTime, index=True)
+    source = Column(String(100), nullable=False, index=True)
+    source_tier = Column(String(32), nullable=False, default='primary', index=True)
+    url = Column(String(1500))
+    artifact_ref = Column(String(1500))
+    summary = Column(Text)
+    content_hash = Column(String(64), nullable=False, unique=True, index=True)
+    schema_fingerprint = Column(String(64), nullable=False)
+    payload = Column(Text)
+    quality_flags = Column(Text)
+    conflict_group = Column(String(64), index=True)
+    expires_at = Column(DateTime, index=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        Index('ix_research_evidence_code_kind_date', 'code', 'kind', 'published_at'),
+        Index('ix_research_evidence_tier_source', 'source_tier', 'source'),
+    )
+
+
+class ShadowProfile(Base):
+    """Versioned, approval-gated Shadow Research profile."""
+
+    __tablename__ = 'shadow_profiles'
+
+    profile_id = Column(String(64), primary_key=True)
+    name = Column(String(120), nullable=False, unique=True, index=True)
+    description = Column(Text)
+    status = Column(String(24), nullable=False, default='draft', index=True)
+    rule_version = Column(String(32), nullable=False)
+    approved_at = Column(DateTime, index=True)
+    approved_by = Column(String(120))
+    degraded_reason = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+
+class ShadowRule(Base):
+    """Immutable rule version compiled from the allowlisted Shadow DSL."""
+
+    __tablename__ = 'shadow_rules'
+
+    rule_id = Column(Integer, primary_key=True, autoincrement=True)
+    profile_id = Column(String(64), ForeignKey('shadow_profiles.profile_id', ondelete='CASCADE'), nullable=False, index=True)
+    version = Column(String(32), nullable=False)
+    dsl = Column(Text, nullable=False)
+    rule_hash = Column(String(64), nullable=False)
+    feature_names = Column(Text)
+    status = Column(String(24), nullable=False, default='draft', index=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('profile_id', 'version', name='uix_shadow_rule_profile_version'),
+        UniqueConstraint('profile_id', 'rule_hash', name='uix_shadow_rule_profile_hash'),
+    )
+
+
+class ShadowBacktestRun(Base):
+    """Time-split Shadow backtest result and frozen source snapshot hash."""
+
+    __tablename__ = 'shadow_backtest_runs'
+
+    run_id = Column(String(64), primary_key=True)
+    profile_id = Column(String(64), ForeignKey('shadow_profiles.profile_id', ondelete='CASCADE'), nullable=False, index=True)
+    rule_id = Column(Integer, ForeignKey('shadow_rules.rule_id', ondelete='RESTRICT'), nullable=False, index=True)
+    code = Column(String(16), nullable=False, index=True)
+    split_date = Column(Date, nullable=False, index=True)
+    source_snapshot_hash = Column(String(64), nullable=False, index=True)
+    status = Column(String(24), nullable=False, default='running', index=True)
+    metrics = Column(Text, nullable=False)
+    degraded_reason = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('profile_id', 'rule_id', 'code', 'source_snapshot_hash', name='uix_shadow_run_snapshot'),
+    )
+
+
+class ShadowSignal(Base):
+    """Non-tradeable signal generated only after approved Shadow scanning."""
+
+    __tablename__ = 'shadow_signals'
+
+    signal_id = Column(String(64), primary_key=True)
+    profile_id = Column(String(64), ForeignKey('shadow_profiles.profile_id', ondelete='CASCADE'), nullable=False, index=True)
+    rule_id = Column(Integer, ForeignKey('shadow_rules.rule_id', ondelete='RESTRICT'), nullable=False, index=True)
+    run_id = Column(String(64), ForeignKey('shadow_backtest_runs.run_id', ondelete='RESTRICT'), nullable=False, index=True)
+    code = Column(String(16), nullable=False, index=True)
+    signal_date = Column(Date, nullable=False, index=True)
+    status = Column(String(24), nullable=False, default='eligible', index=True)
+    feature_snapshot_hash = Column(String(64), nullable=False, index=True)
+    data_cutoff = Column(Date, nullable=False, index=True)
+    evidence_refs = Column(Text)
+    reason = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'profile_id', 'rule_id', 'run_id', 'code', 'signal_date', 'feature_snapshot_hash',
+            name='uix_shadow_signal_replay',
+        ),
+    )
+
+
 class ScreeningRun(Base):
     """A completed built-in screening run persisted by DSA."""
 
@@ -525,11 +645,187 @@ class PortfolioAccount(Base):
     market = Column(String(8), nullable=False, default='cn', index=True)  # cn/hk/us
     base_currency = Column(String(8), nullable=False, default='CNY')
     is_active = Column(Boolean, nullable=False, default=True, index=True)
+    # Paper Account metadata lives on the canonical account row. Legacy rows
+    # are backfilled to the safe manual/external-disabled defaults at startup.
+    account_kind = Column(String(16), nullable=False, default='manual', index=True)
+    controller_kind = Column(String(32), nullable=False, default='manual')
+    external_execution_enabled = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.now, index=True)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
     __table_args__ = (
         Index('ix_portfolio_account_owner_active', 'owner_id', 'is_active'),
+        CheckConstraint(
+            'external_execution_enabled = 0',
+            name='ck_portfolio_account_external_execution_disabled',
+        ),
+    )
+
+
+class PaperAccountConfig(Base):
+    """Versioned Paper Account mandate/controller configuration."""
+
+    __tablename__ = 'paper_account_configs'
+
+    config_id = Column(String(64), primary_key=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id', ondelete='CASCADE'), nullable=False, unique=True, index=True)
+    config_version = Column(Integer, nullable=False, default=1)
+    controller_kind = Column(String(32), nullable=False, default='llm')
+    approval_mode = Column(String(24), nullable=False, default='recommend_only')
+    mandate_version = Column(String(32), nullable=False, default='1')
+    mandate_json = Column(Text, nullable=False)
+    initial_cash = Column(Float, nullable=False, default=0.0)
+    state = Column(String(16), nullable=False, default='active', index=True)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+
+class PaperDecisionRun(Base):
+    """Idempotent Paper decision-cycle envelope."""
+
+    __tablename__ = 'paper_decision_runs'
+
+    run_id = Column(String(64), primary_key=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id', ondelete='CASCADE'), nullable=False, index=True)
+    decision_at = Column(DateTime, nullable=False, index=True)
+    strategy_version = Column(String(64), nullable=False)
+    config_version = Column(Integer, nullable=False, default=1)
+    status = Column(String(24), nullable=False, default='created', index=True)
+    idempotency_key = Column(String(128), nullable=False)
+    # Sanitized execution trace.  Raw prompts, hidden reasoning and model
+    # output free text are deliberately not persisted here.
+    backend = Column(String(64))
+    model = Column(String(160))
+    prompt_version = Column(String(64))
+    skill_version = Column(String(64))
+    tool_trace_json = Column(Text)
+    diagnostics_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'account_id', 'decision_at', 'strategy_version',
+            name='uix_paper_run_account_decision_strategy',
+        ),
+        UniqueConstraint('account_id', 'idempotency_key', name='uix_paper_run_account_idempotency'),
+    )
+
+
+class PaperObservation(Base):
+    """Immutable point-in-time observation consumed by one Paper run."""
+
+    __tablename__ = 'paper_observations'
+
+    observation_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey('paper_decision_runs.run_id', ondelete='CASCADE'), nullable=False, index=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id', ondelete='CASCADE'), nullable=False, index=True)
+    cutoff_at = Column(DateTime, nullable=False, index=True)
+    payload_hash = Column(String(64), nullable=False, index=True)
+    payload_json = Column(Text, nullable=False)
+    status = Column(String(24), nullable=False, default='frozen')
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'payload_hash', name='uix_paper_observation_run_hash'),
+    )
+
+
+class PaperProposal(Base):
+    """Strictly structured model proposal; free text is never order input."""
+
+    __tablename__ = 'paper_proposals'
+
+    proposal_id = Column(String(64), primary_key=True)
+    run_id = Column(String(64), ForeignKey('paper_decision_runs.run_id', ondelete='CASCADE'), nullable=False, index=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id', ondelete='CASCADE'), nullable=False, index=True)
+    proposal_version = Column(Integer, nullable=False, default=1)
+    symbol = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn')
+    side = Column(String(8), nullable=False)
+    order_type = Column(String(16), nullable=False, default='market')
+    quantity = Column(Float)
+    target_weight = Column(Float)
+    limit_price = Column(Float)
+    stop_price = Column(Float)
+    rationale = Column(Text, nullable=False)
+    evidence_refs = Column(Text, nullable=False, default='[]')
+    proposal_hash = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False, default='proposed', index=True)
+    decision_by = Column(String(120))
+    decision_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('run_id', 'proposal_hash', name='uix_paper_proposal_run_hash'),
+    )
+
+
+class PaperRiskDecision(Base):
+    """Immutable mandate evaluation result for one Proposal version."""
+
+    __tablename__ = 'paper_risk_decisions'
+
+    risk_decision_id = Column(String(64), primary_key=True)
+    proposal_id = Column(String(64), ForeignKey('paper_proposals.proposal_id', ondelete='CASCADE'), nullable=False, index=True)
+    run_id = Column(String(64), ForeignKey('paper_decision_runs.run_id', ondelete='CASCADE'), nullable=False, index=True)
+    decision = Column(String(16), nullable=False)
+    rule_codes = Column(Text, nullable=False, default='[]')
+    details_json = Column(Text, nullable=False, default='{}')
+    mandate_version = Column(String(32), nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+
+class PaperOrder(Base):
+    """Virtual order lifecycle; never submitted to an external broker."""
+
+    __tablename__ = 'paper_orders'
+
+    order_id = Column(String(64), primary_key=True)
+    proposal_id = Column(String(64), ForeignKey('paper_proposals.proposal_id', ondelete='CASCADE'), nullable=False, unique=True, index=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id', ondelete='CASCADE'), nullable=False, index=True)
+    symbol = Column(String(16), nullable=False, index=True)
+    market = Column(String(8), nullable=False, default='cn')
+    side = Column(String(8), nullable=False)
+    order_type = Column(String(16), nullable=False, default='market')
+    quantity = Column(Float, nullable=False)
+    limit_price = Column(Float)
+    stop_price = Column(Float)
+    status = Column(String(24), nullable=False, default='staged', index=True)
+    version = Column(Integer, nullable=False, default=1)
+    observation_id = Column(String(64), ForeignKey('paper_observations.observation_id', ondelete='SET NULL'), index=True)
+    observation_cutoff = Column(DateTime, nullable=False)
+    execution_policy = Column(String(24), nullable=False, default='next_open')
+    expires_at = Column(DateTime)
+    filled_quantity = Column(Float, nullable=False, default=0.0)
+    avg_fill_price = Column(Float)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, nullable=False)
+
+
+class PaperFill(Base):
+    """Virtual fill identity that projects through portfolio ledger outbox."""
+
+    __tablename__ = 'paper_fills'
+
+    fill_id = Column(String(64), primary_key=True)
+    order_id = Column(String(64), ForeignKey('paper_orders.order_id', ondelete='CASCADE'), nullable=False, index=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id', ondelete='CASCADE'), nullable=False, index=True)
+    fill_date = Column(Date, nullable=False, index=True)
+    quantity = Column(Float, nullable=False)
+    price = Column(Float, nullable=False)
+    fee = Column(Float, nullable=False, default=0.0)
+    tax = Column(Float, nullable=False, default=0.0)
+    fill_hash = Column(String(64), nullable=False)
+    status = Column(String(24), nullable=False, default='pending', index=True)
+    ledger_outbox_id = Column(Integer, ForeignKey('portfolio_ledger_outbox.id', ondelete='SET NULL'))
+    bar_timestamp = Column(DateTime, nullable=False, index=True)
+    execution_policy = Column(String(24), nullable=False, default='next_open')
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('order_id', 'fill_hash', name='uix_paper_fill_order_hash'),
     )
 
 
@@ -558,6 +854,46 @@ class PortfolioTrade(Base):
         UniqueConstraint('account_id', 'trade_uid', name='uix_portfolio_trade_uid'),
         UniqueConstraint('account_id', 'dedup_hash', name='uix_portfolio_trade_dedup_hash'),
         Index('ix_portfolio_trade_account_date', 'account_id', 'trade_date'),
+    )
+
+
+class PortfolioLedgerOutbox(Base):
+    """Durable pending projection for a fake/virtual fill.
+
+    The first Paper Account slice does not own a separate ``paper_fills``
+    table yet.  This same-database row therefore stores the immutable fill
+    payload until the Account Ledger accepts the corresponding trade.  A
+    retry can safely replay the payload because ``trade_uid`` is unique per
+    account and uses the reserved ``paper:<fill_id>`` namespace.
+    """
+
+    __tablename__ = 'portfolio_ledger_outbox'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, ForeignKey('portfolio_accounts.id'), nullable=False, index=True)
+    fill_id = Column(String(128), nullable=False)
+    trade_uid = Column(String(128), nullable=False)
+    payload = Column(Text, nullable=False)
+    status = Column(String(16), nullable=False, default='pending', index=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text)
+    ledger_event_id = Column(Integer)
+    created_at = Column(DateTime, default=datetime.now, nullable=False, index=True)
+    applied_at = Column(DateTime)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            'account_id',
+            'fill_id',
+            name='uix_portfolio_outbox_account_fill',
+        ),
+        UniqueConstraint(
+            'account_id',
+            'trade_uid',
+            name='uix_portfolio_outbox_account_trade_uid',
+        ),
+        Index('ix_portfolio_outbox_status_created', 'status', 'created_at'),
     )
 
 
@@ -963,6 +1299,9 @@ class AlertTriggerRecord(Base):
     reason = Column(Text)
     data_source = Column(String(64))
     data_timestamp = Column(DateTime, index=True)
+    # Opaque event identities (Paper/Shadow fills, order events, etc.) must
+    # not be compressed into a lossy timestamp surrogate for deduplication.
+    source_event_id = Column(String(128), index=True)
     triggered_at = Column(DateTime, default=datetime.now, index=True)
     status = Column(String(16), nullable=False, default='triggered', index=True)
     diagnostics = Column(Text)
@@ -1310,6 +1649,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     
     _instance: Optional['DatabaseManager'] = None
     _init_lock = threading.RLock()
+    # Portfolio events and their projections must share one in-process
+    # writer lock. SQLite's BEGIN IMMEDIATE still protects the database when
+    # multiple processes are involved, while this lock prevents two
+    # repository instances in the same worker from interleaving the
+    # read/validate/write part of a ledger cycle.
+    _ledger_write_lock = threading.RLock()
     _initialized: bool = False
     
     def __new__(cls, *args, **kwargs):
@@ -1370,8 +1715,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
             # 创建所有表
             Base.metadata.create_all(self._engine)
-            self._ensure_llm_usage_telemetry_columns()
+            # Run the decision-signal migration before the other compatibility
+            # migrations so its guarded inspector failure remains observable
+            # and cannot be masked by an unrelated legacy table inspection.
             self._ensure_decision_signal_profile_schema()
+            self._ensure_portfolio_account_paper_schema()
+            self._ensure_paper_decision_trace_schema()
+            self._ensure_alert_trigger_event_identity_schema()
+            self._ensure_llm_usage_telemetry_columns()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
@@ -1418,6 +1769,98 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             raise
         finally:
             session.close()
+
+    def _ensure_portfolio_account_paper_schema(self) -> None:
+        """Backfill Paper Account metadata columns on pre-paper SQLite DBs."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        if not inspector.has_table(PortfolioAccount.__tablename__):
+            return
+        existing = {column["name"] for column in inspector.get_columns(PortfolioAccount.__tablename__)}
+        columns = {
+            "account_kind": "VARCHAR(16) NOT NULL DEFAULT 'manual'",
+            "controller_kind": "VARCHAR(32) NOT NULL DEFAULT 'manual'",
+            "external_execution_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+        }
+        with self._engine.begin() as connection:
+            for name, definition in columns.items():
+                if name not in existing:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {PortfolioAccount.__tablename__} ADD COLUMN {name} {definition}"
+                    )
+        # Existing deployments must never silently become externally executable.
+        with self._engine.begin() as connection:
+            connection.exec_driver_sql(
+                f"UPDATE {PortfolioAccount.__tablename__} "
+                "SET account_kind = COALESCE(account_kind, 'manual'), "
+                "controller_kind = COALESCE(controller_kind, 'manual'), "
+                "external_execution_enabled = 0"
+            )
+
+    def _ensure_paper_decision_trace_schema(self) -> None:
+        """Backfill trace/audit columns on pre-Task-10 Paper databases."""
+
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        migrations = {
+            PaperDecisionRun.__tablename__: {
+                "backend": "VARCHAR(64)",
+                "model": "VARCHAR(160)",
+                "prompt_version": "VARCHAR(64)",
+                "skill_version": "VARCHAR(64)",
+                "tool_trace_json": "TEXT",
+                "diagnostics_json": "TEXT",
+            },
+            PaperProposal.__tablename__: {
+                "decision_by": "VARCHAR(120)",
+                "decision_at": "DATETIME",
+            },
+            PaperOrder.__tablename__: {
+                "observation_id": "VARCHAR(64)",
+                "observation_cutoff": "DATETIME",
+                "execution_policy": "VARCHAR(24) NOT NULL DEFAULT 'next_open'",
+                "expires_at": "DATETIME",
+                "filled_quantity": "FLOAT NOT NULL DEFAULT 0",
+                "avg_fill_price": "FLOAT",
+                "stop_price": "FLOAT",
+            },
+            PaperFill.__tablename__: {
+                "bar_timestamp": "DATETIME",
+                "execution_policy": "VARCHAR(24) NOT NULL DEFAULT 'next_open'",
+            },
+        }
+        for table_name, columns in migrations.items():
+            if not inspector.has_table(table_name):
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table_name)}
+            with self._engine.begin() as connection:
+                for name, definition in columns.items():
+                    if name not in existing:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}"
+                        )
+
+    def _ensure_alert_trigger_event_identity_schema(self) -> None:
+        """Add the lossless opaque-event identity column to alert history."""
+        if not self._is_sqlite_engine:
+            return
+        table_name = AlertTriggerRecord.__tablename__
+        inspector = inspect(self._engine)
+        if not inspector.has_table(table_name):
+            return
+        existing = {column["name"] for column in inspector.get_columns(table_name)}
+        with self._engine.begin() as connection:
+            if "source_event_id" not in existing:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN source_event_id VARCHAR(128)"
+                )
+            connection.exec_driver_sql(
+                f"CREATE INDEX IF NOT EXISTS ix_alert_trigger_source_event_id "
+                f"ON {table_name} (source_event_id)"
+            )
 
     def _ensure_decision_signal_profile_schema(self) -> None:
         """Add and backfill nullable decision_profile for existing SQLite DBs."""
@@ -1931,6 +2374,18 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             raise
 
     @contextmanager
+    def ledger_write_lock(self):
+        """Serialize account-ledger cycles within this process.
+
+        The lock is deliberately independent from SQLAlchemy sessions.  A
+        repository cycle acquires it before opening ``BEGIN IMMEDIATE`` and
+        releases it only after commit/rollback, so pre-write validation,
+        event insertion and projection invalidation observe one ordering.
+        """
+        with self._ledger_write_lock:
+            yield
+
+    @contextmanager
     def session_scope(self):
         """Provide a transactional scope around a series of operations."""
         session = self.get_session()
@@ -2211,6 +2666,186 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 return payload if isinstance(payload, dict) else None
             except Exception:
                 return None
+
+    @staticmethod
+    def _research_tier_rank(value: Optional[str]) -> int:
+        return {
+            "official": 0,
+            "primary": 1,
+            "backup": 2,
+            "derived": 3,
+        }.get(str(value or "").strip().lower(), 99)
+
+    def save_research_evidence(
+        self,
+        evidence: Dict[str, Any],
+        *,
+        expires_at: Optional[datetime] = None,
+        max_payload_chars: int = 12000,
+    ) -> int:
+        """Insert or deduplicate one normalized EvidenceRecord.
+
+        Exact ``content_hash`` duplicates share one row.  If a later source
+        has a stronger tier (official before primary/backup), its provenance
+        replaces the weaker source while preserving the evidence identity.
+        Long payloads are dropped rather than copied into the research/tool
+        path; callers should retain ``artifact_ref`` for those documents.
+        """
+
+        if not isinstance(evidence, dict):
+            return 0
+        required = ("evidence_id", "kind", "title", "source", "source_tier", "content_hash", "schema_fingerprint")
+        if any(not str(evidence.get(field) or "").strip() for field in required):
+            return 0
+        payload = evidence.get("payload")
+        payload_text = self._safe_json_dumps(payload) if payload is not None else None
+        flags = list(evidence.get("quality_flags") or [])
+        if payload_text and len(payload_text) > max(1, int(max_payload_chars)):
+            payload_text = None
+            if "payload_truncated" not in flags:
+                flags.append("payload_truncated")
+        published_at = evidence.get("published_at")
+        if isinstance(published_at, str):
+            published_at = self._parse_published_date(published_at)
+        expires_value = expires_at or evidence.get("expires_at")
+        if isinstance(expires_value, str):
+            expires_value = self._parse_published_date(expires_value)
+
+        values = {
+            "evidence_id": str(evidence["evidence_id"]),
+            "kind": str(evidence["kind"]),
+            "code": evidence.get("code"),
+            "title": str(evidence["title"])[:500],
+            "published_at": published_at,
+            "source": str(evidence["source"]),
+            "source_tier": str(evidence["source_tier"]),
+            "url": evidence.get("url"),
+            "artifact_ref": evidence.get("artifact_ref"),
+            "summary": str(evidence.get("summary"))[:2000] if evidence.get("summary") is not None else None,
+            "content_hash": str(evidence["content_hash"]),
+            "schema_fingerprint": str(evidence["schema_fingerprint"]),
+            "payload": payload_text,
+            "quality_flags": self._safe_json_dumps(flags),
+            "conflict_group": evidence.get("conflict_group"),
+            "expires_at": expires_value,
+            "updated_at": datetime.now(),
+        }
+
+        def _write(session: Session) -> int:
+            existing = session.execute(
+                select(ResearchEvidence).where(ResearchEvidence.content_hash == values["content_hash"])
+            ).scalar_one_or_none()
+            if existing is None:
+                # Return the row we just inserted.  ``MAX(id)`` could return a
+                # concurrently-inserted row, and Paper Account binds Proposals
+                # to Evidence by this id.
+                inserted = ResearchEvidence(created_at=datetime.now(), **values)
+                session.add(inserted)
+                session.flush()
+                return int(inserted.id)
+
+            # Do not let a backup overwrite an official record.  A stronger
+            # source can refresh provenance and the bounded summary.
+            if self._research_tier_rank(values["source_tier"]) < self._research_tier_rank(existing.source_tier):
+                existing.source = values["source"]
+                existing.source_tier = values["source_tier"]
+                existing.url = values["url"] or existing.url
+                existing.artifact_ref = values["artifact_ref"] or existing.artifact_ref
+            if values["summary"] and not existing.summary:
+                existing.summary = values["summary"]
+            if values["payload"] and not existing.payload:
+                existing.payload = values["payload"]
+            if values["conflict_group"]:
+                existing.conflict_group = values["conflict_group"]
+            existing.quality_flags = values["quality_flags"]
+            existing.updated_at = values["updated_at"]
+            session.flush()
+            return int(existing.id)
+
+        return self._run_write_transaction(
+            f"save_research_evidence[{values['content_hash']}]",
+            _write,
+        )
+
+    @staticmethod
+    def _research_evidence_dict(row: ResearchEvidence, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+        now = now or datetime.now()
+        try:
+            flags = json.loads(row.quality_flags or "[]")
+        except Exception:
+            flags = []
+        expires_at = row.expires_at
+        stale = bool(expires_at and expires_at <= now)
+        return {
+            "id": row.id,
+            "evidence_id": row.evidence_id,
+            "kind": row.kind,
+            "code": row.code,
+            "title": row.title,
+            "published_at": row.published_at,
+            "source": row.source,
+            "source_tier": row.source_tier,
+            "url": row.url,
+            "artifact_ref": row.artifact_ref,
+            "summary": row.summary,
+            "content_hash": row.content_hash,
+            "schema_fingerprint": row.schema_fingerprint,
+            "payload": json.loads(row.payload) if row.payload else None,
+            "quality_flags": flags,
+            "conflict_group": row.conflict_group,
+            "expires_at": expires_at,
+            "stale": stale,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+
+    def get_research_evidence(self, content_hash: str) -> Optional[Dict[str, Any]]:
+        if not content_hash:
+            return None
+        with self.get_session() as session:
+            row = session.execute(
+                select(ResearchEvidence).where(ResearchEvidence.content_hash == str(content_hash)).limit(1)
+            ).scalar_one_or_none()
+            return self._research_evidence_dict(row) if row is not None else None
+
+    def list_research_evidence(
+        self,
+        *,
+        code: Optional[str] = None,
+        kind: Optional[str] = None,
+        cutoff: Optional[datetime] = None,
+        include_stale: bool = True,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        conditions = []
+        if code:
+            conditions.append(ResearchEvidence.code == str(code))
+        if kind:
+            conditions.append(ResearchEvidence.kind == str(kind))
+        if cutoff:
+            conditions.append(or_(ResearchEvidence.published_at.is_(None), ResearchEvidence.published_at <= cutoff))
+        if not include_stale:
+            conditions.append(or_(ResearchEvidence.expires_at.is_(None), ResearchEvidence.expires_at > datetime.now()))
+        with self.get_session() as session:
+            rows = session.execute(
+                select(ResearchEvidence)
+                .where(and_(*conditions) if conditions else text("1=1"))
+                .order_by(desc(ResearchEvidence.published_at), desc(ResearchEvidence.id))
+                .limit(max(1, min(int(limit), 500)))
+            ).scalars().all()
+            return [self._research_evidence_dict(row) for row in rows]
+
+    def purge_research_evidence(self, before: datetime) -> int:
+        """Delete expired/old evidence explicitly; no implicit destructive TTL."""
+
+        if not isinstance(before, datetime):
+            raise TypeError("before must be datetime")
+
+        def _write(session: Session) -> int:
+            result = session.execute(delete(ResearchEvidence).where(ResearchEvidence.created_at < before))
+            return int(result.rowcount or 0)
+
+        return self._run_write_transaction("purge_research_evidence", _write)
 
     def save_screening_run(self, payload: Dict[str, Any]) -> int:
         """Persist one completed screening response without blocking screening on DB errors."""

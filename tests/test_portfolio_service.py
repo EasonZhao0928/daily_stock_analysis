@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,7 +22,13 @@ from sqlalchemy import select
 
 from src.config import Config
 from src.repositories.portfolio_repo import PortfolioBusyError, PortfolioRepository
-from src.services.portfolio_service import _AvgState, PortfolioConflictError, PortfolioOversellError, PortfolioService
+from src.services.portfolio_service import (
+    LedgerCommand,
+    _AvgState,
+    PortfolioConflictError,
+    PortfolioOversellError,
+    PortfolioService,
+)
 from src.storage import DatabaseManager, PortfolioDailySnapshot, PortfolioPosition, PortfolioPositionLot, PortfolioTrade
 
 
@@ -311,6 +319,49 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertTrue(all(position["price_source"] == "realtime_quote" for position in positions))
         self.assertTrue(all(position["price_provider"] == "unit-test" for position in positions))
 
+    def test_current_snapshot_fetches_realtime_outside_ledger_cycle(self) -> None:
+        """B2 regression: provider/network work must not run under the ledger lock."""
+        today = date.today()
+        account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+        self.service.record_trade(
+            account_id=aid,
+            symbol="600519",
+            trade_date=today,
+            side="buy",
+            quantity=10,
+            price=100,
+            market="cn",
+            currency="CNY",
+        )
+
+        state = {"ledger_open": False, "prefetch_called": False}
+        original_cycle = self.service.repo.ledger_cycle
+
+        @contextmanager
+        def tracked_cycle():
+            state["ledger_open"] = True
+            try:
+                with original_cycle() as session:
+                    yield session
+            finally:
+                state["ledger_open"] = False
+
+        def prefetch(symbols):
+            self.assertFalse(state["ledger_open"])
+            state["prefetch_called"] = True
+            return {symbol: (125.0, "unit-test") for symbol in symbols}
+
+        with patch.object(self.service.repo, "ledger_cycle", tracked_cycle), patch.object(
+            self.service,
+            "_prefetch_realtime_position_prices",
+            side_effect=prefetch,
+        ):
+            snapshot = self.service.get_portfolio_snapshot(account_id=aid, as_of=today)
+
+        self.assertTrue(state["prefetch_called"])
+        self.assertEqual(snapshot["accounts"][0]["positions"][0]["price_source"], "realtime_quote")
+
     def test_current_snapshot_does_not_serialize_when_bulk_prefetch_cache_misses(self) -> None:
         """Bulk-prefetch path must not share a fetcher manager across workers.
 
@@ -484,6 +535,101 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertEqual(len(avg_acc["positions"]), 1)
         self.assertAlmostEqual(fifo_acc["positions"][0]["quantity"], 50.0, places=6)
         self.assertAlmostEqual(avg_acc["positions"][0]["quantity"], 50.0, places=6)
+
+    def test_replaying_same_event_stream_keeps_snapshot_and_cache_invariants(self) -> None:
+        account = self.service.create_account(name="Replay", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+
+        self.service.record_cash_ledger(
+            account_id=aid,
+            event_date=date(2026, 1, 1),
+            direction="in",
+            amount=10000,
+            currency="CNY",
+        )
+        self.service.record_trade(
+            account_id=aid,
+            symbol="600519",
+            trade_date=date(2026, 1, 2),
+            side="buy",
+            quantity=100,
+            price=10,
+            fee=10,
+            market="cn",
+            currency="CNY",
+        )
+        self.service.record_trade(
+            account_id=aid,
+            symbol="600519",
+            trade_date=date(2026, 1, 3),
+            side="buy",
+            quantity=50,
+            price=20,
+            fee=5,
+            market="cn",
+            currency="CNY",
+        )
+        self.service.record_trade(
+            account_id=aid,
+            symbol="600519",
+            trade_date=date(2026, 1, 4),
+            side="sell",
+            quantity=80,
+            price=30,
+            fee=6,
+            tax=3,
+            market="cn",
+            currency="CNY",
+        )
+        self._save_close("600519", date(2026, 1, 5), 25.0)
+
+        first = self.service.get_portfolio_snapshot(
+            account_id=aid,
+            as_of=date(2026, 1, 5),
+            cost_method="fifo",
+        )
+        second = self.service.get_portfolio_snapshot(
+            account_id=aid,
+            as_of=date(2026, 1, 5),
+            cost_method="fifo",
+        )
+
+        self.assertEqual(first, second)
+        account_snapshot = first["accounts"][0]
+        self.assertAlmostEqual(account_snapshot["total_cash"], 10376.0, places=6)
+        self.assertAlmostEqual(account_snapshot["total_market_value"], 1750.0, places=6)
+        self.assertAlmostEqual(account_snapshot["total_equity"], 12126.0, places=6)
+        self.assertAlmostEqual(account_snapshot["realized_pnl"], 1583.0, places=6)
+        self.assertAlmostEqual(account_snapshot["unrealized_pnl"], 543.0, places=6)
+        self.assertAlmostEqual(account_snapshot["fee_total"], 21.0, places=6)
+        self.assertAlmostEqual(account_snapshot["tax_total"], 3.0, places=6)
+        self.assertEqual(account_snapshot["positions"][0]["quantity"], 70.0)
+
+        with self.db.get_session() as session:
+            snapshot_rows = session.execute(
+                select(PortfolioDailySnapshot).where(
+                    PortfolioDailySnapshot.account_id == aid,
+                    PortfolioDailySnapshot.snapshot_date == date(2026, 1, 5),
+                    PortfolioDailySnapshot.cost_method == "fifo",
+                )
+            ).scalars().all()
+            position_rows = session.execute(
+                select(PortfolioPosition).where(
+                    PortfolioPosition.account_id == aid,
+                    PortfolioPosition.cost_method == "fifo",
+                )
+            ).scalars().all()
+            lot_rows = session.execute(
+                select(PortfolioPositionLot).where(
+                    PortfolioPositionLot.account_id == aid,
+                    PortfolioPositionLot.cost_method == "fifo",
+                )
+            ).scalars().all()
+
+        self.assertEqual(len(snapshot_rows), 1)
+        self.assertEqual(len(position_rows), 1)
+        self.assertEqual(sorted(round(float(row.remaining_quantity), 6) for row in lot_rows), [20.0, 50.0])
+        self.assertEqual(json.loads(snapshot_rows[0].payload), account_snapshot)
 
     def test_snapshot_position_price_metadata_uses_backend_values_for_cn_hk_us(self) -> None:
         for market, currency, symbol, close, expected_symbol in [
@@ -813,6 +959,42 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertAlmostEqual(pos["quantity"], 200.0, places=6)
         self.assertAlmostEqual(pos["avg_cost"], 5.0, places=6)
 
+    def test_fx_conversion_keeps_direct_inverse_and_missing_rate_behavior(self) -> None:
+        as_of = date(2026, 1, 5)
+        self.service.repo.save_fx_rate(
+            from_currency="USD",
+            to_currency="CNY",
+            rate_date=as_of,
+            rate=7.0,
+            source="unit-test",
+            is_stale=False,
+        )
+
+        direct = self.service.convert_amount(
+            amount=100.0,
+            from_currency="USD",
+            to_currency="CNY",
+            as_of_date=as_of,
+        )
+        inverse = self.service.convert_amount(
+            amount=700.0,
+            from_currency="CNY",
+            to_currency="USD",
+            as_of_date=as_of,
+        )
+        fallback = self.service.convert_amount(
+            amount=100.0,
+            from_currency="EUR",
+            to_currency="CNY",
+            as_of_date=as_of,
+        )
+
+        self.assertEqual(direct, (700.0, False, "direct_rate"))
+        self.assertAlmostEqual(inverse[0], 100.0, places=6)
+        self.assertFalse(inverse[1])
+        self.assertEqual(inverse[2], "inverse_rate")
+        self.assertEqual(fallback, (100.0, True, "fallback_1_to_1"))
+
     def test_normalize_symbol_preserves_cn_exchange_prefix_and_suffix(self) -> None:
         self.assertEqual(self.service._normalize_symbol("sh600519"), "SH600519")
         self.assertEqual(self.service._normalize_symbol("600519.SH"), "SH600519")
@@ -981,6 +1163,49 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertEqual(len(trades["items"]), 1)
         self.assertEqual(trades["items"][0]["side"], "buy")
 
+    def test_inactive_account_rejects_all_event_writes_without_state(self) -> None:
+        account = self.service.create_account(name="Archived", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+
+        self.assertTrue(self.service.deactivate_account(aid))
+        with self.assertRaisesRegex(ValueError, "Active account not found"):
+            self.service.record_trade(
+                account_id=aid,
+                symbol="600519",
+                trade_date=date(2026, 1, 2),
+                side="buy",
+                quantity=10,
+                price=100,
+                market="cn",
+                currency="CNY",
+            )
+        with self.assertRaisesRegex(ValueError, "Active account not found"):
+            self.service.record_cash_ledger(
+                account_id=aid,
+                event_date=date(2026, 1, 2),
+                direction="in",
+                amount=1000,
+                currency="CNY",
+            )
+        with self.assertRaisesRegex(ValueError, "Active account not found"):
+            self.service.record_corporate_action(
+                account_id=aid,
+                symbol="600519",
+                effective_date=date(2026, 1, 2),
+                action_type="cash_dividend",
+                market="cn",
+                currency="CNY",
+                cash_dividend_per_share=1.0,
+            )
+
+        self.assertEqual(self.service.repo.list_trades(aid, as_of=date(2026, 1, 2)), [])
+        self.assertEqual(self.service.repo.list_cash_ledger(aid, as_of=date(2026, 1, 2)), [])
+        self.assertEqual(self.service.repo.list_corporate_actions(aid, as_of=date(2026, 1, 2)), [])
+        self.assertEqual(self.service.list_accounts(), [])
+        inactive = self.service.list_accounts(include_inactive=True)
+        self.assertEqual(len(inactive), 1)
+        self.assertFalse(inactive[0]["is_active"])
+
     def test_duplicate_full_close_sell_keeps_conflict_semantics(self) -> None:
         account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
         aid = account["id"]
@@ -1124,6 +1349,106 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertEqual(len(trade_rows), 0)
         self.assertEqual(len(snapshot_rows), 0)
         self.assertEqual(len(lot_rows), 0)
+
+    def test_delete_cash_and_corporate_action_replays_remaining_source_events(self) -> None:
+        account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+
+        self.service.record_cash_ledger(
+            account_id=aid,
+            event_date=date(2026, 1, 1),
+            direction="in",
+            amount=10000,
+            currency="CNY",
+        )
+        extra_cash = self.service.record_cash_ledger(
+            account_id=aid,
+            event_date=date(2026, 1, 1),
+            direction="in",
+            amount=1000,
+            currency="CNY",
+        )
+        self.service.record_trade(
+            account_id=aid,
+            symbol="600519",
+            trade_date=date(2026, 1, 2),
+            side="buy",
+            quantity=100,
+            price=10,
+            market="cn",
+            currency="CNY",
+        )
+        dividend = self.service.record_corporate_action(
+            account_id=aid,
+            symbol="600519",
+            effective_date=date(2026, 1, 3),
+            action_type="cash_dividend",
+            market="cn",
+            currency="CNY",
+            cash_dividend_per_share=1.0,
+        )
+        split = self.service.record_corporate_action(
+            account_id=aid,
+            symbol="600519",
+            effective_date=date(2026, 1, 4),
+            action_type="split_adjustment",
+            market="cn",
+            currency="CNY",
+            split_ratio=2.0,
+        )
+        self._save_close("600519", date(2026, 1, 5), 6.0)
+
+        before = self.service.get_portfolio_snapshot(
+            account_id=aid,
+            as_of=date(2026, 1, 5),
+            cost_method="fifo",
+        )["accounts"][0]
+        self.assertAlmostEqual(before["total_cash"], 10100.0, places=6)
+        self.assertAlmostEqual(before["total_market_value"], 1200.0, places=6)
+        self.assertAlmostEqual(before["total_equity"], 11300.0, places=6)
+        self.assertEqual(before["positions"][0]["quantity"], 200.0)
+        self.assertAlmostEqual(before["positions"][0]["avg_cost"], 5.0, places=6)
+
+        self.assertTrue(self.service.delete_corporate_action_event(dividend["id"]))
+        after_dividend = self.service.get_portfolio_snapshot(
+            account_id=aid,
+            as_of=date(2026, 1, 5),
+            cost_method="fifo",
+        )["accounts"][0]
+        self.assertAlmostEqual(after_dividend["total_cash"], 10000.0, places=6)
+        self.assertEqual(after_dividend["positions"][0]["quantity"], 200.0)
+        self.assertEqual(
+            self.service.list_corporate_action_events(account_id=aid, page=1, page_size=20)["total"],
+            1,
+        )
+
+        self.assertTrue(self.service.delete_corporate_action_event(split["id"]))
+        after_split = self.service.get_portfolio_snapshot(
+            account_id=aid,
+            as_of=date(2026, 1, 5),
+            cost_method="fifo",
+        )["accounts"][0]
+        self.assertAlmostEqual(after_split["total_market_value"], 600.0, places=6)
+        self.assertEqual(after_split["positions"][0]["quantity"], 100.0)
+        self.assertAlmostEqual(after_split["positions"][0]["avg_cost"], 10.0, places=6)
+        self.assertEqual(
+            self.service.list_corporate_action_events(account_id=aid, page=1, page_size=20)["total"],
+            0,
+        )
+
+        self.assertTrue(self.service.delete_cash_ledger_event(extra_cash["id"]))
+        after_cash = self.service.get_portfolio_snapshot(
+            account_id=aid,
+            as_of=date(2026, 1, 5),
+            cost_method="fifo",
+        )["accounts"][0]
+        self.assertAlmostEqual(after_cash["total_cash"], 9000.0, places=6)
+        self.assertAlmostEqual(after_cash["total_equity"], 9600.0, places=6)
+        self.assertEqual(
+            self.service.list_cash_ledger_events(account_id=aid, page=1, page_size=20)["total"],
+            1,
+        )
+        self.assertFalse(self.service.delete_cash_ledger_event(extra_cash["id"]))
 
     def test_concurrent_sell_race_allows_only_one_write(self) -> None:
         account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
@@ -1396,6 +1721,251 @@ class PortfolioServiceTestCase(unittest.TestCase):
                 with self.assertRaises(PortfolioBusyError):
                     with repo.portfolio_write_session():
                         pass
+
+    def test_ledger_submit_returns_receipt_and_legacy_writers_delegate_to_one_seam(self) -> None:
+        account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+
+        receipt = self.service.submit(
+            LedgerCommand(
+                account_id=aid,
+                kind="cash_ledger",
+                payload={
+                    "event_date": date(2026, 1, 1),
+                    "direction": "in",
+                    "amount": 1000,
+                    "currency": "CNY",
+                },
+            )
+        )
+        self.assertTrue(receipt.accepted)
+        self.assertEqual(receipt.event_type, "cash_ledger")
+        self.assertIsInstance(receipt.event_id, int)
+
+        with patch.object(self.service, "submit", wraps=self.service.submit) as submit:
+            self.service.record_trade(
+                account_id=aid,
+                symbol="600519",
+                trade_date=date(2026, 1, 2),
+                side="buy",
+                quantity=1,
+                price=100,
+                market="cn",
+                currency="CNY",
+            )
+            self.service.record_cash_ledger(
+                account_id=aid,
+                event_date=date(2026, 1, 3),
+                direction="in",
+                amount=1000,
+                currency="CNY",
+            )
+            self.service.record_corporate_action(
+                account_id=aid,
+                symbol="600519",
+                effective_date=date(2026, 1, 4),
+                action_type="cash_dividend",
+                market="cn",
+                currency="CNY",
+                cash_dividend_per_share=1.0,
+            )
+
+        self.assertEqual(
+            [call.args[0].kind for call in submit.call_args_list],
+            ["trade", "cash_ledger", "corporate_action"],
+        )
+
+    def test_ledger_submit_rejects_inactive_account_without_partial_state(self) -> None:
+        account = self.service.create_account(name="Archived", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+        self.assertTrue(self.service.deactivate_account(aid))
+
+        receipt = self.service.submit(
+            LedgerCommand(
+                account_id=aid,
+                kind="trade",
+                payload={
+                    "symbol": "600519",
+                    "trade_date": date(2026, 1, 2),
+                    "side": "buy",
+                    "quantity": 10,
+                    "price": 100,
+                    "market": "cn",
+                    "currency": "CNY",
+                },
+            )
+        )
+
+        self.assertFalse(receipt.accepted)
+        self.assertEqual(receipt.error_code, "account_inactive")
+        self.assertEqual(self.service.repo.list_trades(aid, as_of=date(2026, 1, 2)), [])
+
+    def test_ledger_submit_rejects_oversell_atomically_with_stable_error_code(self) -> None:
+        account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+        self.service.record_trade(
+            account_id=aid,
+            symbol="600519",
+            trade_date=date(2026, 1, 1),
+            side="buy",
+            quantity=10,
+            price=100,
+            market="cn",
+            currency="CNY",
+        )
+
+        receipt = self.service.submit(
+            LedgerCommand(
+                account_id=aid,
+                kind="trade",
+                payload={
+                    "symbol": "600519",
+                    "trade_date": date(2026, 1, 2),
+                    "side": "sell",
+                    "quantity": 20,
+                    "price": 90,
+                    "market": "cn",
+                    "currency": "CNY",
+                    "trade_uid": "oversell-001",
+                },
+            )
+        )
+
+        self.assertFalse(receipt.accepted)
+        self.assertEqual(receipt.error_code, "oversell")
+        self.assertEqual(self.service.repo.list_trades(aid, as_of=date(2026, 1, 2))[0].side, "buy")
+        self.assertFalse(self.service.repo.has_trade_uid(aid, "oversell-001"))
+
+    def test_ledger_submit_rejects_duplicate_trade_uid_as_idempotent_noop(self) -> None:
+        account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+        command = LedgerCommand(
+            account_id=aid,
+            kind="trade",
+            payload={
+                "symbol": "600519",
+                "trade_date": date(2026, 1, 1),
+                "side": "buy",
+                "quantity": 10,
+                "price": 100,
+                "market": "cn",
+                "currency": "CNY",
+                "trade_uid": "uid-001",
+            },
+        )
+
+        first = self.service.submit(command)
+        duplicate = self.service.submit(command)
+
+        self.assertTrue(first.accepted)
+        self.assertFalse(duplicate.accepted)
+        self.assertEqual(duplicate.error_code, "duplicate_trade_uid")
+        self.assertTrue(duplicate.idempotent)
+        self.assertEqual(len(self.service.repo.list_trades(aid, as_of=date(2026, 1, 1))), 1)
+
+    def test_ledger_cycle_rolls_back_event_and_projection_together(self) -> None:
+        account = self.service.create_account(name="Rollback", broker="Demo", market="cn", base_currency="CNY")
+        aid = account["id"]
+        self.service.record_cash_ledger(
+            account_id=aid,
+            event_date=date(2026, 1, 1),
+            direction="in",
+            amount=10000,
+            currency="CNY",
+        )
+        self.service.record_trade(
+            account_id=aid,
+            symbol="600519",
+            trade_date=date(2026, 1, 2),
+            side="buy",
+            quantity=10,
+            price=100,
+            market="cn",
+            currency="CNY",
+            trade_uid="before-rollback",
+        )
+        self._save_close("600519", date(2026, 1, 2), 100.0)
+        self.service.get_portfolio_snapshot(account_id=aid, as_of=date(2026, 1, 2), cost_method="fifo")
+
+        with self.db.get_session() as session:
+            before_snapshot = session.execute(
+                select(PortfolioDailySnapshot).where(
+                    PortfolioDailySnapshot.account_id == aid,
+                    PortfolioDailySnapshot.snapshot_date == date(2026, 1, 2),
+                    PortfolioDailySnapshot.cost_method == "fifo",
+                )
+            ).scalar_one()
+            before_position = session.execute(
+                select(PortfolioPosition).where(
+                    PortfolioPosition.account_id == aid,
+                    PortfolioPosition.cost_method == "fifo",
+                )
+            ).scalar_one()
+            before_payload = before_snapshot.payload
+            before_quantity = float(before_position.quantity)
+
+        with self.assertRaisesRegex(RuntimeError, "injected ledger failure"):
+            with self.service.repo.ledger_cycle() as session:
+                self.service.repo.add_trade_in_session(
+                    session=session,
+                    account_id=aid,
+                    trade_uid="rollback-1",
+                    symbol="600519",
+                    market="cn",
+                    currency="CNY",
+                    trade_date=date(2026, 1, 2),
+                    side="buy",
+                    quantity=5,
+                    price=90,
+                    fee=0,
+                    tax=0,
+                )
+                self.service.repo.replace_positions_lots_and_snapshot_in_session(
+                    session=session,
+                    account_id=aid,
+                    snapshot_date=date(2026, 1, 2),
+                    cost_method="fifo",
+                    base_currency="CNY",
+                    total_cash=0,
+                    total_market_value=0,
+                    total_equity=0,
+                    unrealized_pnl=0,
+                    realized_pnl=0,
+                    fee_total=0,
+                    tax_total=0,
+                    fx_stale=False,
+                    payload="{}",
+                    positions=[],
+                    lots=[],
+                    valuation_currency="CNY",
+                )
+                raise RuntimeError("injected ledger failure")
+
+        with self.db.get_session() as session:
+            self.assertIsNone(
+                session.execute(
+                    select(PortfolioTrade).where(
+                        PortfolioTrade.account_id == aid,
+                        PortfolioTrade.trade_uid == "rollback-1",
+                    )
+                ).scalar_one_or_none()
+            )
+            after_snapshot = session.execute(
+                select(PortfolioDailySnapshot).where(
+                    PortfolioDailySnapshot.account_id == aid,
+                    PortfolioDailySnapshot.snapshot_date == date(2026, 1, 2),
+                    PortfolioDailySnapshot.cost_method == "fifo",
+                )
+            ).scalar_one()
+            after_position = session.execute(
+                select(PortfolioPosition).where(
+                    PortfolioPosition.account_id == aid,
+                    PortfolioPosition.cost_method == "fifo",
+                )
+            ).scalar_one()
+
+        self.assertEqual(after_snapshot.payload, before_payload)
+        self.assertEqual(float(after_position.quantity), before_quantity)
 
 
 if __name__ == "__main__":

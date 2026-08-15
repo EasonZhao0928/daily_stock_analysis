@@ -8,6 +8,7 @@ therefore end database work by terminating the process group that owns it.
 
 from __future__ import annotations
 
+import importlib
 import json
 import multiprocessing as mp
 import os
@@ -18,7 +19,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from src.agent.tools.execution import ToolAccessContext
+from src.agent.tools.execution import (
+    ToolAccessContext,
+    build_tool_audit,
+    redact_diagnostic_value,
+)
 
 
 # Gate P observed cooperative TERM completion in under 25 ms.  The grace keeps
@@ -33,6 +38,7 @@ TOOL_PROCESS_POLL_SECONDS = 0.02
 MAX_TOOL_RESULT_BYTES = 1024 * 1024
 MAX_TOOL_PROCESS_HEADER_BYTES = 64 * 1024
 MAX_TOOL_PROCESS_FRAME_BYTES = 1 + 4 + MAX_TOOL_PROCESS_HEADER_BYTES + MAX_TOOL_RESULT_BYTES
+TOOL_REGISTRY_MANIFEST_VERSION = 1
 
 ToolWorker = Callable[[str, dict, ToolAccessContext], dict]
 
@@ -162,17 +168,209 @@ def _context_from_payload(payload: dict) -> ToolAccessContext:
     )
 
 
+def _manifest_value(value: Any) -> Any:
+    """Return a JSON-safe copy of registry metadata."""
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and enum_value is not value:
+        return _manifest_value(enum_value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_manifest_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _manifest_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _handler_manifest_ref(handler: Any) -> Optional[dict]:
+    """Describe an importable module-level handler, or fail closed."""
+    module = getattr(handler, "__module__", None)
+    qualname = getattr(handler, "__qualname__", None)
+    if (
+        not isinstance(module, str)
+        or not module
+        or not isinstance(qualname, str)
+        or not qualname
+        or "<locals>" in qualname
+        or "<lambda>" in qualname
+    ):
+        return None
+    return {"module": module, "qualname": qualname}
+
+
+def build_tool_registry_manifest(tool_surface: Any, *, execution_profile: Any = None) -> dict:
+    """Serialize the exact ToolSurface registry for a spawned worker.
+
+    Handlers are represented only by import references.  Local closures and
+    other non-importable handlers are deliberately omitted by the child rather
+    than being replaced by the process-global registry.
+
+    ``execution_profile`` is the DSA :class:`ExecutionProfile` for this run.  It
+    is deliberately *not* the Codex sandbox permission profile: the two are
+    unrelated namespaces and conflating them silently disabled profile
+    enforcement in the child.
+    """
+    registry = getattr(tool_surface, "_registry", None)
+    definitions = registry.list_tools() if registry is not None else []
+    tools = []
+    for tool_def in sorted(definitions, key=lambda item: str(item.name)):
+        policy = tool_def.policy
+        tools.append(
+            {
+                "name": tool_def.name,
+                "description": tool_def.description,
+                "category": tool_def.category,
+                "parameters": [
+                    {
+                        "name": parameter.name,
+                        "type": parameter.type,
+                        "description": parameter.description,
+                        "required": parameter.required,
+                        "enum": _manifest_value(parameter.enum),
+                        "default": _manifest_value(parameter.default),
+                    }
+                    for parameter in tool_def.parameters
+                ],
+                "policy": {
+                    "read_only": policy.read_only,
+                    "side_effects": _manifest_value(policy.side_effects),
+                    "permissions": _manifest_value(policy.permissions),
+                    "policy_status": policy.policy_status,
+                    "scope_dimensions": _manifest_value(policy.scope_dimensions),
+                    "cancellation_safe": policy.cancellation_safe,
+                    "allowed_profiles": _manifest_value(policy.allowed_profiles),
+                },
+                "execution_profiles": _manifest_value(tool_def.execution_profiles),
+                "allowed_profiles": _manifest_value(tool_def.allowed_profiles),
+                "handler": _handler_manifest_ref(tool_def.handler),
+            }
+        )
+    return {
+        "version": TOOL_REGISTRY_MANIFEST_VERSION,
+        "execution_profile": _manifest_value(execution_profile),
+        "tools": tools,
+    }
+
+
+def _resolve_handler(ref: Any) -> Optional[Callable]:
+    if not isinstance(ref, dict):
+        return None
+    module_name = ref.get("module")
+    qualname = ref.get("qualname")
+    if (
+        not isinstance(module_name, str)
+        or not module_name
+        or not isinstance(qualname, str)
+        or not qualname
+        or "<" in qualname
+    ):
+        return None
+    try:
+        handler: Any = importlib.import_module(module_name)
+        for part in qualname.split("."):
+            handler = getattr(handler, part)
+        return handler if callable(handler) else None
+    except (AttributeError, ImportError, TypeError):
+        return None
+
+
+def _registry_from_manifest(manifest: Any) -> tuple[Any, Any]:
+    """Rebuild a registry from trusted-in-process metadata, never globally."""
+    from src.agent.tools.registry import ToolDefinition, ToolParameter, ToolPolicy, ToolRegistry
+
+    registry = ToolRegistry()
+    if not isinstance(manifest, dict) or manifest.get("version") != TOOL_REGISTRY_MANIFEST_VERSION:
+        return registry, None
+    for item in manifest.get("tools") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        handler = _resolve_handler(item.get("handler"))
+        if handler is None:
+            continue
+        parameters = []
+        try:
+            for parameter in item.get("parameters") or []:
+                parameters.append(
+                    ToolParameter(
+                        name=str(parameter["name"]),
+                        type=str(parameter["type"]),
+                        description=str(parameter.get("description") or ""),
+                        required=bool(parameter.get("required", True)),
+                        enum=parameter.get("enum"),
+                        default=parameter.get("default"),
+                    )
+                )
+            policy_data = item.get("policy") or {}
+            policy = ToolPolicy(
+                read_only=policy_data.get("read_only"),
+                side_effects=list(policy_data.get("side_effects") or []),
+                permissions=list(policy_data.get("permissions") or []),
+                policy_status=str(policy_data.get("policy_status") or "unknown"),
+                scope_dimensions=list(policy_data.get("scope_dimensions") or []),
+                cancellation_safe=bool(policy_data.get("cancellation_safe")),
+                allowed_profiles=policy_data.get("allowed_profiles"),
+            )
+            registry.register(
+                ToolDefinition(
+                    name=item["name"],
+                    description=str(item.get("description") or ""),
+                    parameters=parameters,
+                    handler=handler,
+                    category=str(item.get("category") or "data"),
+                    policy=policy,
+                    execution_profiles=item.get("execution_profiles"),
+                    allowed_profiles=item.get("allowed_profiles"),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return registry, manifest.get("execution_profile")
+
+
 def _execute_registered_tool(
     tool_name: str,
     arguments: dict,
     context: ToolAccessContext,
+    registry_manifest: Any = None,
 ) -> dict:
-    # Import only after the child owns a new process group.  This prevents the
-    # worker from inheriting a cached registry or database connections.
-    from src.agent.factory import get_tool_registry
+    # The manifest is supplied by the parent transport for this run.  A missing
+    # manifest fails closed; the child must never resolve the process-global
+    # factory registry because it may not match the injected ToolSurface.
     from src.agent.tool_surface import ToolSurface
+    from src.agent.tools.registry import ExecutionProfile
 
-    return ToolSurface(get_tool_registry()).execute_tool(tool_name, arguments, context)
+    if registry_manifest is None:
+        return _error_result(
+            tool_name,
+            "tool_not_allowed",
+            "No injected DSA tool registry was provided.",
+            context=context,
+        )
+    registry, profile = _registry_from_manifest(registry_manifest)
+    if profile is None:
+        # A run without an Execution Profile cannot be authorized here.  Failing
+        # closed keeps the child from silently running with no profile checks.
+        return _error_result(
+            tool_name,
+            "invalid_profile",
+            "No DSA execution profile was provided for this run.",
+            context=context,
+        )
+    try:
+        profile = ExecutionProfile.coerce(profile)
+    except ValueError:
+        return _error_result(
+            tool_name,
+            "invalid_profile",
+            "Execution profile is not supported.",
+            context=context,
+        )
+    return ToolSurface(registry).execute_tool(
+        tool_name,
+        arguments,
+        context,
+        profile=profile,
+    )
 
 
 def _tool_process_entry(
@@ -187,11 +385,20 @@ def _tool_process_entry(
         _send_frame(connection, {"type": "ready"})
 
         request = json.loads(request_json)
-        result = worker(
-            str(request["tool_name"]),
-            request["arguments"],
-            _context_from_payload(request["context"]),
-        )
+        context = _context_from_payload(request["context"])
+        if worker is _execute_registered_tool:
+            result = worker(
+                str(request["tool_name"]),
+                request["arguments"],
+                context,
+                request.get("registry_manifest"),
+            )
+        else:
+            result = worker(
+                str(request["tool_name"]),
+                request["arguments"],
+                context,
+            )
         if not isinstance(result, dict):
             raise TypeError("tool worker returned a non-object result")
         diagnostics = result.get("diagnostics") or {}
@@ -254,20 +461,49 @@ def _process_group_alive(process_group_id: int) -> bool:
     return True
 
 
-def _error_result(tool_name: str, code: str, message: str) -> dict:
+def _error_result(
+    tool_name: str,
+    code: str,
+    message: str,
+    *,
+    context: Optional[ToolAccessContext] = None,
+) -> dict:
+    """Build a bounded, traceable error envelope for the process boundary.
+
+    The runner used to return only ``error`` for pre-start and cleanup
+    failures.  That made a cancelled/terminated worker indistinguishable from
+    an unstructured handler failure to callers that do not also inspect the
+    runner snapshot.  Keep the existing error shape, while adding the same
+    redacted audit/diagnostic fields that ToolSurface emits.
+    """
+    safe_text = json.dumps(
+        {"error": message, "code": code, "retriable": False},
+        ensure_ascii=False,
+    )
+    audit_context = context or ToolAccessContext()
     return {
         "ok": False,
         "tool_name": tool_name,
         "result": None,
-        "result_text": json.dumps(
-            {"error": message, "code": code, "retriable": False},
-            ensure_ascii=False,
-        ),
+        "result_text": safe_text,
         "error": {
             "code": code,
             "message": message,
             "retriable": False,
             "details": {},
+        },
+        "audit": build_tool_audit(
+            tool_name=tool_name,
+            arguments={},
+            result=safe_text,
+            error_code=code,
+            context=audit_context,
+        ),
+        "diagnostics": {
+            "redacted": True,
+            "result_length": len(safe_text.encode("utf-8")),
+            "result_truncated": False,
+            "preview": redact_diagnostic_value(safe_text),
         },
     }
 
@@ -275,8 +511,20 @@ def _error_result(tool_name: str, code: str, message: str) -> dict:
 class CodexToolProcessRunner:
     """Own and reap every process used for one transport's DSA tool calls."""
 
-    def __init__(self, *, worker: ToolWorker = _execute_registered_tool) -> None:
+    def __init__(
+        self,
+        *,
+        worker: ToolWorker = _execute_registered_tool,
+        tool_surface: Any = None,
+        execution_profile: Any = None,
+        registry_manifest: Optional[dict] = None,
+    ) -> None:
+        if registry_manifest is None and tool_surface is not None:
+            registry_manifest = build_tool_registry_manifest(
+                tool_surface, execution_profile=execution_profile
+            )
         self._worker = worker
+        self._registry_manifest = registry_manifest
         self._mp_context = mp.get_context("spawn")
         self._state_lock = threading.Lock()
         self._active: dict[int, _OwnedToolProcess] = {}
@@ -292,9 +540,19 @@ class CodexToolProcessRunner:
     ) -> dict:
         cancel_event = context.cancel_event
         if cancel_event is not None and cancel_event.is_set():
-            return _error_result(tool_name, "cancelled", "Tool execution was cancelled.")
+            return _error_result(
+                tool_name,
+                "cancelled",
+                "Tool execution was cancelled.",
+                context=context,
+            )
         if context.deadline is not None and time.monotonic() >= context.deadline:
-            return _error_result(tool_name, "timeout", "Tool execution deadline was exceeded.")
+            return _error_result(
+                tool_name,
+                "timeout",
+                "Tool execution deadline was exceeded.",
+                context=context,
+            )
         if not isinstance(arguments, dict):
             # Argument validation remains authoritative in ToolSurface.  Keeping
             # the original value here lets it return the existing error shape.
@@ -307,6 +565,7 @@ class CodexToolProcessRunner:
                     "tool_name": tool_name,
                     "arguments": serializable_arguments,
                     "context": _context_payload(context),
+                    "registry_manifest": self._registry_manifest,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -316,6 +575,7 @@ class CodexToolProcessRunner:
                 tool_name,
                 "tool_roundtrip_failed",
                 "Tool request could not be serialized.",
+                context=context,
             )
 
         receive_connection, send_connection = self._mp_context.Pipe(duplex=False)
@@ -329,7 +589,12 @@ class CodexToolProcessRunner:
             if self._closing:
                 receive_connection.close()
                 send_connection.close()
-                return _error_result(tool_name, "cancelled", "Tool transport is closing.")
+                return _error_result(
+                    tool_name,
+                    "cancelled",
+                    "Tool transport is closing.",
+                    context=context,
+                )
             self._sequence += 1
             sequence = self._sequence
             try:
@@ -341,6 +606,7 @@ class CodexToolProcessRunner:
                     tool_name,
                     "tool_roundtrip_failed",
                     "Tool worker could not be started.",
+                    context=context,
                 )
             send_connection.close()
             owner = _OwnedToolProcess(
@@ -455,11 +721,22 @@ class CodexToolProcessRunner:
                 tool_name,
                 "resource_cleanup_failed",
                 "Tool worker resources could not be fully reclaimed.",
+                context=context,
             )
         if termination_reason == "cancelled":
-            return _error_result(tool_name, "cancelled", "Tool execution was cancelled.")
+            return _error_result(
+                tool_name,
+                "cancelled",
+                "Tool execution was cancelled.",
+                context=context,
+            )
         if termination_reason == "timeout":
-            return _error_result(tool_name, "timeout", "Tool execution deadline was exceeded.")
+            return _error_result(
+                tool_name,
+                "timeout",
+                "Tool execution deadline was exceeded.",
+                context=context,
+            )
         if isinstance(message, dict) and message.get("type") == "result":
             payload = message.get("payload")
             if isinstance(payload, dict):
@@ -476,9 +753,20 @@ class CodexToolProcessRunner:
                     tool_name,
                     "output_too_large",
                     "Tool result exceeded the IPC output limit.",
+                    context=context,
                 )
-            return _error_result(tool_name, "handler_error", "Tool handler failed.")
-        return _error_result(tool_name, "handler_error", "Tool worker exited unexpectedly.")
+            return _error_result(
+                tool_name,
+                "handler_error",
+                "Tool handler failed.",
+                context=context,
+            )
+        return _error_result(
+            tool_name,
+            "handler_error",
+            "Tool worker exited unexpectedly.",
+            context=context,
+        )
 
     def close(self) -> bool:
         """Stop accepting calls and synchronously reap every owned worker."""

@@ -50,6 +50,27 @@ logger = logging.getLogger(__name__)
 _SEARCH_TIMEOUT_PROCESS_START_METHOD = "spawn"
 _SEARCH_TIMEOUT_PROCESS_JOIN_GRACE_SECONDS = 1.0
 _SEARCH_TIMEOUT_WORKER_SLOTS = threading.BoundedSemaphore(4)
+def _request_with_supplier_runtime(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    json: Optional[Dict[str, Any]] = None,
+    timeout: Any = None,
+) -> requests.Response:
+    """Compatibility request seam for independent search-provider APIs.
+
+    Governed market suppliers are not permitted through SearchService; those
+    capabilities live behind DataFetcherManager.
+    """
+    request_kwargs: Dict[str, Any] = {"headers": headers, "timeout": timeout}
+    if params is not None:
+        request_kwargs["params"] = params
+    if json is not None:
+        request_kwargs["json"] = json
+    request_kwargs = {key: value for key, value in request_kwargs.items() if value is not None}
+    return getattr(requests, method)(url, **request_kwargs)
 
 
 def _terminate_search_process(process: Any) -> None:
@@ -184,7 +205,9 @@ _SEARCH_TRANSIENT_EXCEPTIONS = (
 )
 def _post_with_retry(url: str, *, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> requests.Response:
     """POST with retry on transient SSL/network errors."""
-    return requests.post(url, headers=headers, json=json, timeout=timeout)
+    return _request_with_supplier_runtime(
+        "post", url, headers=headers, json=json, timeout=timeout
+    )
 
 
 @retry(
@@ -198,7 +221,9 @@ def _get_with_retry(
     url: str, *, headers: Dict[str, str], params: Dict[str, Any], timeout: int
 ) -> requests.Response:
     """GET with retry on transient SSL/network errors."""
-    return requests.get(url, headers=headers, params=params, timeout=timeout)
+    return _request_with_supplier_runtime(
+        "get", url, headers=headers, params=params, timeout=timeout
+    )
 
 
 def fetch_url_content(url: str, timeout: int = 5) -> str:

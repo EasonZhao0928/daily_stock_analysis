@@ -1,0 +1,22 @@
+name: financial_statement_quality
+display_name: 财报质量
+description: 检查三张表的报告期、单位、币种、增长质量、现金流和一致预期一致性。
+summary: 先对齐报告期和单位，再评价利润质量。
+version: 1.0.0
+category: research
+risk-level: medium
+evidence-policy: required
+required-capabilities: [market_data:read, evidence:read]
+required_tools: [get_stock_info, get_financial_statement, get_consensus_estimate, get_daily_history]
+aliases: [财报分析, 三表质量, 利润质量]
+instructions: |
+  ## 期间与单位
+  - 明确年报/季报和报告期，统一 CNY、每股 CNY 与百分比口径；缺失字段保持 unknown。
+  - 对比利润表、资产负债表和现金流量表的共同报告期，标注跨期不可比项。
+
+  ## 质量检查
+  - 检查收入、利润、经营现金流、应收/存货、杠杆和 ROE 的方向与异常。
+  - 一致预期仅作为外部预期，记录机构数、均值/区间及来源，不当作公司指引。
+
+  ## 输出
+  - 给出质量等级、关键勾稽关系、异常解释和需要回看原文的证据清单。

@@ -14,10 +14,14 @@ import pandas as pd
 
 from data_provider.base import canonical_stock_code
 from src.repositories.portfolio_repo import PortfolioRepository
+from src.services.portfolio_ledger_types import (
+    LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+    LEDGER_ERROR_DUPLICATE_TRADE_UID,
+    LEDGER_ERROR_PORTFOLIO_BUSY,
+    LEDGER_EVENT_TRADE,
+    LedgerCommand,
+)
 from src.services.portfolio_service import (
-    PortfolioBusyError,
-    PortfolioConflictError,
-    PortfolioOversellError,
     PortfolioService,
 )
 
@@ -88,8 +92,13 @@ class PortfolioImportService:
         portfolio_service: Optional[PortfolioService] = None,
         repo: Optional[PortfolioRepository] = None,
     ):
-        self.portfolio_service = portfolio_service or PortfolioService()
-        self.repo = repo or PortfolioRepository()
+        if portfolio_service is not None:
+            self.portfolio_service = portfolio_service
+        else:
+            self.portfolio_service = PortfolioService(repo=repo) if repo is not None else PortfolioService()
+        # Keep this compatibility read handle aligned with the service's
+        # repository. All writes go through ``PortfolioService.submit``.
+        self.repo = self.portfolio_service.repo
         self._parser_registry = self.__class__._shared_parser_registry
         self._broker_alias_map = self.__class__._shared_broker_alias_map
         if not self.__class__._shared_registry_initialized:
@@ -203,15 +212,15 @@ class PortfolioImportService:
                 if not dedup_hash:
                     dedup_hash = self._build_dedup_hash(record)
 
-                if trade_uid and self.repo.has_trade_uid(account_id, trade_uid):
-                    duplicate_count += 1
-                    continue
                 dedup_hash_to_use: Optional[str] = dedup_hash or None
-                if dedup_hash_to_use and self.repo.has_trade_dedup_hash(account_id, dedup_hash_to_use):
-                    duplicate_count += 1
-                    continue
 
                 if dry_run:
+                    if trade_uid and self.repo.has_trade_uid(account_id, trade_uid):
+                        duplicate_count += 1
+                        continue
+                    if dedup_hash_to_use and self.repo.has_trade_dedup_hash(account_id, dedup_hash_to_use):
+                        duplicate_count += 1
+                        continue
                     if trade_uid and trade_uid in seen_trade_uids:
                         duplicate_count += 1
                         continue
@@ -231,30 +240,39 @@ class PortfolioImportService:
                 else:
                     trade_date_obj = date.fromisoformat(str(trade_date_value))
 
-                self.portfolio_service.record_trade(
-                    account_id=account_id,
-                    symbol=str(record["symbol"]),
-                    trade_date=trade_date_obj,
-                    side=str(record["side"]),
-                    quantity=float(record["quantity"]),
-                    price=float(record["price"]),
-                    fee=float(record.get("fee", 0.0) or 0.0),
-                    tax=float(record.get("tax", 0.0) or 0.0),
-                    market=record.get("market"),
-                    currency=record.get("currency"),
-                    trade_uid=trade_uid,
-                    dedup_hash=dedup_hash_to_use,
-                    note=(record.get("note") or "").strip() or f"csv_import:{broker_norm}",
+                receipt = self.portfolio_service.submit(
+                    LedgerCommand(
+                        account_id=account_id,
+                        kind=LEDGER_EVENT_TRADE,
+                        payload={
+                            "symbol": str(record["symbol"]),
+                            "trade_date": trade_date_obj,
+                            "side": str(record["side"]),
+                            "quantity": float(record["quantity"]),
+                            "price": float(record["price"]),
+                            "fee": float(record.get("fee", 0.0) or 0.0),
+                            "tax": float(record.get("tax", 0.0) or 0.0),
+                            "market": record.get("market"),
+                            "currency": record.get("currency"),
+                            "trade_uid": trade_uid,
+                            "dedup_hash": dedup_hash_to_use,
+                            "note": (record.get("note") or "").strip() or f"csv_import:{broker_norm}",
+                        },
+                    )
                 )
-                inserted_count += 1
-            except PortfolioConflictError:
-                duplicate_count += 1
-            except PortfolioOversellError as exc:
-                failed_count += 1
-                errors.append(f"idx={i}: {exc}")
-            except PortfolioBusyError as exc:
-                failed_count += 1
-                errors.append(f"idx={i}: portfolio_busy: {exc}")
+                if receipt.accepted:
+                    inserted_count += 1
+                elif receipt.error_code in {
+                    LEDGER_ERROR_DUPLICATE_TRADE_UID,
+                    LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+                }:
+                    duplicate_count += 1
+                else:
+                    failed_count += 1
+                    error_message = receipt.message or receipt.error_code or "ledger command rejected"
+                    if receipt.error_code == LEDGER_ERROR_PORTFOLIO_BUSY:
+                        error_message = f"portfolio_busy: {error_message}"
+                    errors.append(f"idx={i}: {error_message}")
             except Exception as exc:
                 failed_count += 1
                 errors.append(f"idx={i}: {exc}")

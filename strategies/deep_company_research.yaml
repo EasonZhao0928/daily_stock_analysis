@@ -1,0 +1,23 @@
+name: deep_company_research
+display_name: 深度公司研究
+description: 以公告、财报、估值、资金与行业信息建立可追溯的个股研究底稿。
+summary: 先列证据，再写推断；不把搜索摘要当成事实。
+version: 1.0.0
+category: research
+risk-level: medium
+evidence-policy: required
+required-capabilities: [market_data:read, evidence:read, intel:read]
+required_tools: [get_stock_info, get_financial_statement, get_capital_flow, get_announcements, search_comprehensive_intel, get_daily_history]
+aliases: [深度研究, 公司研究, 基本面研究]
+instructions: |
+  ## 研究范围
+  - 明确股票代码、研究截止时间和数据源；先调用基本面、行情、资金与公告/新闻工具。
+  - 每个事实附来源、报告期/as-of 与 source tier；合法空值不能写成零。
+
+  ## 证据与推断
+  - 分开“已披露事实”“基于事实的推断”“仍待验证假设”。
+  - 优先官方公告和原始财报，研报只作为观点与预期，不替代披露。
+
+  ## 输出
+  - 给出经营质量、竞争位置、估值情景、主要风险和下一步验证清单。
+  - 结论必须说明数据陈旧、冲突或缺失，不输出无证据的确定性目标价。

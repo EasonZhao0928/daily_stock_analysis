@@ -19,8 +19,10 @@ const LoginPage = lazy(() => import('./pages/LoginPage'));
 const NotFoundPage = lazy(() => import('./pages/NotFoundPage'));
 const ChatPage = lazy(() => import('./pages/ChatPage'));
 const PortfolioPage = lazy(() => import('./pages/PortfolioPage'));
+const PaperWorkbenchPage = lazy(() => import('./pages/PaperWorkbenchPage'));
 const DecisionSignalsPage = lazy(() => import('./pages/DecisionSignalsPage'));
 const AlertsPage = lazy(() => import('./pages/AlertsPage'));
+const ShadowResearchPage = lazy(() => import('./pages/ShadowResearchPage'));
 const TokenUsagePage = lazy(() => import('./pages/TokenUsagePage'));
 const StockScreeningPage = lazy(() => import('./pages/StockScreeningPage'));
 
@@ -82,10 +84,12 @@ const AppContent: React.FC = () => {
         <Route path="/" element={<HomePage />} />
         <Route path="/chat" element={<ChatPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
+        <Route path="/paper-workbench" element={<PaperWorkbenchPage />} />
         <Route path="/decision-signals" element={<DecisionSignalsPage />} />
         <Route path="/screening" element={<StockScreeningPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/alerts" element={<AlertsPage />} />
+        <Route path="/shadow" element={<ShadowResearchPage />} />
         <Route path="/usage" element={<TokenUsagePage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<NotFoundPage />} />

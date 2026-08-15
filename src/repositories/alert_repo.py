@@ -130,9 +130,10 @@ class AlertRepository:
 
         rule_id = fields.get("rule_id")
         data_timestamp = fields.get("data_timestamp")
-        if fields.get("status") != "triggered" or rule_id is None or data_timestamp is None:
+        source_event_id = fields.get("source_event_id")
+        if fields.get("status") != "triggered" or rule_id is None or (data_timestamp is None and source_event_id is None):
             raise ValueError(
-                "create_trigger_if_absent requires triggered status, rule_id, and data_timestamp"
+                "create_trigger_if_absent requires triggered status, rule_id, and data_timestamp or source_event_id"
             )
 
         with self.db.get_session() as session:
@@ -140,8 +141,11 @@ class AlertRepository:
                 AlertTriggerRecord.rule_id == rule_id,
                 AlertTriggerRecord.target == fields.get("target"),
                 AlertTriggerRecord.status == "triggered",
-                AlertTriggerRecord.data_timestamp == data_timestamp,
             )
+            if source_event_id is not None:
+                query = query.where(AlertTriggerRecord.source_event_id == str(source_event_id))
+            else:
+                query = query.where(AlertTriggerRecord.data_timestamp == data_timestamp)
             data_source = fields.get("data_source")
             if data_source is None:
                 query = query.where(AlertTriggerRecord.data_source.is_(None))

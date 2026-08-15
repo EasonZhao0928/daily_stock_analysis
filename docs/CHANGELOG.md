@@ -13,6 +13,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 - [改进] AIHubMix 注册与引流链接统一使用 inferera.com，改善中国大陆网络直连体验。
 - [chore] 增加 personal 分支的服务器自动部署工作流与 systemd 部署脚本。
+- [新功能] 增加 source-owned Paper Account 决策入口，从 Account Ledger、Market Data、Evidence 和 Shadow Signal 冻结 point-in-time Observation，并支持服务端行情推进 Virtual Order。
+- [新功能] 增加扩展 Market Data 能力路由、金融 Evidence 适配器、Shadow 跨标的回测指标、共享 K 线/SSE 工作台与 Paper/Portfolio 图表联动。
+- [改进] Research Skill 和 Bot `/ask` 统一使用 ToolSurface profile 能力校验；Paper Proposal、审批、风控和运行记录补齐严格 schema 与分页响应模型。
+- [改进] Alert 公共 run cycle 持有 trigger、dedupe、cooldown 和 notification attempt 持久化语义；个人微信 iLink 增加 QR 配对、失效状态、cursor 单调性和 allowlist 防护。
+- [测试] 增加 Paper source-owned golden flow、提示注入/越权负面测试、供应商旁路门禁、扩展数据和 feature flag 默认关闭回归。
+- [文档] 更新 DSA × Vibe-Trading 实施任务与最终一致性审计，记录离线门禁、未在线验证项和回滚边界。
+- [修复] Codex 子进程不再把沙箱权限名当作 DSA Execution Profile，profile 无效时硬失败；LiteLLM 与 Codex 现在按同一 profile 授权工具。
+- [修复] `approval_mode=auto_paper` 必须显式开启 `PAPER_AUTO_MODE_ENABLED` 才可创建与自动建单；扩展行情能力受 `EXTENDED_MARKET_DATA_ENABLED` 控制，移除无消费者的 `SHADOW_BACKGROUND_SCAN_ENABLED`。
+- [修复] Paper Proposal 工具面收敛为冻结上下文与提案工具，不再暴露实时行情等未来数据来源。
+- [修复] Paper Observation 对行情与账户输入同样执行 cutoff 校验，时间戳缺失或不可解析时拒绝而非放行。
+- [修复] K 线能力路由转发起止时间与条数，修复 `limit`/`start` 被丢弃导致的图表只返回约 30 天数据。
+- [修复] 个人微信 iLink 游标不再因排序缺陷停留在初始值而重复拉取历史消息。
+- [修复] 行情 SSE 增加并发连接上限与事件上限，避免长连接耗尽同步线程池。
+- [修复] Evidence 保存返回实际插入行 ID；供应商解析异常不再触发整个域族熔断；会话去重标记在任务提交失败后释放。
+- [改进] 供应商旁路门禁覆盖东财、新浪、腾讯、同花顺与巨潮域族，allowlist 增加只减不增校验；筛选链路的新浪与腾讯直连并入共享会话与频控。
+- [改进] Paper 虚拟订单不再提供任意状态跃迁与成交投影 HTTP 入口，仅保留用户可发起的撤单。
+- [修复] 配置重载不再关闭进程级共享的供应商 HTTP 会话，避免筛选与热点组件持有已关闭连接；如需彻底释放可显式传入 `close_sessions=True`。
+- [改进] Paper Observation 的行情来源信息改为并列的 `market_source_refs` 字段，`market_data` 只保留标的到行情行的映射。
+- [改进] 未确定个股范围的会话在 LiteLLM 与 Codex 下给出同一条说明，不再只返回无解释的 `stock_scope_violation`。
+- [改进] Paper Account 增加与 design/CONTEXT 词汇一致的 `review_proposal`、`advance_orders`、`control` 公开方法。
+- [文档] 新增《Paper Account 与 Shadow Research》和《Market Data 能力路由与供应商治理》专题文档，覆盖决策 cycle、point-in-time 守卫、feature flag、模型权限边界、域族频控与 SSE 资源上限。
+- [新功能] Paper 决策 cycle 增加 `POST /api/v1/paper/accounts/{id}/run` 入口，请求体只接受标的范围与策略版本，行情与账户事实一律由服务端按 cutoff 读取。
+- [新功能] 定时模式增加纸面账户决策调度（`PAPER_SCHEDULER_ENABLED`，默认关闭），只扫描活跃账户、启动不立即执行、单账户失败不影响整轮。
+- [新功能] 财报三表、一致预期、公告、研报、龙虎榜、两融、大宗、股东户数、解禁与分红能力增加对应 Agent 工具，并同步修正相关研究 Skill 的 required tools；能力未启用时返回明确的不可用状态而非空数据。
+- [修复] Paper/Shadow 事件告警保留无损 `source_event_id`，不再把 opaque ID 哈希成伪时间戳；同日未来行情、共享实时取价并发和组合快照锁范围补齐回归保护。
+- [修复] Paper Proposal 审批自动幂等创建数量明确的 Virtual Order，移除客户端手动 staging route；Market Candle API 在返回前统一序列化 pandas/date 时间戳，避免 FastAPI schema 500。
+- [修复] DataFetcherManager 的轻量测试/注入构造路径现在也惰性初始化 realtime fan-out guard，避免指数与市场统计 fallback 因缺少 thread-local 上下文失效。
+- [测试] 完成本轮 Web lint/test/build 与 Paper Workbench 浏览器 smoke；保留真实 Codex OAuth、在线供应商、微信扫码和生产部署为 opt-in 验收。
+- [文档] 新增前后端变更总览，并重写本地/服务器操作手册，补充 `.env` 分组、Codex App Server 登录、systemd、SSH 密码流程和 Caddy HTTPS 反向代理。
+- [文档] 明确区分 `GENERATION_BACKEND=codex_cli`（可用于日报/个股分析/大盘复盘）与 `AGENT_BACKEND=codex_app_server`（问股 Chat/Paper proposal）。
 
 ## [3.30.0] - 2026-08-09
 

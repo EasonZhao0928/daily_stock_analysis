@@ -5,21 +5,34 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import time
 import threading
 from collections.abc import Awaitable, Callable
 from contextvars import copy_context
 from functools import wraps
+from pathlib import Path
 from typing import Any, TypeVar
 from warnings import warn
 
 import anyio.to_thread
 import fastapi.testclient
 import httpx
+import pytest
 import starlette.testclient
 from anyio._backends import _asyncio
 
 T = TypeVar("T")
+
+
+@pytest.fixture(autouse=True)
+def _reset_supplier_runtime_between_tests():
+    """Circuit/rate state is process-global in production, not across tests."""
+    from data_provider.supplier_runtime import reset_supplier_runtime_registry
+
+    reset_supplier_runtime_registry()
+    yield
+    reset_supplier_runtime_registry()
 
 _original_call_soon_threadsafe = asyncio.BaseEventLoop.call_soon_threadsafe
 
@@ -139,6 +152,30 @@ def _run_async_from_thread_with_wakeup(
 anyio.to_thread.run_sync = _run_sync_via_asyncio_to_thread
 _asyncio.AsyncIOBackend.run_sync_from_thread = classmethod(_run_sync_from_thread_with_wakeup)
 _asyncio.AsyncIOBackend.run_async_from_thread = classmethod(_run_async_from_thread_with_wakeup)
+
+
+@pytest.fixture(autouse=True)
+def _reset_auth_module_state_after_test():
+    """Prevent auth cache state from leaking between otherwise isolated API tests."""
+    baseline_env_file = os.environ.get("ENV_FILE")
+    if baseline_env_file is None:
+        baseline_env_file = str(Path(__file__).resolve().parents[1] / ".env.example")
+    os.environ["ENV_FILE"] = baseline_env_file
+    import src.auth as auth
+
+    auth._auth_enabled = None
+    auth._session_secret = None
+    auth._password_hash_salt = None
+    auth._password_hash_stored = None
+    auth._rate_limit = {}
+    yield
+
+    auth._auth_enabled = None
+    auth._session_secret = None
+    auth._password_hash_salt = None
+    auth._password_hash_stored = None
+    auth._rate_limit = {}
+    os.environ["ENV_FILE"] = baseline_env_file
 
 
 class _ThreadlessTestClient:

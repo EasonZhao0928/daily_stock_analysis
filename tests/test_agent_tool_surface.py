@@ -11,7 +11,15 @@ from pathlib import Path
 from src.agent.stock_scope import StockScope
 from src.agent.tool_surface import ToolSurface
 from src.agent.tools.execution import ToolAccessContext, check_tool_execution
-from src.agent.tools.registry import ToolDefinition, ToolParameter, ToolPolicy, ToolRegistry
+from src.agent.tools.registry import (
+    ExecutionProfile,
+    ToolDefinition,
+    ToolInvocation,
+    ToolParameter,
+    ToolPolicy,
+    ToolRegistry,
+    ToolResult,
+)
 
 
 def _single_tool_registry(tool: ToolDefinition) -> ToolRegistry:
@@ -50,6 +58,601 @@ def _registry_with_echo(executed=None) -> ToolRegistry:
     return registry
 
 
+def _tool_surface_snapshot(surface: ToolSurface) -> dict:
+    codex_visible_names = {
+        item["name"]
+        for item in surface.list_tools("public", cancellation_safe_only=True)
+    }
+    return {
+        item["name"]: {
+            **{key: value for key, value in item.items() if key != "name"},
+            "codex_visible": item["name"] in codex_visible_names,
+        }
+        for item in surface.list_tools("public")
+    }
+
+
+def _result_snapshot(result: dict) -> dict:
+    snapshot = dict(result)
+    snapshot["audit"] = {**result["audit"], "duration": 0.0}
+    return snapshot
+
+
+_EXPECTED_PRODUCTION_TOOL_SNAPSHOT = {
+    "get_realtime_quote": {
+        "description": (
+            "Get real-time stock quote including price, change%, volume ratio, "
+            "turnover rate, PE, PB, market cap. Returns live market data."
+        ),
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code, e.g., '600519' (A-share), 'AAPL' (US), 'hk00700' (HK)",
+                }
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "get_daily_history": {
+        "description": (
+            "Get daily OHLCV (open, high, low, close, volume) historical data with "
+            "MA5/MA10/MA20 indicators. Returns the last N trading days."
+        ),
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Number of trading days to fetch (default: 60)",
+                },
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code, e.g., '600519' (A-share), 'AAPL' (US)",
+                },
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read", "db_read", "db_write_cache"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "get_chip_distribution": {
+        "description": (
+            "Get chip distribution analysis for a stock. Returns profit ratio, "
+            "average cost, chip concentration at 90% and 70% levels. Useful for "
+            "judging support/resistance and holding structure."
+        ),
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_code": {
+                    "type": "string",
+                    "description": "A-share stock code, e.g., '600519'",
+                }
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "get_analysis_context": {
+        "description": (
+            "Get historical analysis context from the database for a stock. Returns "
+            "today's and yesterday's OHLCV data, MA alignment status, volume and "
+            "price changes. Provides the technical data foundation."
+        ),
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code, e.g., '600519'",
+                }
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["db_read"],
+            "permissions": ["analysis_context:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "get_stock_info": {
+        "description": (
+            "Get stock fundamental information: valuation, growth, earnings, institution "
+            "flow, stock sector membership (belong_boards; boards is compatibility alias) "
+            "and sector rankings. Returns a compact fundamental_context to reduce token usage."
+        ),
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code: A-share '600519', US 'AAPL', HK '00700'",
+                }
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "get_portfolio_snapshot": {
+        "description": (
+            "Get portfolio snapshot summary and optional risk blocks. Default returns "
+            "compact summary for lower token usage; set include_positions=true to include "
+            "full position details."
+        ),
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "account_id": {
+                    "type": "integer",
+                    "description": "Optional account id; omit to use all active accounts.",
+                },
+                "as_of": {
+                    "type": "string",
+                    "description": "Optional snapshot date in YYYY-MM-DD format (default: today).",
+                },
+                "cost_method": {
+                    "type": "string",
+                    "description": "Cost method: fifo or avg (default: fifo).",
+                    "enum": ["fifo", "avg"],
+                },
+                "include_positions": {
+                    "type": "boolean",
+                    "description": "Whether to include full positions in snapshot output (default: false).",
+                },
+                "include_risk": {
+                    "type": "boolean",
+                    "description": "Whether to include risk summary block (default: true).",
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["db_read"],
+            "permissions": ["portfolio:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": [], "requires_stock_scope": False},
+        "codex_visible": True,
+    },
+    "get_capital_flow": {
+        "description": (
+            "Get main-force (主力) capital flow data for an A-share stock. Returns today's "
+            "net inflow, 5-day and 10-day cumulative inflows, and top sector-level capital "
+            "flow rankings. Only supported for A-share individual stocks (not ETFs, indices, "
+            "HK, or US stocks)."
+        ),
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_code": {
+                    "type": "string",
+                    "description": "A-share stock code, e.g., '600519'",
+                }
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "analyze_trend": {
+        "description": (
+            "Run comprehensive technical trend analysis on a stock. Fetches historical data "
+            "from database or data source. Returns MA alignment, bias rates, MACD status, RSI "
+            "levels, volume analysis, support/resistance levels, and a buy/sell signal with a "
+            "score (0-100)."
+        ),
+        "category": "analysis",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code to analyze, e.g., '600519'",
+                }
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read", "db_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "calculate_ma": {
+        "description": (
+            "Calculate moving averages (MA5/10/20/30/60/120/250 or custom periods) for a "
+            "stock. Returns each MA value, price bias %, and whether price is above each MA. "
+            "Also returns overall MA alignment (多头/空头/混合)."
+        ),
+        "category": "analysis",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Number of trading days to fetch history for (default: 120)",
+                },
+                "periods": {
+                    "type": "string",
+                    "description": (
+                        "Comma-separated MA periods to calculate (default: '5,10,20,30,60,120,250'). "
+                        "E.g., '5,10,20,60'"
+                    ),
+                },
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code, e.g., '600519'",
+                },
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read", "db_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "get_volume_analysis": {
+        "description": (
+            "Analyse volume-price relationship for a stock. Returns volume ratios, average "
+            "volume on up vs down days, volume trend (expanding/shrinking), and pattern "
+            "interpretation (量价配合/背离). Useful for confirming trend strength and detecting "
+            "distribution or accumulation phases."
+        ),
+        "category": "analysis",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Number of recent trading days to analyse (default: 30)",
+                },
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code, e.g., '600519'",
+                },
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read", "db_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "analyze_pattern": {
+        "description": (
+            "Detect candlestick and chart patterns in recent price history. Identifies: Doji, "
+            "Hammer, Shooting Star, Morning/Evening Star, Engulfing, Double Bottom, upward "
+            "breakout, box oscillation, and more. Returns pattern list with type "
+            "(bullish/bearish/reversal) and strength."
+        ),
+        "category": "analysis",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Number of recent trading days to scan (default: 60)",
+                },
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code, e.g., '600519'",
+                },
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read", "db_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "search_stock_news": {
+        "description": (
+            "Search for the latest news articles about a specific stock. Requires both "
+            "stock_code and stock_name for accurate search. Returns news titles, snippets, "
+            "sources, and URLs."
+        ),
+        "category": "search",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code, e.g., '600519'",
+                },
+                "stock_name": {
+                    "type": "string",
+                    "description": "Stock name in Chinese, e.g., '贵州茅台'",
+                },
+            },
+            "required": ["stock_code", "stock_name"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read", "db_write_cache"],
+            "permissions": ["news:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": True,
+    },
+    "search_comprehensive_intel": {
+        "description": (
+            "Multi-dimensional intelligence search: latest news, market analysis, risk "
+            "checking, earnings outlook, and industry trends for a stock. Returns a formatted "
+            "report and structured results."
+        ),
+        "category": "search",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code, e.g., '600519'",
+                },
+                "stock_name": {
+                    "type": "string",
+                    "description": "Stock name in Chinese, e.g., '贵州茅台'",
+                },
+            },
+            "required": ["stock_code", "stock_name"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read", "db_write_cache"],
+            "permissions": ["intel:read"],
+            "policy_status": "declared",
+            "cancellation_safe": False,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": False,
+    },
+    "get_market_indices": {
+        "description": (
+            "Get major market indices (e.g., Shanghai Composite, Shenzhen Component, CSI "
+            "300 for China; S&P 500, Nasdaq, Dow for US). Provides market overview."
+        ),
+        "category": "market",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "region": {
+                    "type": "string",
+                    "description": (
+                        "Market region: 'cn' for China A-shares, 'hk' for Hong Kong, 'us' for "
+                        "US stocks (default: 'cn')"
+                    ),
+                    "enum": ["cn", "hk", "us"],
+                }
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": [], "requires_stock_scope": False},
+        "codex_visible": True,
+    },
+    "get_sector_rankings": {
+        "description": (
+            "Get sector/industry performance rankings. Returns top N and bottom N sectors by "
+            "daily change percentage. Useful for sector rotation analysis."
+        ),
+        "category": "market",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "top_n": {
+                    "type": "integer",
+                    "description": "Number of top/bottom sectors to return (default: 10)",
+                }
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["network_read"],
+            "permissions": ["market_data:read"],
+            "policy_status": "declared",
+            "cancellation_safe": False,
+        },
+        "scope": {"scope_dimensions": [], "requires_stock_scope": False},
+        "codex_visible": False,
+    },
+    "get_skill_backtest_summary": {
+        "description": (
+            "Inspect backtest data for a specific skill when skill-scoped stats exist. Provide "
+            "skill_id for a targeted lookup; use get_strategy_backtest_summary for overall "
+            "metrics. When skill-scoped rollups are unavailable, returns an informational "
+            "response instead of fabricating metrics."
+        ),
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "eval_window_days": {
+                    "type": "integer",
+                    "description": (
+                        "Evaluation window in days (default: 30). How many trading days after "
+                        "signal to evaluate."
+                    ),
+                },
+                "skill_id": {
+                    "type": "string",
+                    "description": "Skill identifier, e.g. 'bull_trend'.",
+                },
+            },
+            "required": ["skill_id"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["db_read"],
+            "permissions": ["backtest:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": [], "requires_stock_scope": False},
+        "codex_visible": True,
+    },
+    "get_strategy_backtest_summary": {
+        "description": "Legacy alias returning the overall backtest performance summary without triggering new backtests.",
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "eval_window_days": {
+                    "type": "integer",
+                    "description": (
+                        "Evaluation window in days (default: 30). How many trading days after "
+                        "signal to evaluate."
+                    ),
+                }
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["db_read"],
+            "permissions": ["backtest:read"],
+            "policy_status": "declared",
+            "cancellation_safe": True,
+        },
+        "scope": {"scope_dimensions": [], "requires_stock_scope": False},
+        "codex_visible": True,
+    },
+    "get_stock_backtest_summary": {
+        "description": (
+            "Get backtest performance data for a specific stock: per-stock summary (win rate, "
+            "accuracy, avg return) plus recent evaluation records. Read-only, does not trigger "
+            "new backtests."
+        ),
+        "category": "data",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "eval_window_days": {
+                    "type": "integer",
+                    "description": "Evaluation window in days (default: 30)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max number of recent evaluation records to return (default: 10)",
+                },
+                "stock_code": {
+                    "type": "string",
+                    "description": "Stock code, e.g., '600519' (A-share), 'AAPL' (US), 'hk00700' (HK)",
+                },
+            },
+            "required": ["stock_code"],
+            "additionalProperties": False,
+        },
+        "policy": {
+            "read_only": True,
+            "side_effects": ["db_read"],
+            "permissions": ["backtest:read"],
+            "policy_status": "declared",
+            "cancellation_safe": False,
+        },
+        "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
+        "codex_visible": False,
+    },
+}
+
+
 def test_public_descriptor_does_not_expose_handler_and_includes_policy_scope() -> None:
     registry = ToolRegistry()
     registry.register(
@@ -78,6 +681,165 @@ def test_public_descriptor_does_not_expose_handler_and_includes_policy_scope() -
     assert "handler" not in encoded
     assert "callable" not in encoded
     assert "<function" not in encoded
+
+
+# The baseline the task 1.1 characterization tests protect, plus the task
+# 5.2-5.4 capability tools added later.  The count is written out so growing the
+# surface stays a deliberate, reviewed act.
+_EXPECTED_PRODUCTION_TOOL_COUNT = 28
+
+
+def test_default_registry_tool_surface_is_a_current_snapshot() -> None:
+    """Existing tool contracts must not drift; additions must be deliberate."""
+    from src.agent.factory import get_tool_registry
+
+    registry = get_tool_registry()
+    surface = ToolSurface(registry)
+
+    assert len(registry) == _EXPECTED_PRODUCTION_TOOL_COUNT
+    # Every baseline tool keeps its exact descriptor.
+    snapshot = _tool_surface_snapshot(surface)
+    for name, expected in _EXPECTED_PRODUCTION_TOOL_SNAPSHOT.items():
+        assert name in snapshot, f"baseline tool disappeared: {name}"
+        assert snapshot[name] == expected, f"baseline tool contract drifted: {name}"
+    # Baseline order is preserved at the front of the registry.
+    assert registry.list_names()[: len(_EXPECTED_PRODUCTION_TOOL_SNAPSHOT)] == list(
+        _EXPECTED_PRODUCTION_TOOL_SNAPSHOT
+    )
+    assert registry.validate_tool_policies(strict=True) == []
+
+
+def test_default_registry_openai_surface_keeps_current_tool_order_and_schema() -> None:
+    from src.agent.factory import get_tool_registry
+
+    registry = get_tool_registry()
+    openai_tools = ToolSurface(registry).list_tools("openai")
+
+    assert openai_tools == registry.to_openai_tools()
+    names = [item["function"]["name"] for item in openai_tools]
+    assert names[: len(_EXPECTED_PRODUCTION_TOOL_SNAPSHOT)] == list(
+        _EXPECTED_PRODUCTION_TOOL_SNAPSHOT
+    )
+    assert len(names) == _EXPECTED_PRODUCTION_TOOL_COUNT
+
+
+def test_tool_success_envelope_is_a_current_snapshot() -> None:
+    result = ToolSurface(_registry_with_echo()).execute_tool(
+        "echo",
+        {"message": "hello"},
+        ToolAccessContext(backend="test", session_id="s1"),
+    )
+
+    assert _result_snapshot(result) == {
+        "ok": True,
+        "tool_name": "echo",
+        "result": {"message": "hello", "mode": "plain"},
+        "result_text": '{"message": "hello", "mode": "plain"}',
+        "error": None,
+        "audit": {
+            "tool_name": "echo",
+            "arguments_summary": '{"message": "hello"}',
+            "duration": 0.0,
+            "result_summary": '{"message": "hello", "mode": "plain"}',
+            "error_code": None,
+            "backend": "test",
+            "session_id": "s1",
+        },
+        "diagnostics": {
+            "redacted": True,
+            "result_length": 37,
+            "result_truncated": False,
+            "preview": '{"message": "hello", "mode": "plain"}',
+        },
+    }
+
+
+def test_tool_error_envelope_is_a_current_snapshot() -> None:
+    from src.agent.factory import get_tool_registry
+
+    result = ToolSurface(get_tool_registry()).execute_tool(
+        "get_realtime_quote",
+        {},
+        ToolAccessContext(backend="codex", session_id="session-1"),
+    )
+
+    assert _result_snapshot(result) == {
+        "ok": False,
+        "tool_name": "get_realtime_quote",
+        "result": None,
+        "result_text": (
+            '{"error": "missing required argument: stock_code", '
+            '"code": "invalid_arguments", "retriable": false}'
+        ),
+        "error": {
+            "code": "invalid_arguments",
+            "message": "missing required argument: stock_code",
+            "retriable": False,
+            "details": {},
+        },
+        "audit": {
+            "tool_name": "get_realtime_quote",
+            "arguments_summary": "{}",
+            "duration": 0.0,
+            "result_summary": (
+                '{"error": "missing required argument: stock_code", '
+                '"code": "invalid_arguments", "retriable": false}'
+            ),
+            "error_code": "invalid_arguments",
+            "backend": "codex",
+            "session_id": "session-1",
+        },
+        "diagnostics": {
+            "redacted": True,
+            "result_length": 99,
+            "result_truncated": False,
+            "preview": (
+                '{"error": "missing required argument: stock_code", '
+                '"code": "invalid_arguments", "retriable": false}'
+            ),
+        },
+    }
+
+
+def test_tool_result_truncation_is_a_current_snapshot() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="large",
+            description="Large",
+            parameters=[],
+            handler=lambda: {"text": "abcdefghij"},
+        )
+    )
+
+    result = ToolSurface(registry).execute_tool(
+        "large",
+        {},
+        ToolAccessContext(max_result_bytes=20),
+    )
+
+    assert _result_snapshot(result) == {
+        "ok": True,
+        "tool_name": "large",
+        "result": None,
+        "result_text": '{"text": <truncated>',
+        "error": None,
+        "audit": {
+            "tool_name": "large",
+            "arguments_summary": "{}",
+            "duration": 0.0,
+            "result_summary": '{"text": <truncated>',
+            "error_code": None,
+            "backend": None,
+            "session_id": None,
+        },
+        "diagnostics": {
+            "redacted": True,
+            "result_length": 20,
+            "result_truncated": True,
+            "preview": '{"text": <truncated>',
+        },
+    }
 
 
 def test_cancellation_safe_filter_only_lists_explicitly_safe_tools() -> None:
@@ -511,6 +1273,39 @@ def test_audit_and_diagnostics_are_redacted() -> None:
     assert "[REDACTED" in visible or "<truncated" in visible
 
 
+def test_external_result_redaction_happens_before_payload_limit() -> None:
+    plain_secret = "plain-secret-value-1234567890"
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="external_secret",
+            description="External result",
+            parameters=[],
+            handler=lambda: {
+                "api_key": plain_secret,
+                "nested": {"token": plain_secret},
+                "text": "x" * 200,
+            },
+        )
+    )
+
+    result = ToolSurface(registry).execute_tool(
+        "external_secret",
+        {},
+        ToolAccessContext(
+            backend="codex_app_server",
+            redact_result=True,
+            max_result_bytes=120,
+        ),
+    )
+
+    assert result["ok"] is True
+    assert plain_secret not in result["result_text"]
+    assert plain_secret not in json.dumps(result["result"], ensure_ascii=False)
+    assert result["diagnostics"]["result_truncated"] is True
+    assert len(result["result_text"].encode("utf-8")) <= 120
+
+
 def test_policy_unknown_does_not_break_registry_but_strict_validation_reports_issue() -> None:
     registry = ToolRegistry()
     registry.register(ToolDefinition(name="plain", description="Plain", parameters=[], handler=lambda: None))
@@ -674,9 +1469,32 @@ def test_default_production_registry_only_exposes_bounded_tools_to_codex() -> No
     }
 
     assert safe_names == {
+        "get_realtime_quote",
+        "get_daily_history",
+        "get_chip_distribution",
         "get_analysis_context",
+        "get_stock_info",
+        "get_capital_flow",
+        "analyze_trend",
+        "calculate_ma",
+        "get_volume_analysis",
+        "analyze_pattern",
+        "get_market_indices",
+        "get_portfolio_snapshot",
         "get_skill_backtest_summary",
         "get_strategy_backtest_summary",
+        "search_stock_news",
+        # Task 5.2-5.4 capability tools: bounded, read-only and cancellation-safe.
+        "get_financial_statement",
+        "get_consensus_estimate",
+        "get_announcements",
+        "get_research_reports",
+        "get_dragon_tiger",
+        "get_margin_trading",
+        "get_block_trades",
+        "get_shareholder_counts",
+        "get_share_unlocks",
+        "get_dividends",
     }
 
 
@@ -850,3 +1668,267 @@ def test_stock_scope_no_longer_imports_runner_for_normalization() -> None:
     source = Path("src/agent/stock_scope.py").read_text(encoding="utf-8")
 
     assert "from src.agent.runner import _normalize_tool_stock_code" not in source
+
+
+def _profile_contract_registry() -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="research_read",
+            description="Research read",
+            parameters=[],
+            handler=lambda: {"kind": "research"},
+            policy=ToolPolicy.declared(
+                read_only=True,
+                permissions=["market_data:read"],
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="portfolio_read",
+            description="Portfolio read",
+            parameters=[
+                ToolParameter(
+                    name="account_id",
+                    type="string",
+                    description="Account",
+                )
+            ],
+            handler=lambda account_id: {"account_id": account_id},
+            policy=ToolPolicy.declared(
+                read_only=True,
+                side_effects=["db_read"],
+                permissions=["portfolio:read"],
+                scope_dimensions=["account"],
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="paper_state_read",
+            description="Paper state read",
+            parameters=[],
+            handler=lambda: {"kind": "paper"},
+            policy=ToolPolicy.declared(
+                read_only=True,
+                permissions=["paper:read"],
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="paper_propose",
+            description="Paper proposal",
+            parameters=[],
+            handler=lambda: {"kind": "proposal"},
+            policy=ToolPolicy.declared(
+                read_only=False,
+                side_effects=["paper_proposal"],
+                permissions=["paper:proposal"],
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="paper_approve",
+            description="Paper approval",
+            parameters=[],
+            handler=lambda: {"kind": "approval"},
+            policy=ToolPolicy.declared(
+                read_only=False,
+                side_effects=["paper_approval"],
+                permissions=["paper:approval"],
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="shell_exec",
+            description="Shell",
+            parameters=[],
+            handler=lambda: {"kind": "shell"},
+            policy=ToolPolicy.declared(
+                read_only=False,
+                side_effects=["shell"],
+                permissions=["shell:execute"],
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="paper_direct_write",
+            description="Direct paper-side write with forbidden capabilities",
+            parameters=[],
+            handler=lambda: {"kind": "unsafe"},
+            policy=ToolPolicy.declared(
+                read_only=False,
+                side_effects=["db_write", "broker_order", "file_write"],
+                permissions=["paper:proposal"],
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="symbol_read",
+            description="Symbol read",
+            parameters=[
+                ToolParameter(
+                    name="symbol",
+                    type="string",
+                    description="Symbol",
+                )
+            ],
+            handler=lambda symbol: {"symbol": symbol},
+            policy=ToolPolicy.declared(
+                read_only=True,
+                permissions=["market_data:read"],
+                scope_dimensions=["symbol"],
+            ),
+        )
+    )
+    return registry
+
+
+def test_execution_profiles_filter_tools_without_changing_descriptors() -> None:
+    surface = ToolSurface(_profile_contract_registry())
+
+    assert [profile.value for profile in ExecutionProfile] == [
+        "research_readonly",
+        "portfolio_readonly",
+        "paper_proposal",
+        "paper_approval",
+    ]
+    assert [item["name"] for item in surface.describe("research_readonly")] == [
+        "research_read",
+        "symbol_read",
+    ]
+    assert [item["name"] for item in surface.describe("portfolio_readonly")] == [
+        "research_read",
+        "portfolio_read",
+        "symbol_read",
+    ]
+    # ``paper_proposal`` deliberately excludes market_data:read tools
+    # (``research_read`` / ``symbol_read``): a Paper cycle decides against a
+    # frozen Observation, so any live read would reach past its own cutoff.
+    assert [item["name"] for item in surface.describe("paper_proposal")] == [
+        "paper_state_read",
+        "paper_propose",
+    ]
+    assert [item["name"] for item in surface.describe("paper_approval")] == [
+        "paper_approve",
+    ]
+
+    all_descriptors = surface.list_tools("public")
+    assert surface.list_tools("public") == all_descriptors
+    assert surface.list_tools("openai", profile="research_readonly") == [
+        item
+        for item in surface.list_tools("openai")
+        if item["function"]["name"] in {"research_read", "symbol_read"}
+    ]
+    assert surface.list_tools("mcp_descriptor", profile="paper_approval") == [
+        item
+        for item in surface.list_tools("mcp_descriptor")
+        if item["name"] == "paper_approve"
+    ]
+
+    denied = {
+        item["tool"]: item["code"]
+        for item in surface.profile_diagnostics("research_readonly")
+        if not item["visible"]
+    }
+    assert denied["shell_exec"] == "tool_not_allowed"
+
+    paper_names = [item["name"] for item in surface.describe("paper_proposal")]
+    assert "paper_direct_write" not in paper_names
+    paper_diagnostic = next(
+        item
+        for item in surface.profile_diagnostics("paper_proposal")
+        if item["tool"] == "paper_direct_write"
+    )
+    assert paper_diagnostic["details"]["reason"] == "side_effect_not_allowed"
+
+
+def test_tool_invocation_and_tool_result_have_stable_serialization() -> None:
+    invocation = ToolInvocation(
+        tool_name="symbol_read",
+        arguments={"symbol": "AAPL"},
+        profile="research_readonly",
+        scope={"symbols": ["AAPL"], "account_ids": ["paper-1"]},
+    )
+
+    invocation_payload = invocation.to_dict()
+    assert invocation_payload == {
+        "tool_name": "symbol_read",
+        "arguments": {"symbol": "AAPL"},
+        "profile": "research_readonly",
+        "scope": {"account_ids": ["paper-1"], "symbols": ["AAPL"]},
+    }
+    assert json.loads(invocation.to_json()) == invocation_payload
+    assert ToolInvocation.from_json(invocation.to_json()).to_dict() == invocation_payload
+
+    result = ToolSurface(_profile_contract_registry()).execute(invocation)
+
+    assert isinstance(result, ToolResult)
+    assert result.ok is True
+    assert result.tool_name == "symbol_read"
+    assert result.result == {"symbol": "AAPL"}
+    assert json.loads(result.to_json()) == result.to_dict()
+    assert result.to_dict()["error"] is None
+
+
+def test_profile_authorization_and_scope_errors_are_stable() -> None:
+    surface = ToolSurface(_profile_contract_registry())
+
+    not_allowed = surface.execute(
+        ToolInvocation(
+            name="paper_approve",
+            arguments={},
+            profile="research_readonly",
+        )
+    )
+    assert not_allowed.error["code"] == "tool_not_allowed"
+    assert not_allowed.error["retriable"] is False
+    assert not_allowed.to_dict() == ToolResult.from_json(not_allowed.to_json()).to_dict()
+
+    missing_account = surface.execute(
+        ToolInvocation(
+            name="portfolio_read",
+            arguments={"account_id": "account-1"},
+            profile="portfolio_readonly",
+        )
+    )
+    assert missing_account.error["code"] == "account_scope_violation"
+    assert missing_account.error["details"]["reason"] == "account_scope_required"
+
+    outside_account = surface.execute(
+        ToolInvocation(
+            name="portfolio_read",
+            arguments={"account_id": "account-2"},
+            profile="portfolio_readonly",
+            scope={"account_ids": ["account-1"]},
+        )
+    )
+    assert outside_account.error["code"] == "account_scope_violation"
+    assert outside_account.error["details"]["reason"] == "account_scope_mismatch"
+
+    missing_symbol = surface.execute(
+        ToolInvocation(
+            name="symbol_read",
+            arguments={"symbol": "AAPL"},
+            profile="research_readonly",
+        )
+    )
+    assert missing_symbol.error["code"] == "symbol_scope_violation"
+    assert missing_symbol.error["details"]["reason"] == "symbol_scope_required"
+
+    outside_symbol = surface.execute(
+        ToolInvocation(
+            name="symbol_read",
+            arguments={"symbol": "MSFT"},
+            profile="research_readonly",
+            scope={"symbols": ["AAPL"]},
+        )
+    )
+    assert outside_symbol.error["code"] == "symbol_scope_violation"
+    assert outside_symbol.error["details"]["reason"] == "symbol_scope_mismatch"

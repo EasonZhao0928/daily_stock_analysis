@@ -1279,6 +1279,24 @@ class Config:
     dingtalk_app_key: Optional[str] = None      # 应用 AppKey
     dingtalk_app_secret: Optional[str] = None   # 应用 AppSecret
     dingtalk_stream_enabled: bool = False       # 是否启用 Stream 模式（无需公网IP）
+
+    # Personal WeChat/iLink channel (off by default; token is a credential ref)
+    wechat_channel_enabled: bool = False
+    wechat_ilink_base_url: Optional[str] = None
+    wechat_ilink_token_ref: Optional[str] = None
+    wechat_allowlist: List[str] = field(default_factory=list)
+    wechat_poll_timeout_ms: int = 30000
+
+    # DSA-Vibe integration feature gates. Each one gates a real code path:
+    # ``paper_auto_mode_enabled`` guards approval_mode=auto_paper, and
+    # ``extended_market_data_enabled`` guards the extended capability route.
+    paper_auto_mode_enabled: bool = False
+    extended_market_data_enabled: bool = False
+    # Scheduled (unattended) Paper decision cycles.  Independent of
+    # ``paper_auto_mode_enabled``: this decides *when* cycles run, that one
+    # decides whether a passing Proposal may skip human approval.
+    paper_scheduler_enabled: bool = False
+    paper_scheduler_interval_minutes: int = 60
     
     # 企业微信机器人（回调模式）
     wecom_corpid: Optional[str] = None              # 企业 ID
@@ -2175,6 +2193,18 @@ class Config:
             dingtalk_app_key=os.getenv('DINGTALK_APP_KEY'),
             dingtalk_app_secret=os.getenv('DINGTALK_APP_SECRET'),
             dingtalk_stream_enabled=os.getenv('DINGTALK_STREAM_ENABLED', 'false').lower() == 'true',
+            wechat_channel_enabled=os.getenv('WECHAT_CHANNEL_ENABLED', 'false').lower() == 'true',
+            wechat_ilink_base_url=os.getenv('WECHAT_ILINK_BASE_URL') or None,
+            wechat_ilink_token_ref=os.getenv('WECHAT_ILINK_TOKEN_REF') or None,
+            wechat_allowlist=[u.strip() for u in os.getenv('WECHAT_ALLOWLIST', '').split(',') if u.strip()],
+            wechat_poll_timeout_ms=parse_env_int(os.getenv('WECHAT_POLL_TIMEOUT_MS'), 30000, field_name='WECHAT_POLL_TIMEOUT_MS', minimum=1000),
+            paper_auto_mode_enabled=os.getenv('PAPER_AUTO_MODE_ENABLED', 'false').lower() == 'true',
+            extended_market_data_enabled=os.getenv('EXTENDED_MARKET_DATA_ENABLED', 'false').lower() == 'true',
+            paper_scheduler_enabled=os.getenv('PAPER_SCHEDULER_ENABLED', 'false').lower() == 'true',
+            paper_scheduler_interval_minutes=parse_env_int(
+                os.getenv('PAPER_SCHEDULER_INTERVAL_MINUTES'), 60,
+                field_name='PAPER_SCHEDULER_INTERVAL_MINUTES', minimum=1,
+            ),
             # 企业微信机器人
             wecom_corpid=os.getenv('WECOM_CORPID'),
             wecom_token=os.getenv('WECOM_TOKEN'),

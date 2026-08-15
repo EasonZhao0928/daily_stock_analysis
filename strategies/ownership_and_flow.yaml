@@ -1,0 +1,22 @@
+name: ownership_and_flow
+display_name: 股东与资金
+description: 分析资金流、龙虎榜、两融、股东变化、解禁和分红的信号与局限。
+summary: 资金信号必须注明单位、窗口和是否为合法空结果。
+version: 1.0.0
+category: research
+risk-level: medium
+evidence-policy: required
+required-capabilities: [market_data:read, evidence:read]
+required_tools: [get_capital_flow, get_shareholder_counts, get_share_unlocks, get_margin_trading, get_dragon_tiger, get_block_trades, get_stock_info]
+aliases: [资金面, 股东研究, 筹码分析]
+instructions: |
+  ## 数据口径
+  - 区分 CNY、股数、户数、每股分红和百分比；说明观察窗口和报告期。
+  - valid_empty 表示该窗口没有事件，upstream_blocked/schema_changed 不能作为“无资金动作”。
+
+  ## 交叉验证
+  - 将资金流、换手、成交量、龙虎榜席位、两融和股东户数放在同一时间轴。
+  - 不把单日净流入直接解释成趋势反转，优先寻找持续性和价格响应。
+
+  ## 输出
+  - 给出支持/反对证据、数据缺口和可能的交易拥挤风险。

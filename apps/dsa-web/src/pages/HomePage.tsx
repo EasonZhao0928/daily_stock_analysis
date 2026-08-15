@@ -1732,6 +1732,15 @@ const HomePage: React.FC = () => {
                     <BarChart3 className="h-4 w-4" />
                     {t('home.historyTrend')}
                   </Button>
+                  {selectedReport.meta.stockCode ? (
+                    <a
+                      href={`/paper-workbench?symbol=${encodeURIComponent(selectedReport.meta.stockCode)}`}
+                      className="inline-flex h-9 items-center gap-2 rounded-lg border border-cyan/25 bg-cyan/8 px-3 text-sm font-medium text-cyan transition-colors hover:bg-cyan/15"
+                    >
+                      <BarChart3 className="h-4 w-4" />
+                      行情工作台
+                    </a>
+                  ) : null}
                   <Button
                     variant="home-action-ai"
                     size="sm"

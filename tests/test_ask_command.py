@@ -69,6 +69,34 @@ class AskCommandSkillSelectionTestCase(unittest.TestCase):
         with patch.object(AskCommand, "_load_skills", return_value=skills):
             self.assertEqual(command._parse_skill(["600519", "请", "用缠论分析"]), "chan_theory")
 
+    def test_execute_rejects_skill_when_canonical_capability_gate_hides_it(self) -> None:
+        command = AskCommand()
+        config = SimpleNamespace(agent_mode=True)
+        state = SimpleNamespace(
+            skills_to_activate=[],
+            capability_diagnostics=[{
+                "skill": "finance",
+                "reason": "missing_capability",
+                "missing_capabilities": ["evidence:read"],
+            }],
+        )
+        message = BotMessage(
+            platform="feishu",
+            message_id="msg-capability",
+            user_id="user-1",
+            user_name="tester",
+            chat_id="chat-1",
+            chat_type=ChatType.PRIVATE,
+            content="/ask 600519 finance",
+        )
+        with patch("bot.commands.ask.get_config", return_value=config), \
+                patch.object(command, "_parse_skill", return_value="finance"), \
+                patch("src.agent.factory.get_tool_registry", return_value=MagicMock()), \
+                patch("src.agent.factory.resolve_skill_prompt_state", return_value=state):
+            response = command.execute(message, ["600519", "finance"])
+        self.assertIn("missing_capability", response.text)
+        self.assertIn("evidence:read", response.text)
+
 
 class TestAskCommandMultiStock(unittest.TestCase):
     """Test multi-stock ask command aggregation output."""

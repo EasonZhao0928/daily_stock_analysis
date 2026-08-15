@@ -28,6 +28,7 @@ from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.dashboard_payload import sanitize_agent_dashboard_payload
 from src.agent.protocols import StageFailureReason
 from src.agent.stream_events import stream_event
+from src.agent.tool_surface import ToolSurface
 from src.agent.tools.registry import ToolRegistry
 from src.agent.tools.execution import (
     _build_tool_cache_key,
@@ -323,8 +324,12 @@ def _build_budget_guard_result(
 def run_agent_loop(
     *,
     messages: List[Dict[str, Any]],
-    tool_registry: ToolRegistry,
     llm_adapter: LLMToolAdapter,
+    tool_surface: Optional[ToolSurface] = None,
+    # Kept as a compatibility keyword for callers outside AgentExecutor.  It
+    # is immediately wrapped in a ToolSurface and never executes handlers
+    # directly in the loop.
+    tool_registry: Optional[ToolRegistry] = None,
     max_steps: int = 10,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     thinking_labels: Optional[Dict[str, str]] = None,
@@ -342,7 +347,9 @@ def run_agent_loop(
     Args:
         messages: The initial message list (system + user + optional history).
                   **Mutated in-place** — tool results are appended.
-        tool_registry: Registry of callable tools.
+        tool_surface: Canonical schema and execution surface for callable tools.
+        tool_registry: Legacy registry keyword; wrapped by ToolSurface when no
+                       surface is supplied.
         llm_adapter: LLM backend (handles multi-provider fallback).
         max_steps: Maximum number of LLM round-trips.
         progress_callback: Optional callback receiving progress dicts.
@@ -358,7 +365,14 @@ def run_agent_loop(
         (mutated) messages list.
     """
     labels = thinking_labels or _THINKING_TOOL_LABELS
-    tool_decls = tool_registry.to_openai_tools()
+    if tool_surface is None:
+        if tool_registry is None:
+            raise ValueError("tool_surface or tool_registry is required")
+        if isinstance(tool_registry, ToolSurface):
+            tool_surface = tool_registry
+        else:
+            tool_surface = ToolSurface(tool_registry, legacy_runner_compat=True)
+    tool_decls = tool_surface.list_tools("openai")
 
     start_time = time.time()
     tool_calls_log: List[Dict[str, Any]] = []
@@ -518,13 +532,14 @@ def run_agent_loop(
                 )
             tool_results = _execute_tools(
                 response.tool_calls,
-                tool_registry,
+                None,
                 step + 1,
                 progress_callback,
                 tool_calls_log,
                 non_retriable_tool_results,
                 tool_wait_timeout_seconds=effective_tool_timeout,
                 stock_scope=stock_scope,
+                tool_surface=tool_surface,
             )
 
             # Append tool results preserving original call order
@@ -603,23 +618,36 @@ def run_agent_loop(
 
 def _execute_tools(
     tool_calls,
-    tool_registry: ToolRegistry,
-    step: int,
-    progress_callback: Optional[Callable],
-    tool_calls_log: List[Dict[str, Any]],
+    tool_registry: Optional[ToolRegistry] = None,
+    step: int = 0,
+    progress_callback: Optional[Callable] = None,
+    tool_calls_log: Optional[List[Dict[str, Any]]] = None,
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
     tool_wait_timeout_seconds: Optional[float] = None,
     stock_scope: Optional[StockScope] = None,
+    *,
+    tool_surface: Optional[ToolSurface] = None,
 ) -> List[Dict[str, Any]]:
     """Execute one or more tool calls, returning ordered result dicts.
 
     Single tools run inline; multiple tools run in parallel threads.
     """
 
+    if tool_surface is None:
+        if tool_registry is None:
+            raise ValueError("tool_surface or tool_registry is required")
+        if isinstance(tool_registry, ToolSurface):
+            tool_surface = tool_registry
+        else:
+            tool_surface = ToolSurface(tool_registry, legacy_runner_compat=True)
+
+    if tool_calls_log is None:
+        tool_calls_log = []
+
     def _exec_single(tc_item):
         return execute_runner_tool_call(
             tool_call=tc_item,
-            tool_registry=tool_registry,
+            tool_surface=tool_surface,
             stock_scope=stock_scope,
             non_retriable_tool_results=non_retriable_tool_results,
         )

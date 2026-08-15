@@ -24,8 +24,6 @@ https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/server-side-sdk/python--sd
 import json
 import logging
 import threading
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional, Callable
 import time
@@ -60,6 +58,11 @@ except ImportError:
     logger.warning("[Feishu Stream] 请运行: pip install lark-oapi")
 
 from bot.models import BotMessage, BotResponse, ChatType
+from bot.conversation import (
+    CallbackChannelAdapter,
+    ConversationChannelRuntime,
+    envelope_from_bot_message,
+)
 from src.formatters import format_feishu_markdown, chunk_content_by_max_bytes
 from src.config import get_config
 
@@ -315,13 +318,14 @@ class FeishuStreamHandler:
         self._on_message = on_message
         self._reply_client = reply_client
         self._logger = logger
-        # Different conversations can run in parallel, but one conversation
-        # must stay FIFO so multi-turn chat and replies do not get reordered.
-        self._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="feishu-msg")
-        self._pending_messages: dict[str, deque[BotMessage]] = {}
-        self._active_conversations: set[str] = set()
-        self._queue_lock = threading.Lock()
         self._shutdown = False
+        self._adapter = CallbackChannelAdapter("feishu", self._send_response)
+        self._runtime = ConversationChannelRuntime(
+            channel="feishu",
+            on_message=self._on_message,
+            max_workers=8,
+        )
+        self._runtime.start(self._adapter)
 
     def _conversation_key(self, bot_message: BotMessage) -> str:
         """Return the ordering key used for per-conversation FIFO processing."""
@@ -333,44 +337,29 @@ class FeishuStreamHandler:
         return f"{chat_id}:{user_id}"
 
     def _enqueue_message(self, bot_message: BotMessage) -> None:
-        """Queue a message and start a worker when its conversation is idle."""
+        """Queue a message through the shared Conversation Channel runtime."""
         if self._shutdown:
             self._logger.debug("[Feishu Stream] Handler already stopped, dropping message")
             return
 
-        conversation_key = self._conversation_key(bot_message)
-        should_start_worker = False
+        envelope = envelope_from_bot_message(
+            bot_message,
+            conversation_id=self._conversation_key(bot_message),
+        )
+        if not self._adapter.emit(envelope):
+            self._logger.debug("[Feishu Stream] 消息被 Conversation Channel 拒绝")
 
-        with self._queue_lock:
-            self._pending_messages.setdefault(conversation_key, deque()).append(bot_message)
-            if conversation_key not in self._active_conversations:
-                self._active_conversations.add(conversation_key)
-                should_start_worker = True
-
-        if should_start_worker:
-            try:
-                self._executor.submit(self._drain_conversation, conversation_key)
-            except RuntimeError as exc:
-                with self._queue_lock:
-                    self._active_conversations.discard(conversation_key)
-                    self._pending_messages.pop(conversation_key, None)
-                self._logger.error("[Feishu Stream] 无法启动消息处理线程: %s", exc)
-
-    def _drain_conversation(self, conversation_key: str) -> None:
-        """Drain one conversation queue in FIFO order."""
-        while True:
-            with self._queue_lock:
-                queue = self._pending_messages.get(conversation_key)
-                if not queue:
-                    self._pending_messages.pop(conversation_key, None)
-                    self._active_conversations.discard(conversation_key)
-                    return
-                bot_message = queue.popleft()
-
-            self._process_message(bot_message)
+    def _send_response(self, envelope, response: BotResponse) -> bool:
+        """Translate the normalized response back to the Feishu SDK."""
+        return bool(self._reply_client.reply_text(
+            message_id=envelope.message_id,
+            text=response.text,
+            at_user=response.at_user,
+            user_id=envelope.user_id if response.at_user else None,
+        ))
 
     def _process_message(self, bot_message: BotMessage) -> None:
-        """Execute command handling off the SDK callback thread."""
+        """Legacy compatibility helper; normal flow is owned by runtime."""
         try:
             response = self._on_message(bot_message)
 
@@ -553,10 +542,11 @@ class FeishuStreamHandler:
     def shutdown(self, wait: bool = False) -> None:
         """Stop accepting new messages and tear down worker threads."""
         self._shutdown = True
-        with self._queue_lock:
-            self._pending_messages.clear()
-            self._active_conversations.clear()
-        self._executor.shutdown(wait=wait)
+        self._runtime.stop(wait=wait)
+
+    def health(self):
+        """Return the shared Conversation Channel health snapshot."""
+        return self._runtime.health()
 
 
 class FeishuStreamClient:

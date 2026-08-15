@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from scripts.codex_app_server_gate_a import (
+    CORE_CODEX_TOOL_NAMES,
     MAX_STDERR_BYTES,
     MAX_STDOUT_FRAME_BYTES,
     MAX_TOOL_RESULT_BYTES,
@@ -28,6 +29,7 @@ from scripts.codex_app_server_gate_a import (
     _controlled_environment,
     _harden_command_against_configured_mcp,
     _resolve_command,
+    _core_codex_tool_coverage,
 )
 from src.agent.tool_surface import ToolSurface
 from src.agent.codex_tool_process import CodexToolProcessRunner
@@ -467,6 +469,17 @@ def _transport(tmp_path: Path, mode: str, *, timeout: float = 3.0) -> CodexAppSe
         request_timeout=timeout,
         environment={"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")},
     )
+
+
+def test_gate_a_core_tool_coverage_checks_readonly_schema_contract() -> None:
+    from src.agent.factory import get_tool_registry
+
+    coverage = _core_codex_tool_coverage(ToolSurface(get_tool_registry()))
+
+    assert coverage["passed"] is True
+    assert set(coverage["required_tools"]) == set(CORE_CODEX_TOOL_NAMES)
+    assert coverage["missing_tools"] == []
+    assert coverage["invalid_schema_tools"] == []
 
 
 def _blocked_stdin_transport(
