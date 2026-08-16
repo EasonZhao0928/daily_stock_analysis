@@ -1280,6 +1280,56 @@ def _is_truthy_env(var_name: str, default: str = "true") -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+_wechat_channel_runtime = None
+
+
+def start_wechat_channel(config: Config) -> bool:
+    """Start personal WeChat iLink only when explicitly enabled and paired."""
+    global _wechat_channel_runtime
+    if not getattr(config, "wechat_channel_enabled", False):
+        return False
+    if _wechat_channel_runtime is not None:
+        return True
+    try:
+        from bot.conversation import ConversationChannelRuntime
+        from bot.credentials import default_credential_store
+        from bot.platforms.wechat_ilink import WeChatChannelAdapter, WeChatILinkClient
+        from bot.dispatcher import get_dispatcher
+
+        base_url = getattr(config, "wechat_ilink_base_url", None)
+        token_ref = getattr(config, "wechat_ilink_token_ref", None) or "wechat-ilink-token"
+        token = default_credential_store().read(token_ref)
+        if not base_url or not token:
+            logger.warning("[Main] WeChat channel enabled but base URL/credential ref is not paired; keeping it stopped.")
+            return False
+        client = WeChatILinkClient(base_url=base_url, token=token)
+        adapter = WeChatChannelAdapter(
+            client,
+            enabled=True,
+            poll_timeout_ms=getattr(config, "wechat_poll_timeout_ms", 30000),
+        )
+        runtime = ConversationChannelRuntime(
+            channel="wechat",
+            on_message=get_dispatcher().dispatch,
+            allowlist=set(getattr(config, "wechat_allowlist", []) or []),
+        )
+        runtime.start(adapter)
+        _wechat_channel_runtime = runtime
+        logger.info("[Main] Personal WeChat channel started with an explicit allowlist.")
+        return True
+    except Exception as exc:
+        logger.error("[Main] Failed to start personal WeChat channel: %s", exc)
+        return False
+
+
+def stop_wechat_channel() -> None:
+    global _wechat_channel_runtime
+    runtime = _wechat_channel_runtime
+    _wechat_channel_runtime = None
+    if runtime is not None:
+        runtime.stop(wait=False)
+
+
 def start_bot_stream_clients(config: Config) -> None:
     """Start bot stream clients when enabled in config."""
     # 启动钉钉 Stream 客户端
@@ -1311,6 +1361,9 @@ def start_bot_stream_clients(config: Config) -> None:
                 logger.warning("[Main] Run: pip install lark-oapi")
         except Exception as exc:
             logger.error(f"[Main] Failed to start Feishu Stream client: {exc}")
+
+    if getattr(config, "wechat_channel_enabled", False):
+        start_wechat_channel(config)
 
 
 def _resolve_scheduled_stock_codes(stock_codes: Optional[List[str]]) -> Optional[List[str]]:
@@ -1542,6 +1595,7 @@ def main() -> int:
                 time.sleep(1)
         except KeyboardInterrupt:
             logger.info("\n用户中断，程序退出")
+            stop_wechat_channel()
         return 0
 
     try:
@@ -1655,6 +1709,28 @@ def main() -> int:
                     "interval_seconds": interval_minutes * 60,
                     "run_immediately": True,
                     "name": "agent_event_monitor",
+                })
+
+            if getattr(config, 'paper_scheduler_enabled', False):
+                # design 6: a Scheduler adapter decides only *when* a Paper
+                # cycle runs; the Paper module still owns the whole decision.
+                from src.services.paper_decision_worker import PaperDecisionWorker
+
+                paper_interval_minutes = max(1, getattr(config, 'paper_scheduler_interval_minutes', 60))
+                paper_worker = PaperDecisionWorker(config_provider=_reload_runtime_config)
+
+                def paper_decision_task():
+                    stats = paper_worker.run_once()
+                    if stats.get("ran"):
+                        logger.info("[PaperScheduler] 本轮完成 %d 个纸面账户决策", stats["ran"])
+
+                background_tasks.append({
+                    "task": paper_decision_task,
+                    "interval_seconds": paper_interval_minutes * 60,
+                    # Never fire a decision cycle at process start: wait for the
+                    # first scheduled tick so a restart cannot replay decisions.
+                    "run_immediately": False,
+                    "name": "paper_decision_cycle",
                 })
 
             schedule_kwargs = {

@@ -116,6 +116,41 @@ class SystemConfigApiTestCase(unittest.TestCase):
         self.assertEqual(item_map["GEMINI_API_KEY"]["value"], "secret-key-value")
         self.assertFalse(item_map["GEMINI_API_KEY"]["is_masked"])
 
+    def test_personal_wechat_status_is_safe_and_requires_allowlist(self) -> None:
+        config = SimpleNamespace(
+            wechat_channel_enabled=True,
+            wechat_ilink_base_url="https://ilink.example.test",
+            wechat_ilink_token_ref="wechat-ilink-token",
+            wechat_allowlist=[],
+            wechat_poll_timeout_ms=30000,
+        )
+        fake_store = SimpleNamespace(read=lambda _ref: "opaque-token")
+        with patch("bot.credentials.default_credential_store", return_value=fake_store):
+            payload = system_config.get_wechat_channel_status(config=config).model_dump()
+
+        self.assertFalse(payload["ready"])
+        self.assertTrue(payload["credential_configured"])
+        self.assertEqual(payload["allowlist_count"], 0)
+        self.assertNotIn("opaque-token", str(payload))
+        self.assertIn("ALLOWLIST", payload["message"])
+
+    def test_personal_wechat_status_ready_does_not_return_token(self) -> None:
+        config = SimpleNamespace(
+            wechat_channel_enabled=True,
+            wechat_ilink_base_url="https://ilink.example.test",
+            wechat_ilink_token_ref="wechat-ilink-token",
+            wechat_allowlist=["user-1"],
+            wechat_poll_timeout_ms=15000,
+        )
+        fake_store = SimpleNamespace(read=lambda _ref: "opaque-token")
+        with patch("bot.credentials.default_credential_store", return_value=fake_store):
+            payload = system_config.get_wechat_channel_status(config=config).model_dump()
+
+        self.assertTrue(payload["ready"])
+        self.assertTrue(payload["base_url_configured"])
+        self.assertTrue(payload["token_ref_configured"])
+        self.assertNotIn("opaque-token", str(payload))
+
     def test_get_config_masks_llm_usage_hmac_secret(self) -> None:
         self._rewrite_env(
             "STOCK_LIST=600519,000001",

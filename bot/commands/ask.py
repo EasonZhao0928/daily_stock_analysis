@@ -186,6 +186,31 @@ class AskCommand(BotCommand):
         return skill_id
 
     @staticmethod
+    def _skill_capability_diagnostic(config: Any, skill_id: str) -> Optional[Dict[str, Any]]:
+        """Use the factory's canonical ToolSurface gate before dispatching /ask."""
+        if not skill_id:
+            return None
+        try:
+            from src.agent.factory import get_tool_registry, resolve_skill_prompt_state
+            from src.agent.tool_surface import ToolSurface
+
+            state = resolve_skill_prompt_state(
+                config,
+                skills=[skill_id],
+                tool_surface=ToolSurface(get_tool_registry()),
+                profile="research_readonly",
+            )
+            if skill_id in state.skills_to_activate:
+                return None
+            return next(
+                (item for item in (state.capability_diagnostics or []) if item.get("skill") == skill_id),
+                {"skill": skill_id, "reason": "unavailable"},
+            )
+        except Exception as exc:
+            logger.warning("[AskCommand] Skill capability validation failed: %s", type(exc).__name__)
+            return {"skill": skill_id, "reason": "capability_check_failed", "error": type(exc).__name__}
+
+    @staticmethod
     def _build_execution_context(stock_code: str, skill_id: str) -> Dict[str, Any]:
         selected = [skill_id] if skill_id else []
         return {
@@ -216,6 +241,13 @@ class AskCommand(BotCommand):
         codes = self._parse_stock_codes(raw_code_str)
         skill_id = self._parse_skill(["placeholder"] + remaining_args) if remaining_args else self._get_default_skill_id()
         skill_text = " ".join(remaining_args).strip()
+
+        diagnostic = self._skill_capability_diagnostic(config, skill_id)
+        if diagnostic is not None:
+            reason = str(diagnostic.get("reason") or "unavailable")
+            missing = list(diagnostic.get("missing_tools") or []) + list(diagnostic.get("missing_capabilities") or [])
+            suffix = f"（缺少：{', '.join(missing)}）" if missing else ""
+            return BotResponse.text_response(f"⚠️ 技能 `{skill_id}` 当前不可用：{reason}{suffix}")
 
         logger.info("[AskCommand] Stocks: %s, Skill: %s, Extra: %s", codes, skill_id, skill_text)
 

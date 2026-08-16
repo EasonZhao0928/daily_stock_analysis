@@ -3,10 +3,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pie, PieChart, ResponsiveContainer, Tooltip, Legend, Cell } from 'recharts';
 import { decisionSignalsApi } from '../api/decisionSignals';
 import { portfolioApi } from '../api/portfolio';
+import { marketApi } from '../api/market';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert } from '../components/common';
 import { PortfolioSignalSummary } from '../components/decision-signals/DecisionSignalDisplay';
+import { CandlestickChart } from '../components/market/CandlestickChart';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import { formatUiText } from '../i18n/uiText';
 import { PORTFOLIO_TEXT } from '../locales/featureText';
@@ -217,6 +219,11 @@ const PortfolioPage: React.FC = () => {
   const portfolioSignalsRequestRef = useRef(0);
   const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
   const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
+  const [chartSymbol, setChartSymbol] = useState<string | null>(null);
+  const [chartResponse, setChartResponse] = useState<Awaited<ReturnType<typeof marketApi.getCandles>> | null>(null);
+  const [chartAnnotations, setChartAnnotations] = useState<Awaited<ReturnType<typeof marketApi.getAnnotations>>['items']>([]);
+  const [chartLoading, setChartLoading] = useState(false);
+  const [chartError, setChartError] = useState<string | null>(null);
 
   const [brokers, setBrokers] = useState<PortfolioImportBrokerItem[]>([]);
   const [selectedBroker, setSelectedBroker] = useState('huatai');
@@ -571,6 +578,33 @@ const PortfolioPage: React.FC = () => {
     }
     return mapped;
   }, [portfolioSignals, positionRows]);
+
+  useEffect(() => {
+    if (!chartSymbol) {
+      setChartResponse(null);
+      setChartAnnotations([]);
+      setChartError(null);
+      return;
+    }
+    let active = true;
+    setChartLoading(true);
+    setChartError(null);
+    void Promise.all([
+      marketApi.getCandles(chartSymbol, { period: 'daily', limit: 120 }),
+      marketApi.getAnnotations(chartSymbol, { accountId: queryAccountId, page: 1, pageSize: 100 }),
+    ]).then(([candles, annotations]) => {
+      if (!active) return;
+      setChartResponse(candles);
+      setChartAnnotations(annotations.items);
+    }).catch((err) => {
+      if (active) setChartError(getParsedApiError(err).message);
+    }).finally(() => {
+      if (active) setChartLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [chartSymbol, queryAccountId]);
 
   const handleAnalyzePosition = async (row: FlatPosition) => {
     const key = `${row.accountId}-${row.symbol}-${row.market}`;
@@ -1258,14 +1292,30 @@ const PortfolioPage: React.FC = () => {
                         <PortfolioSignalSummary item={signal} loading={portfolioSignalsLoading} />
                       </td>
                       <td className="py-2 text-right">
-                        <button
-                          type="button"
-                          onClick={() => void handleAnalyzePosition(row)}
-                          disabled={analyzing}
-                          className="btn-secondary px-2 py-1 text-xs disabled:cursor-wait disabled:opacity-60"
-                        >
-                          {analyzing ? text.submitting : text.analyze}
-                        </button>
+                        <div className="flex justify-end gap-1.5">
+                          <a
+                            href={`/paper-workbench?symbol=${encodeURIComponent(row.symbol)}`}
+                            className="btn-secondary px-2 py-1 text-xs"
+                          >
+                            行情
+                          </a>
+                          <button
+                            type="button"
+                            className="btn-secondary px-2 py-1 text-xs"
+                            onClick={() => setChartSymbol(row.symbol)}
+                            aria-label={`查看 ${row.symbol} K线`}
+                          >
+                            K线
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleAnalyzePosition(row)}
+                            disabled={analyzing}
+                            className="btn-secondary px-2 py-1 text-xs disabled:cursor-wait disabled:opacity-60"
+                          >
+                            {analyzing ? text.submitting : text.analyze}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                     );
@@ -1274,6 +1324,20 @@ const PortfolioPage: React.FC = () => {
               </table>
             </div>
           )}
+          {chartSymbol ? (
+            <div className="mt-5 border-t border-border/50 pt-4" data-testid="portfolio-market-chart">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-semibold text-foreground">{chartSymbol} · 持仓行情</h3>
+                  <p className="text-xs text-secondary-text">数据来自 Market Data；来源、as-of 和 stale 状态由服务端返回。</p>
+                </div>
+                <button type="button" className="btn-secondary px-2 py-1 text-xs" onClick={() => setChartSymbol(null)}>关闭</button>
+              </div>
+              {chartError ? <InlineAlert variant="warning" title="行情加载失败" message={chartError} className="mb-3 rounded-xl px-3 py-2 text-xs shadow-none" /> : null}
+              {chartLoading ? <p className="text-sm text-secondary-text">正在加载 K 线…</p> : null}
+              {chartResponse ? <CandlestickChart candles={chartResponse.candles} annotations={chartAnnotations} stale={chartResponse.stale} metadata={chartResponse} /> : null}
+            </div>
+          ) : null}
         </Card>
 
         <Card padding="md">

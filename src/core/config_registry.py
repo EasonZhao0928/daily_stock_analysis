@@ -79,6 +79,22 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
     "USE_PROXY",
     "PROXY_HOST",
     "PROXY_PORT",
+    # Personal WeChat iLink pairing is intentionally local/env-only.  The
+    # access token lives in Keychain/0600 credential storage, not Web UI state.
+    "WECHAT_CHANNEL_ENABLED",
+    "WECHAT_ILINK_BASE_URL",
+    "WECHAT_ILINK_TOKEN_REF",
+    "WECHAT_ALLOWLIST",
+    "WECHAT_POLL_TIMEOUT_MS",
+    # Integration rollout switches are process-start controls.  They remain
+    # explicit env/config inputs and are intentionally not editable from the
+    # generic Web settings form.
+    "PAPER_AUTO_MODE_ENABLED",
+    "EXTENDED_MARKET_DATA_ENABLED",
+    # Scheduled Paper decision cycles are a process-start control like the
+    # analysis scheduler itself, not a per-request Web setting.
+    "PAPER_SCHEDULER_ENABLED",
+    "PAPER_SCHEDULER_INTERVAL_MINUTES",
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
@@ -127,15 +143,17 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default_value": "litellm",
         "options": [
             {"label": "Default model settings", "value": "litellm"},
+            {"label": "Codex App Server (subscription)", "value": "codex_app_server"},
             {"label": "Codex CLI (experimental)", "value": "codex_cli"},
             {"label": "Claude Code CLI (experimental)", "value": "claude_code_cli"},
             {"label": "OpenCode CLI (experimental)", "value": "opencode_cli"},
         ],
-        "validation": {"enum": ["litellm", "codex_cli", "claude_code_cli", "opencode_cli"]},
+        "validation": {"enum": ["litellm", "codex_app_server", "codex_cli", "claude_code_cli", "opencode_cli"]},
         "display_order": 0,
         "help_key": "settings.ai_model.GENERATION_BACKEND",
         "examples": [
             "GENERATION_BACKEND=litellm",
+            "GENERATION_BACKEND=codex_app_server",
             "GENERATION_BACKEND=codex_cli",
             "GENERATION_BACKEND=claude_code_cli",
             "GENERATION_BACKEND=opencode_cli",
@@ -144,6 +162,29 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {
                 "label": "LLM 配置指南",
                 "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/LLM_CONFIG_GUIDE.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "CODEX_MODEL": {
+        "title": "Codex Model Override",
+        "description": "Optional model override passed to Codex App Server for Generation and Agent sessions. Leave empty to use the signed-in Codex account default.",
+        "category": "ai_model",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "placeholder": "optional Codex model override",
+        "validation": {"pattern": r"^$|^[^\s|<>;`$]+$"},
+        "display_order": 1,
+        "help_key": "settings.ai_model.CODEX_MODEL",
+        "examples": ["CODEX_MODEL=gpt-5"],
+        "docs": [
+            {
+                "label": "Codex App Server",
+                "href": "https://developers.openai.com/codex/app-server/",
             },
         ],
         "warning_codes": [],
@@ -176,7 +217,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "GENERATION_FALLBACK_BACKEND": {
         "title": "Fallback Generation Method",
-        "description": "Backend-level fallback method. Empty disables backend fallback; litellm can be used as fallback for local CLI generation backends.",
+        "description": "Backend-level fallback method. Empty disables backend fallback; for Codex App Server, LiteLLM fallback must be explicitly selected and may incur API cost.",
         "category": "ai_model",
         "data_type": "string",
         "ui_control": "select",
@@ -202,7 +243,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "GENERATION_BACKEND_TIMEOUT_SECONDS": {
         "title": "Generation Backend Timeout",
-        "description": "Maximum seconds allowed for one generation backend call. Applies to local CLI backends; LiteLLM behavior is unchanged.",
+        "description": "Maximum seconds allowed for one generation backend call. Applies to local CLI and Codex App Server generation backends; LiteLLM behavior is unchanged.",
         "category": "ai_model",
         "data_type": "integer",
         "ui_control": "number",
@@ -226,8 +267,8 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "GENERATION_BACKEND_MAX_OUTPUT_BYTES": {
         "title": "Generation Backend Max Output Bytes",
         "description": (
-            "Maximum captured diagnostic stdout/stderr and final-response bytes "
-            "for one local CLI backend call."
+            "Maximum captured transport and final-response bytes "
+            "for one local CLI or Codex App Server generation call."
         ),
         "category": "ai_model",
         "data_type": "integer",

@@ -367,10 +367,10 @@ describe('ChatPage', () => {
     );
 
     expect(await screen.findByText('Codex Agent · 实验')).toBeInTheDocument();
-    expect(screen.getByText('Codex 当前可用范围')).toBeInTheDocument();
-    expect(screen.getByText(/实时行情、新闻、市场热点/)).toBeInTheDocument();
-    expect(screen.getByText('使用已保存的分析上下文和回测汇总，向 Codex 询问个股。')).toBeInTheDocument();
-    expect(screen.getByText(/Codex 将基于已保存的分析上下文和回测汇总回答/)).toBeInTheDocument();
+    expect(screen.getByText('Codex Agent 当前可用范围')).toBeInTheDocument();
+    expect(screen.getByText(/只读行情、历史、技术指标、新闻\/资讯/)).toBeInTheDocument();
+    expect(screen.getByText('向 Codex 询问个股；它会通过 DSA 只读工具读取行情、技术、资讯、回测与持仓上下文。')).toBeInTheDocument();
+    expect(screen.getByText(/输入「分析 600519」或「159202 现在怎么样」/)).toBeInTheDocument();
     expect(screen.queryByText(/AI 将调用实时数据工具/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '切换问股方式' })).toBeInTheDocument();
     expect(mockGetStatus).toHaveBeenCalledTimes(1);

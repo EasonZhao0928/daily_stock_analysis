@@ -40,6 +40,64 @@ export interface ChatResponse {
 
 export type AgentStatusResponse = AgentBackendStatusResponse;
 
+export interface CodexAccountStatus {
+  status: string;
+  authMethod: string | null;
+  email: string | null;
+  planType: string | null;
+  requiresOpenaiAuth: boolean | null;
+}
+
+export interface CodexRateLimitWindow {
+  bucket: 'primary' | 'secondary';
+  usedPercent: number;
+  windowDurationMinutes: number | null;
+  resetsAt: number | null;
+}
+
+export interface CodexRateLimitSnapshot {
+  limitId: string | null;
+  limitName: string | null;
+  planType: string | null;
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+  spendControlReached: boolean | null;
+  rateLimitReachedType: string | null;
+}
+
+export interface CodexRateLimits {
+  snapshots: CodexRateLimitSnapshot[];
+  availableResetCredits: number | null;
+}
+
+export interface CodexAccountNotification {
+  method: string;
+  status: string;
+  account: CodexAccountStatus | null;
+  rateLimits: CodexRateLimits | null;
+  loginId: string | null;
+  success: boolean | null;
+  error: string | null;
+}
+
+export interface CodexAccountStatusResponse {
+  account: CodexAccountStatus;
+  rateLimits: CodexRateLimits | null;
+  rateLimitErrorCode: string | null;
+  notifications: CodexAccountNotification[];
+}
+
+export type CodexLoginMode = 'browser' | 'device_code';
+
+export interface CodexAccountLoginResponse {
+  mode: CodexLoginMode;
+  status: 'pending';
+  loginId: string;
+  authUrl: string | null;
+  verificationUrl: string | null;
+  userCode: string | null;
+}
+
 export interface SkillInfo {
   id: string;
   name: string;
@@ -88,6 +146,24 @@ export const agentApi = {
   async getStatus(): Promise<AgentStatusResponse> {
     const response = await apiClient.get<Record<string, unknown>>('/api/v1/agent/status');
     return toCamelCase<AgentStatusResponse>(response.data);
+  },
+  async getCodexAccountStatus(): Promise<CodexAccountStatusResponse> {
+    const response = await apiClient.get<Record<string, unknown>>('/api/v1/agent/account');
+    return toCamelCase<CodexAccountStatusResponse>(response.data);
+  },
+  async startCodexLogin(mode: CodexLoginMode = 'browser'): Promise<CodexAccountLoginResponse> {
+    const response = await apiClient.post<Record<string, unknown>>('/api/v1/agent/account/login', { mode });
+    return toCamelCase<CodexAccountLoginResponse>(response.data);
+  },
+  async cancelCodexLogin(loginId: string): Promise<{ status: string }> {
+    const response = await apiClient.post<{ status: string }>('/api/v1/agent/account/login/cancel', {
+      login_id: loginId,
+    });
+    return toCamelCase<{ status: string }>(response.data);
+  },
+  async logoutCodexAccount(): Promise<{ status: string }> {
+    const response = await apiClient.post<{ status: string }>('/api/v1/agent/account/logout');
+    return toCamelCase<{ status: string }>(response.data);
   },
   async getChatSessions(limit = 50): Promise<ChatSessionItem[]> {
     const response = await apiClient.get<{ sessions: ChatSessionItem[] }>('/api/v1/agent/chat/sessions', { params: { limit } });

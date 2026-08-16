@@ -27,6 +27,7 @@ from src.agent.provider_trace import persist_provider_trace_turns
 from src.agent.runner import run_agent_loop, parse_dashboard_json
 from src.agent.runtime_facts import AgentRuntimeFacts
 from src.agent.stock_scope import StockScope, resolve_stock_scope
+from src.agent.tool_surface import ToolSurface
 from src.storage import get_db
 from src.agent.tools.registry import ToolRegistry
 from src.report_language import normalize_report_language
@@ -454,20 +455,25 @@ CHAT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数�
 {language_section}
 """
 
-CODEX_CHAT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，负责基于 DSA 已保存的数据解答用户的股票投资问题。
+CODEX_CHAT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，负责通过 DSA 的只读研究工具解答用户的股票投资问题。
 
-## 可用数据
+## 可用数据与工具
 
-- `get_analysis_context`：读取指定股票最近一次已保存的分析上下文。
-- `get_skill_backtest_summary`：读取指定交易技能的已保存回测汇总。
-- `get_strategy_backtest_summary`：读取整体交易策略的已保存回测汇总。
+- 行情与历史：实时行情、日线历史、筹码、资金流、指数和板块排行。
+- 技术分析：趋势、均线、成交量和形态等指标会在当前请求中重算。
+- 资讯与研究：个股新闻、综合资讯、公告、研报、财务、估值和市场扩展数据。
+- 回测：技能/策略汇总以及个股回测明细。
+- 组合只读：当前 Paper/持仓快照和风险信息（只读）。
+- 已保存上下文：`get_analysis_context` 以及各类回测汇总工具。
+
+以上能力来自本次会话列出的 DSA tools；工具失败或返回空数据时必须如实说明。Paper 提案、审批、订单、真实交易、Shell、文件、MCP 和插件写入能力不属于本 profile。
 
 ## 工作方式
 
-1. 询问具体股票时，先调用 `get_analysis_context`，再依据返回的已保存数据回答。
-2. 用户询问交易技能或策略表现时，按问题调用对应的回测汇总工具。
-3. 明确说明结论基于已保存数据；若数据带有分析时间，应在回答中提示其时间范围。
-4. 工具未返回回答所需的信息时，直接说明当前保存的数据不足，不得补写或猜测数据。
+1. 询问具体股票时，先调用实时行情/历史或分析上下文工具，再按问题补充技术、资讯、回测或持仓只读工具。
+2. 用户询问交易技能或策略表现时，按问题调用对应的回测汇总或个股明细工具。
+3. 明确说明数据来源、as-of 时间和是否使用了已保存上下文；不要把工具失败描述成“没有 Agent 配置”。
+4. 工具未返回回答所需的信息时，直接说明缺失项和可行的下一步，不得补写或猜测数字。
 5. 自由组织面向用户的回答，不需要输出 JSON。
 
 {language_section}
@@ -657,7 +663,15 @@ class AgentExecutor:
         max_steps: int = 10,
         timeout_seconds: Optional[float] = None,
     ):
-        self.tool_registry = tool_registry
+        self.tool_surface = (
+            tool_registry
+            if isinstance(tool_registry, ToolSurface)
+            else ToolSurface(tool_registry, legacy_runner_compat=True)
+        )
+        # Compatibility read-only reference for callers that introspect the
+        # legacy executor.  All declarations and execution below use the
+        # ToolSurface; this alias is never an execution seam.
+        self.tool_registry = getattr(self.tool_surface, "_registry", tool_registry)
         self.llm_adapter = llm_adapter
         self.skill_instructions = skill_instructions
         self.default_skill_policy = default_skill_policy
@@ -700,7 +714,7 @@ class AgentExecutor:
         )
 
         # Build tool declarations in OpenAI format (litellm handles all providers)
-        tool_decls = self.tool_registry.to_openai_tools()
+        tool_decls = self.tool_surface.list_tools("openai")
 
         # Initialize conversation
         messages: List[Dict[str, Any]] = [
@@ -749,7 +763,7 @@ class AgentExecutor:
         # Persist the user turn immediately so the session appears in history during processing
         user_message_id = conversation_manager.add_message(session_id, "user", message)
 
-        tool_decls = self.tool_registry.to_openai_tools()
+        tool_decls = self.tool_surface.list_tools("openai")
         result = self._run_loop(
             messages,
             tool_decls,
@@ -811,7 +825,7 @@ class AgentExecutor:
         """
         loop_result = run_agent_loop(
             messages=messages,
-            tool_registry=self.tool_registry,
+            tool_surface=self.tool_surface,
             llm_adapter=self.llm_adapter,
             max_steps=self.max_steps,
             progress_callback=progress_callback,

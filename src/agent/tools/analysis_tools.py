@@ -18,6 +18,7 @@ _ANALYSIS_READ_POLICY = ToolPolicy.declared(
     side_effects=["network_read", "db_read"],
     permissions=["market_data:read"],
     scope_dimensions=["stock"],
+    cancellation_safe=True,
 )
 
 

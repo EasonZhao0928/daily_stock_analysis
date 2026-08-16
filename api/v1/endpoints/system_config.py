@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from api.deps import get_runtime_scheduler_service, get_system_config_service
+from api.deps import get_config_dep, get_runtime_scheduler_service, get_system_config_service
 from api.v1.schemas.common import ErrorResponse
 from api.v1.schemas.system_config import (
     AgentBackendStatusPreviewRequest,
     AgentBackendStatusResponse,
+    CodexQuickCheckRequest,
     DiscoverLLMChannelModelsRequest,
     DiscoverLLMChannelModelsResponse,
     ExportSystemConfigResponse,
@@ -29,12 +31,14 @@ from api.v1.schemas.system_config import (
     TestLLMChannelResponse,
     TestNotificationChannelRequest,
     TestNotificationChannelResponse,
+    WeChatChannelStatusResponse,
     UpdateSystemConfigRequest,
     UpdateSystemConfigResponse,
     ValidateSystemConfigRequest,
     ValidateSystemConfigResponse,
 )
 from src.auth import COOKIE_NAME, is_auth_enabled, refresh_auth_state, verify_session
+from src.config import Config
 from src.services.system_config_service import (
     ConfigConflictError,
     ConfigImportError,
@@ -124,6 +128,45 @@ def _raise_env_backup_access_error(exc: EnvBackupAccessDenied) -> None:
             "error": "env_backup_access_denied",
             "message": exc.message,
         },
+    )
+
+
+def _require_admin_csrf(request: Request | None) -> None:
+    """Require an authenticated same-origin request for quota-affecting probes.
+
+    The normal API middleware verifies the signed session cookie.  This helper
+    adds an endpoint-level CSRF check for the two explicit Codex operations:
+    browser requests must carry a matching Origin/Referer host (or the
+    browser-added ``X-Requested-With`` header), while direct service/unit calls
+    keep their existing call contract by omitting ``request``.
+    """
+    if request is None or os.getenv("DSA_DESKTOP_MODE") == "true":
+        return
+    refresh_auth_state()
+    if not is_auth_enabled():
+        return
+    cookie_val = request.cookies.get(COOKIE_NAME)
+    if not cookie_val or not verify_session(cookie_val):
+        raise HTTPException(status_code=401, detail={"error": "unauthorized", "message": "Login required"})
+
+    expected_host = (request.headers.get("host") or request.url.netloc or "").split(":", 1)[0].lower()
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+    candidate = origin or referer
+    if candidate:
+        parsed = urlsplit(candidate)
+        candidate_host = (parsed.hostname or "").lower()
+        if not expected_host or candidate_host != expected_host:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "csrf_failed", "message": "同源校验失败，请从 DSA Web 页面发起请求"},
+            )
+        return
+    if request.headers.get("x-requested-with", "").lower() == "xmlhttprequest":
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={"error": "csrf_failed", "message": "缺少同源请求标识"},
     )
 
 
@@ -264,6 +307,53 @@ def preview_generation_backend_status(
 
 
 @router.post(
+    "/config/generation-backends/quick-check",
+    response_model=GenerationBackendStatusResponse,
+    responses={
+        200: {"description": "Codex static/protocol/account quick check completed"},
+        400: {"description": "Validation failed", "model": SystemConfigValidationErrorResponse},
+        500: {"description": "Internal server error", "model": ErrorResponse},
+    },
+    summary="Run a no-model Codex quick check",
+    description=(
+        "Check configuration, Codex binary/protocol and token-free account/rate-limit state. "
+        "This endpoint never starts a model turn and does not consume generation quota."
+    ),
+)
+def quick_check_generation_backends(
+    request: CodexQuickCheckRequest,
+    service: SystemConfigService = Depends(get_system_config_service),
+    http_request: Request = None,  # type: ignore[assignment]
+) -> GenerationBackendStatusResponse:
+    """Run an explicit no-model Codex quick check for saved or draft settings."""
+    _require_admin_csrf(http_request)
+    try:
+        payload = service.quick_check_generation_backends(
+            items=[item.model_dump() for item in request.items],
+            mask_token=request.mask_token,
+        )
+        return GenerationBackendStatusResponse.model_validate(payload)
+    except ConfigValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_failed",
+                "message": "System configuration validation failed",
+                "issues": exc.issues,
+            },
+        )
+    except Exception as exc:
+        logger.error("Failed to run generation backend quick check: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "Failed to run generation backend quick check",
+            },
+        )
+
+
+@router.post(
     "/config/generation-backends/smoke-test",
     response_model=TestGenerationBackendResponse,
     responses={
@@ -278,8 +368,10 @@ def preview_generation_backend_status(
 def test_generation_backend(
     request: TestGenerationBackendRequest,
     service: SystemConfigService = Depends(get_system_config_service),
+    http_request: Request = None,  # type: ignore[assignment]
 ) -> TestGenerationBackendResponse:
     """Run a fixed generation backend smoke test."""
+    _require_admin_csrf(http_request)
     try:
         payload = service.test_generation_backend(
             backend_id=request.backend_id,
@@ -287,6 +379,7 @@ def test_generation_backend(
             items=[item.model_dump() for item in request.items],
             mask_token=request.mask_token,
             timeout_seconds=request.timeout_seconds,
+            confirm_quota_risk=request.confirm_quota_risk,
         )
         return TestGenerationBackendResponse.model_validate(payload)
     except ConfigValidationError as exc:
@@ -653,6 +746,61 @@ def test_notification_channel(
                 "message": "Failed to test notification channel",
             },
         )
+
+
+@router.get(
+    "/config/notification/wechat/status",
+    response_model=WeChatChannelStatusResponse,
+    summary="Get personal WeChat channel status",
+    description=(
+        "Return credential-free readiness information for the personal WeChat iLink "
+        "conversation channel. Secret material is never returned."
+    ),
+)
+def get_wechat_channel_status(config: Config = Depends(get_config_dep)) -> WeChatChannelStatusResponse:
+    """Expose safe iLink readiness without treating it as a webhook notifier."""
+    base_url_configured = bool((getattr(config, "wechat_ilink_base_url", None) or "").strip())
+    token_ref = (getattr(config, "wechat_ilink_token_ref", None) or "wechat-ilink-token").strip()
+    token_ref_configured = bool(token_ref)
+    credential_configured = False
+    if token_ref_configured:
+        try:
+            from bot.credentials import default_credential_store
+
+            credential_configured = bool(default_credential_store().read(token_ref))
+        except Exception:
+            # A keychain/0600 store failure is reported as not ready; the
+            # exception and credential value must not cross the API boundary.
+            credential_configured = False
+    enabled = bool(getattr(config, "wechat_channel_enabled", False))
+    allowlist = getattr(config, "wechat_allowlist", None) or []
+    # ConversationChannelRuntime treats an empty allowlist as deny-all.  Do
+    # not advertise a channel as ready when it would accept zero users.
+    ready = (
+        enabled
+        and base_url_configured
+        and token_ref_configured
+        and credential_configured
+        and bool(allowlist)
+    )
+    if ready:
+        message = "个人微信 iLink 已配置；重启服务后会启动长轮询会话。"
+    elif not enabled:
+        message = "个人微信 iLink 未启用；它与企业微信 Webhook 通知是两个独立渠道。"
+    elif not allowlist:
+        message = "个人微信 iLink 凭据已找到，但 WECHAT_ALLOWLIST 为空；至少配置一个允许的用户 ID 后再重启服务。"
+    else:
+        message = "个人微信 iLink 尚未配对：请检查 Base URL、凭据引用和本机凭据存储。"
+    return WeChatChannelStatusResponse(
+        enabled=enabled,
+        base_url_configured=base_url_configured,
+        token_ref_configured=token_ref_configured,
+        credential_configured=credential_configured,
+        allowlist_count=len(allowlist),
+        poll_timeout_ms=int(getattr(config, "wechat_poll_timeout_ms", 30000) or 30000),
+        ready=ready,
+        message=message,
+    )
 
 
 @router.post(

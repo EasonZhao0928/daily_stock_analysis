@@ -59,7 +59,7 @@ describe('SidebarNav', () => {
 
     expect(await screen.findByRole('link', { name: '选股' })).toHaveAttribute('href', '/screening');
     const hrefs = screen.getAllByRole('link').map((link) => link.getAttribute('href'));
-    expect(hrefs.slice(0, 5)).toEqual(['/', '/chat', '/screening', '/portfolio', '/decision-signals']);
+    expect(hrefs.slice(0, 5)).toEqual(['/', '/chat', '/screening', '/portfolio', '/paper-workbench']);
   });
 
   it('refreshes the controlled screening entry after config changes', async () => {
@@ -137,6 +137,18 @@ describe('SidebarNav', () => {
     const signalsLink = screen.getByRole('link', { name: 'AI 建议' });
     expect(signalsLink).toHaveAttribute('href', '/decision-signals');
     expect(signalsLink).toHaveClass('font-medium');
+  });
+
+  it('keeps an active navigation item inside the sidebar width', () => {
+    render(
+      <MemoryRouter initialEntries={['/paper-workbench']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    const paperLink = screen.getByRole('link', { name: 'Paper 工作台' });
+    expect(paperLink).toHaveClass('min-w-0', 'max-w-full', 'box-border');
+    expect(paperLink.querySelector('span')).toHaveClass('min-w-0', 'truncate');
   });
 
   it('opens the logout confirmation and confirms logout', async () => {

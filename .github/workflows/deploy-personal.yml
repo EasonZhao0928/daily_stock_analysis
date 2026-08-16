@@ -135,6 +135,6 @@ jobs:
           fi
 
           "${SSH[@]}" "$REMOTE" \
-            "cd '$DEPLOY_PATH' && APP_DIR='$DEPLOY_PATH' SERVICE_USER='$DEPLOY_USER' bash scripts/deploy_personal.sh"
+          "cd '$DEPLOY_PATH' && APP_DIR='$DEPLOY_PATH' SERVICE_USER='$DEPLOY_USER' SERVICE_MODE=web bash scripts/deploy_personal.sh"
           "${SSH[@]}" "$REMOTE" \
             "curl -fsS --max-time 10 http://127.0.0.1:8000/api/health"

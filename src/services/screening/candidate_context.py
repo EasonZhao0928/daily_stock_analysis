@@ -8,11 +8,13 @@ from __future__ import annotations
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Mapping, Optional
 
 import pandas as pd
-import requests
+
+from data_provider.market_data_types import DataEnvelope, DataQuery, DataStatus, SourcePolicy
 
 _NEGATIVE_EVENT_KEYWORDS = {
     "减持": ("减持", "拟减持", "被动减持"),
@@ -58,6 +60,7 @@ def collect_candidate_context(
     cache_dir: str | Path | None = None,
     cache_ttl_hours: int = 24,
     source_weights: dict[str, float] | None = None,
+    market_data_manager: Any | None = None,
 ) -> tuple[list[dict[str, object]], list[str]]:
     """Collect candidate-level context rows keyed by stock code.
 
@@ -96,6 +99,7 @@ def collect_candidate_context(
                 cache_dir=cache_dir,
                 cache_ttl_hours=cache_ttl_hours,
                 source_weights=source_weights,
+                market_data_manager=market_data_manager,
             )
     else:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -109,6 +113,7 @@ def collect_candidate_context(
                     cache_dir=cache_dir,
                     cache_ttl_hours=cache_ttl_hours,
                     source_weights=source_weights,
+                    market_data_manager=market_data_manager,
                 ): index
                 for index, task in enumerate(tasks)
             }
@@ -140,6 +145,7 @@ def _collect_candidate_context_row(
     cache_dir: str | Path | None,
     cache_ttl_hours: int,
     source_weights: dict[str, float] | None,
+    market_data_manager: Any | None = None,
 ) -> tuple[dict[str, object] | None, list[str]]:
     code = candidate["code"]
     errors: list[str] = []
@@ -157,35 +163,34 @@ def _collect_candidate_context_row(
             "name": candidate.get("name", ""),
         }
         successful_sources: list[str] = []
-        if "news" in providers:
+        diagnostics: dict[str, dict[str, object]] = {}
+
+        requested_context = [provider for provider in providers if provider in {"news", "announcement", "fund_flow", "quote"}]
+        for provider in requested_context:
             try:
-                row["news"] = fetch_stock_news_summary(code, limit=news_limit)
-                if row["news"]:
-                    successful_sources.append("news")
+                envelope = _fetch_candidate_context_envelope(
+                    provider,
+                    code,
+                    stock_name=candidate.get("name", ""),
+                    limit=(announcement_limit if provider == "announcement" else news_limit),
+                    market_data_manager=market_data_manager,
+                )
             except Exception as exc:
-                errors.append(f"{code} news: {exc}")
-        if "announcement" in providers or "announcements" in providers:
-            try:
-                row["announcement"] = fetch_stock_announcement_summary(code, limit=announcement_limit)
-                if row["announcement"]:
-                    successful_sources.append("announcement")
-            except Exception as exc:
-                errors.append(f"{code} announcement: {exc}")
-        if "fund_flow" in providers or "fundflow" in providers:
-            try:
-                row["fund_flow"] = fetch_stock_fund_flow_summary(code)
-                if row["fund_flow"]:
-                    successful_sources.append("fund_flow")
-            except Exception as exc:
-                errors.append(f"{code} fund_flow: {exc}")
-        if "quote" in providers:
-            try:
-                row["quote"] = fetch_stock_quote_summary(code)
-                if row["quote"]:
-                    successful_sources.append("quote")
-            except Exception as exc:
-                errors.append(f"{code} quote: {exc}")
-        if any(value for key, value in row.items() if key not in {"code", "name"}):
+                envelope = _error_envelope(provider, code, exc)
+
+            diagnostics[provider] = _diagnostic_from_envelope(envelope)
+            if envelope.status is DataStatus.OK and _has_context_value(envelope.data):
+                row[provider] = _context_value_to_text(provider, envelope.data)
+                if row[provider]:
+                    successful_sources.append(provider)
+            elif envelope.status not in {DataStatus.VALID_EMPTY, DataStatus.OK}:
+                detail = _envelope_error(envelope)
+                errors.append(f"{code} {provider}: {detail}")
+
+        if diagnostics:
+            row["source_diagnostics"] = diagnostics
+            row["source_status"] = {key: value.get("status") for key, value in diagnostics.items()}
+        if diagnostics or any(value for key, value in row.items() if key not in {"code", "name"}):
             row["source_count"] = len(successful_sources)
             row["source_confidence"] = _source_confidence(successful_sources, providers)
             row["source_weight_score"] = _source_weight_score(
@@ -210,98 +215,310 @@ def _collect_candidate_context_row(
 
 
 def fetch_stock_news_summary(code: str, *, limit: int = 3) -> str:
-    import akshare as ak
-
-    df = ak.stock_news_em(symbol=str(code).zfill(6))
-    if df is None or df.empty:
-        return ""
-    items = []
-    for _, row in df.head(max(limit, 1)).iterrows():
-        title = _first_value(row, ["新闻标题", "标题", "title"])
-        published_at = _first_value(row, ["发布时间", "时间", "date"])
-        source = _first_value(row, ["文章来源", "来源", "source"])
-        text = " ".join(item for item in [published_at, source, title] if item)
-        if text:
-            items.append(text)
-    return _compress_text(" | ".join(_dedupe(items)), max_len=520)
+    """Compatibility facade returning the routed news envelope as text."""
+    envelope = _fetch_candidate_context_envelope("news", code, limit=limit)
+    return _context_value_to_text("news", envelope.data) if envelope.status is DataStatus.OK else ""
 
 
 def fetch_stock_announcement_summary(code: str, *, limit: int = 3) -> str:
-    import akshare as ak
-
-    end = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=45)).strftime("%Y%m%d")
-    df = ak.stock_zh_a_disclosure_report_cninfo(
-        symbol=str(code).zfill(6),
-        market="沪深京",
-        start_date=start,
-        end_date=end,
-    )
-    if df is None or df.empty:
-        return ""
-    items = []
-    for _, row in df.head(max(limit, 1)).iterrows():
-        title = _first_value(row, ["公告标题", "标题", "announcementTitle", "title"])
-        date = _first_value(row, ["公告时间", "公告日期", "date"])
-        if title:
-            items.append(" ".join(item for item in [date, title] if item))
-    return _compress_text(" | ".join(_dedupe(items)), max_len=520)
+    """Compatibility facade returning the routed announcement envelope as text."""
+    envelope = _fetch_candidate_context_envelope("announcement", code, limit=limit)
+    return _context_value_to_text("announcement", envelope.data) if envelope.status is DataStatus.OK else ""
 
 
 def fetch_stock_fund_flow_summary(code: str) -> str:
-    import akshare as ak
-
-    market = _market_for_code(code)
-    if not market:
-        return ""
-    df = ak.stock_individual_fund_flow(stock=str(code).zfill(6), market=market)
-    if df is None or df.empty:
-        return ""
-    row = df.iloc[-1]
-    fields = []
-    for column in df.columns:
-        name = str(column)
-        if any(keyword in name for keyword in ["日期", "主力净流入", "超大单净流入", "大单净流入", "净占比"]):
-            value = _safe_text(row.get(column))
-            if value:
-                fields.append(f"{name}={value}")
-    return _compress_text("，".join(fields[:8]), max_len=420)
+    """Compatibility facade returning the routed fund-flow envelope as text."""
+    envelope = _fetch_candidate_context_envelope("fund_flow", code)
+    return _context_value_to_text("fund_flow", envelope.data) if envelope.status is DataStatus.OK else ""
 
 
 def fetch_stock_quote_summary(code: str) -> str:
-    """Fetch lightweight Tencent quote/fundamental context for one candidate."""
-    symbol = _tencent_symbol_for_code(code)
-    if not symbol:
-        return ""
-    resp = requests.get(
-        f"https://qt.gtimg.cn/q={symbol}",
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=8,
+    """Compatibility facade returning the routed quote envelope as text."""
+    envelope = _fetch_candidate_context_envelope("quote", code)
+    return _context_value_to_text("quote", envelope.data) if envelope.status is DataStatus.OK else ""
+
+
+def _get_market_data_manager() -> Any:
+    """Use the Screening/DataFetcherManager singleton as the context seam."""
+    from src.services.screening_service import _get_dsa_fetcher_manager
+
+    return _get_dsa_fetcher_manager()
+
+
+def _get_search_service() -> Any:
+    from src.search_service import get_search_service
+
+    return get_search_service()
+
+
+def _fetch_candidate_context_envelope(
+    provider: str,
+    code: str,
+    *,
+    stock_name: str = "",
+    limit: int = 3,
+    market_data_manager: Any | None = None,
+) -> DataEnvelope:
+    """Fetch one candidate capability and keep status/provenance separate.
+
+    The old implementation returned ``""`` for all of: a legal empty result,
+    a blocked provider, a malformed response and an invalid symbol.  This
+    boundary preserves the legacy text facade while the pipeline receives a
+    ``DataEnvelope``-compatible diagnostic for each requested source.
+    """
+    provider = _normalize_providers([provider])[0]
+    normalized_code = _normalize_code(code)
+    if not normalized_code or normalized_code == "000000":
+        return _error_envelope(provider, normalized_code or code, ValueError("invalid security code"), status=DataStatus.SYMBOL_INVALID)
+
+    manager = market_data_manager or _get_market_data_manager()
+    if provider in {"news", "announcement"}:
+        envelope = manager.fetch(
+            DataQuery(provider, normalized_code),
+            SourcePolicy(timeout_seconds=8.0, allow_stale=True),
+        )
+        if isinstance(envelope, DataEnvelope) and envelope.capability == provider:
+            data = envelope.data
+            if isinstance(data, list):
+                envelope = DataEnvelope(**{**envelope.__dict__, "data": data[: max(1, int(limit or 1))]})
+            return envelope
+        # Compatibility for older injected managers while production uses the
+        # Market Data capability route above.
+        service = _get_search_service()
+        if not getattr(service, "is_available", False):
+            return _context_envelope(
+                provider,
+                normalized_code,
+                [],
+                source="market_data",
+                status=DataStatus.UPSTREAM_BLOCKED,
+                errors=["market data route unavailable"],
+            )
+        if provider == "news":
+            response = service.search_stock_news(
+                normalized_code, stock_name or normalized_code, max_results=max(1, int(limit or 1))
+            )
+            return _search_response_envelope(provider, normalized_code, response)
+        response = service.search_stock_events(normalized_code, stock_name or normalized_code)
+        return _search_response_envelope(provider, normalized_code, response, limit=limit)
+
+    if provider == "fund_flow":
+        envelope = manager.fetch(
+            DataQuery("capital_flow", normalized_code),
+            SourcePolicy(timeout_seconds=8.0, allow_stale=True),
+        )
+        if isinstance(envelope, DataEnvelope) and envelope.capability == "capital_flow":
+            return DataEnvelope(**{**envelope.__dict__, "capability": "fund_flow"})
+        block = manager.get_capital_flow_context(normalized_code, budget_seconds=8.0)
+        return _fundamental_block_envelope(provider, normalized_code, block)
+
+    if provider == "quote":
+        fetch = getattr(manager, "fetch", None)
+        if callable(fetch):
+            envelope = fetch(
+                DataQuery("realtime_quote", normalized_code),
+                SourcePolicy(timeout_seconds=8.0, allow_stale=True),
+            )
+            if isinstance(envelope, DataEnvelope):
+                return envelope
+        quote = manager.get_realtime_quote(normalized_code, log_final_failure=False)
+        if quote is None:
+            return _context_envelope(
+                provider,
+                normalized_code,
+                {},
+                source="market_data",
+                status=DataStatus.VALID_EMPTY,
+            )
+        return _context_envelope(provider, normalized_code, quote, source="market_data")
+
+    return _error_envelope(provider, normalized_code, ValueError("unsupported context provider"))
+
+
+def _search_response_envelope(
+    provider: str,
+    code: str,
+    response: Any,
+    *,
+    limit: int | None = None,
+) -> DataEnvelope:
+    results = list(getattr(response, "results", []) or [])
+    if limit is not None:
+        results = results[: max(1, int(limit or 1))]
+    source = _safe_text(getattr(response, "provider", "")) or "search"
+    errors = []
+    if not bool(getattr(response, "success", False)):
+        errors.append(_safe_text(getattr(response, "error_message", "")) or "search provider failed")
+    status = DataStatus.OK if results and bool(getattr(response, "success", False)) else (
+        DataStatus.VALID_EMPTY if bool(getattr(response, "success", False)) else DataStatus.UPSTREAM_BLOCKED
     )
-    resp.raise_for_status()
-    text = resp.text or ""
-    if "=\"" not in text:
-        return ""
-    body = text.split("=\"", 1)[1].split("\";", 1)[0]
-    parts = body.split("~")
-    if len(parts) < 46:
-        return ""
-    fields = [
-        ("名称", _part(parts, 1)),
-        ("现价", _part(parts, 3)),
-        ("涨跌幅", _part(parts, 32)),
-        ("最高", _part(parts, 33)),
-        ("最低", _part(parts, 34)),
-        ("成交额万元", _part(parts, 37)),
-        ("换手率", _part(parts, 38)),
-        ("市盈率", _part(parts, 39)),
-        ("总市值亿元", _part(parts, 45)),
-        ("流通市值亿元", _part(parts, 44)),
-    ]
-    return _compress_text(
-        "，".join(f"{name}={value}" for name, value in fields if value),
-        max_len=360,
+    return _context_envelope(
+        provider,
+        code,
+        results,
+        source=source,
+        status=status,
+        errors=errors,
+        fallback_chain=[source],
     )
+
+
+def _fundamental_block_envelope(provider: str, code: str, block: Any) -> DataEnvelope:
+    payload = block.get("data", {}) if isinstance(block, Mapping) else {}
+    errors = list(block.get("errors", []) or []) if isinstance(block, Mapping) else ["fundamental block malformed"]
+    source_chain = _source_chain_names(block.get("source_chain", []) if isinstance(block, Mapping) else [])
+    status_text = _safe_text(block.get("status", "")) if isinstance(block, Mapping) else ""
+    has_payload = _has_context_value(payload)
+    if status_text in {"ok", "partial"} and has_payload:
+        status = DataStatus.OK
+    elif status_text in {"ok", "partial", "not_supported"} and not has_payload and not errors:
+        status = DataStatus.VALID_EMPTY
+    else:
+        status = DataStatus.UPSTREAM_BLOCKED
+    return _context_envelope(
+        provider,
+        code,
+        payload,
+        source=source_chain[-1] if source_chain else "fundamental_pipeline",
+        status=status,
+        errors=errors,
+        fallback_chain=source_chain,
+        quality_flags=["partial"] if status_text == "partial" else [],
+    )
+
+
+def _context_envelope(
+    capability: str,
+    code: str,
+    data: Any,
+    *,
+    source: str,
+    status: DataStatus = DataStatus.OK,
+    source_tier: str = "primary",
+    errors: list[Any] | None = None,
+    fallback_chain: list[str] | None = None,
+    quality_flags: list[str] | None = None,
+) -> DataEnvelope:
+    details = {"errors": [_safe_text(item) for item in (errors or []) if _safe_text(item)]}
+    return DataEnvelope(
+        capability=capability,
+        security_id=code,
+        data=data,
+        source=_safe_text(source) or "market_data",
+        source_tier=source_tier,
+        as_of=None,
+        retrieved_at=datetime.now(timezone.utc),
+        status=status,
+        fallback_chain=[item for item in (fallback_chain or []) if _safe_text(item)],
+        quality_flags=[item for item in (quality_flags or []) if _safe_text(item)],
+        provenance=details,
+    )
+
+
+def _error_envelope(
+    provider: str,
+    code: str,
+    error: BaseException,
+    *,
+    status: DataStatus = DataStatus.UPSTREAM_BLOCKED,
+) -> DataEnvelope:
+    return _context_envelope(
+        provider,
+        code,
+        {},
+        source="market_data",
+        status=status,
+        errors=[f"{type(error).__name__}: {error}"],
+    )
+
+
+def _source_chain_names(values: Any) -> list[str]:
+    names: list[str] = []
+    for item in values or []:
+        value = item.get("provider") if isinstance(item, Mapping) else item
+        text = _safe_text(value)
+        if text and text not in names:
+            names.append(text)
+    return names
+
+
+def _diagnostic_from_envelope(envelope: DataEnvelope) -> dict[str, object]:
+    details = envelope.provenance.details if envelope.provenance is not None else {}
+    return {
+        "status": envelope.status.value,
+        "source": envelope.source,
+        "source_tier": envelope.source_tier,
+        "retrieved_at": envelope.retrieved_at.isoformat(),
+        "is_stale": envelope.is_stale,
+        "quality_flags": list(envelope.quality_flags),
+        "fallback_chain": list(envelope.fallback_chain),
+        "errors": list(details.get("errors", [])) if isinstance(details, Mapping) else [],
+    }
+
+
+def _envelope_error(envelope: DataEnvelope) -> str:
+    diagnostic = _diagnostic_from_envelope(envelope)
+    errors = diagnostic.get("errors") or []
+    return _safe_text(errors[0] if errors else diagnostic.get("status")) or "provider unavailable"
+
+
+def _has_context_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        return any(_has_context_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_context_value(item) for item in value)
+    if hasattr(value, "empty"):
+        try:
+            return not bool(value.empty)
+        except (TypeError, ValueError):
+            return True
+    return True
+
+
+def _context_value_to_text(provider: str, value: Any) -> str:
+    if provider in {"news", "announcement"}:
+        items = []
+        for item in value if isinstance(value, list) else []:
+            title = _safe_text(getattr(item, "title", "") if not isinstance(item, Mapping) else item.get("title"))
+            published = _safe_text(
+                getattr(item, "published_date", "") if not isinstance(item, Mapping) else item.get("published_date")
+            )
+            source = _safe_text(getattr(item, "source", "") if not isinstance(item, Mapping) else item.get("source"))
+            snippet = _safe_text(getattr(item, "snippet", "") if not isinstance(item, Mapping) else item.get("snippet"), max_len=180)
+            text = " ".join(item for item in [published, source, title or snippet] if item)
+            if text:
+                items.append(text)
+        return _compress_text(" | ".join(_dedupe(items)), max_len=520)
+    if provider == "fund_flow":
+        payload = value.get("stock_flow", value) if isinstance(value, Mapping) else value
+        if not isinstance(payload, Mapping):
+            return _compress_text(payload, max_len=420)
+        fields = []
+        for key, item in payload.items():
+            value_text = _safe_text(item)
+            if value_text:
+                fields.append(f"{key}={value_text}")
+        return _compress_text("，".join(fields[:8]), max_len=420)
+    if provider == "quote":
+        payload = value.to_dict() if hasattr(value, "to_dict") and callable(value.to_dict) else value
+        if not isinstance(payload, Mapping):
+            return _compress_text(payload, max_len=360)
+        labels = {
+            "name": "名称", "price": "现价", "change_pct": "涨跌幅", "high": "最高",
+            "low": "最低", "amount": "成交额", "turnover_rate": "换手率", "pe_ratio": "市盈率",
+            "market_cap": "总市值", "float_market_cap": "流通市值",
+        }
+        fields = [
+            f"{labels.get(key, key)}={_safe_text(item)}"
+            for key, item in payload.items()
+            if key in labels and _safe_text(item)
+        ]
+        return _compress_text("，".join(fields), max_len=360)
+    return _compress_text(value, max_len=520)
 
 
 def classify_context_events(row: dict[str, object]) -> list[str]:
@@ -352,6 +569,8 @@ def _ensure_context_row_enrichment(
 ) -> None:
     successful_sources = successful_sources or _successful_sources_from_row(row)
     requested_sources = requested_sources or successful_sources
+    if not isinstance(row.get("source_count"), int):
+        row["source_count"] = len(successful_sources)
     if source_weights is not None or not isinstance(row.get("source_weight_score"), (int, float)):
         row["source_weight_score"] = _source_weight_score(
             successful_sources,
@@ -523,6 +742,15 @@ def _row_text(row: dict[str, object]) -> str:
 
 
 def _successful_sources_from_row(row: dict[str, object]) -> list[str]:
+    diagnostics = row.get("source_diagnostics")
+    if isinstance(diagnostics, Mapping):
+        routed = [
+            str(source)
+            for source, item in diagnostics.items()
+            if isinstance(item, Mapping) and item.get("status") == DataStatus.OK.value
+        ]
+        if routed:
+            return routed
     sources = []
     if row.get("news"):
         sources.append("news")

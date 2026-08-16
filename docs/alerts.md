@@ -67,6 +67,7 @@
 | `reason` | 可读触发原因 |
 | `data_source` | 数据源或 provider |
 | `data_timestamp` | 数据时间；缺失时不得伪造为当前时间 |
+| `source_event_id` | 上游事件的原始、无损 ID；与 `data_timestamp` 二选一用于同源事件去重 |
 | `triggered_at` | 触发时间 |
 | `status` | 触发状态，例如 triggered、skipped、degraded、failed |
 | `diagnostics` | 脱敏后的诊断信息 |
@@ -196,7 +197,7 @@ P3 不做：
 
 P4 让真实告警触发具备可排障的通知结果，并让通过 Alert API 创建的持久化规则具备可重启保持的业务冷却状态。
 
-- DB 持久化规则的 `triggered` 历史按 `rule_id + target + data_source + data_timestamp` 做同一数据点去重：同一触发事件只保留最早一条 `alert_triggers`，重复轮询命中会复用已有触发记录；`data_timestamp` 缺失时不做去重，避免误合并无法证明同源的数据点。即使后续被冷却或通知降噪抑制，仍通过 `alert_notifications` 记录对应的通知尝试或 synthetic 抑制状态。
+- DB 持久化规则的 `triggered` 历史按 `rule_id + target + data_source + data_timestamp` 或上游 `source_event_id` 做同一数据点去重：同一触发事件只保留最早一条 `alert_triggers`，重复轮询命中会复用已有触发记录。`data_timestamp` 缺失时，如果同时没有 `source_event_id` 则不做去重，避免把无法证明同源的数据点误合并；不再把 opaque event ID 哈希伪装成时间戳。即使后续被冷却或通知降噪抑制，仍通过 `alert_notifications` 记录对应的通知尝试或 synthetic 抑制状态。
 - `alert_notifications` 记录真实 per-channel notification attempt，包括 `channel`、`success`、`error_code`、`retryable`、`latency_ms` 和脱敏后的 `diagnostics`。
 - 非渠道发送状态使用 synthetic channel 记录：
   - `__cooldown__`：告警业务冷却抑制，`error_code="cooldown_active"`。
@@ -292,7 +293,7 @@ P6 将可展示目标与可持久化目标分离：
 | `portfolio_account target=all` | `account:all` | `全部账户` |
 | `portfolio_account target=<id>` | `account:<id>` | `账户 <id>` |
 
-- `alert_triggers.target`、`alert_cooldowns.target`、P4 `rule_id + target + data_source + data_timestamp` 去重全部使用 `effective_target`。
+- `alert_triggers.target`、`alert_cooldowns.target`、P4 的 `rule_id + target + data_source + data_timestamp` / `source_event_id` 去重全部使用 `effective_target`。
 - `RuntimeAlertRule.key` 对展开后的子目标使用 `{parent_key}|{effective_target}`，避免 DB cooldown 读取失败时的进程内 fallback 把同一父规则下的不同子目标互相 suppress。
 - `display_target` 不写入 `alert_triggers.target`，仅用于通知标题、dry-run `target_results` 和 Web 展示。
 - P6 不做跨规则同标的通知合并；同一股票若同时命中 watchlist 子规则和独立 `single_symbol` 规则，会按每条规则独立记录和通知。
@@ -384,7 +385,7 @@ scope/type 校验是双向约束：`target_scope=market` 只能使用两类 Mark
 - 若目标 `trade_date` 只有损坏快照，`market_light_score_drop` 返回 `degraded`，不会自动退回更旧交易日做 best-effort 比较。
 - `market_light_score_drop` 首版只做跨交易日比较；无上一交易日基线或同日基线返回 `skipped`，查询/解析异常返回 `degraded`。
 - worker 对 `target_scope=market` 做 region 交易日 gate，并尊重 `TRADING_DAY_CHECK_ENABLED` / `config.trading_day_check_enabled`；检查关闭时允许评估，检查开启且 region 非交易日时返回 `skipped`，不拉取当前快照。
-- 触发历史写 `target=<region>`、`observed_value=<score>`、`data_source=market_light`、`data_timestamp=<trade_date 00:00:00>`，继续复用 P4 的 `rule_id + target + data_source + data_timestamp` 去重。
+- 触发历史写 `target=<region>`、`observed_value=<score>`、`data_source=market_light`、`data_timestamp=<trade_date 00:00:00>`，继续复用 P4 的 `rule_id + target + data_source + data_timestamp` 去重；事件型来源则写入 `source_event_id`，不得将 opaque ID 哈希成伪时间戳。
 
 ### Web 与回滚边界
 
@@ -425,7 +426,7 @@ Desktop 不新增原生告警管理界面；桌面用户复用内置或外部 We
 
 worker 会把 `triggered`、`skipped`、`degraded`、`failed` 写入 `alert_triggers` 作为评估历史；正常未触发不写历史。`skipped` 表示规则本轮没有可评估条件，例如 market 非交易日或缺少上一交易日基线；`degraded` 表示数据源、持仓快照、历史快照或解析过程出现异常，结果不可用于触发通知。
 
-真实触发后会写入 `alert_notifications` 和 `alert_cooldowns`；DB 持久化规则按 `rule_id + target + data_source + data_timestamp` 对同一数据点做 best-effort 去重。legacy JSON 规则继续只使用进程内 fingerprint，不写持久化冷却。
+真实触发后会写入 `alert_notifications` 和 `alert_cooldowns`；DB 持久化规则按 `rule_id + target + data_source + data_timestamp` 或 `source_event_id` 对同一数据点做 best-effort 去重。legacy JSON 规则继续只使用进程内 fingerprint，不写持久化冷却。
 
 回滚 P8 只需 revert 文档、配置说明和 Web 文案改动；没有数据库迁移或用户数据清理。回滚早期 Phase 时，已创建的持久化规则不会自动删除，按下方 Phase 回滚说明处理。
 

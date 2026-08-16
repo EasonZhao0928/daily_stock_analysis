@@ -4,6 +4,7 @@ from src.llm.backend_registry import (
     AGENT_CAPABLE_BACKEND_IDS,
     AUTO_AGENT_BACKEND_ID,
     CLAUDE_CODE_CLI_BACKEND_ID,
+    CODEX_APP_SERVER_BACKEND_ID,
     CODEX_CLI_BACKEND_ID,
     GENERATION_ONLY_BACKEND_IDS,
     LOCAL_CLI_GENERATION_BACKEND_IDS,
@@ -25,11 +26,13 @@ from src.llm.generation_backend import (
     GenerationResult,
 )
 from src.llm.litellm_backend import LiteLLMGenerationBackend
+from src.llm.codex_app_server_backend import CodexAppServerGenerationBackend
 
 __all__ = [
     "AUTO_AGENT_BACKEND_ID",
     "AGENT_CAPABLE_BACKEND_IDS",
     "CLAUDE_CODE_CLI_BACKEND_ID",
+    "CODEX_APP_SERVER_BACKEND_ID",
     "CODEX_CLI_BACKEND_ID",
     "GENERATION_ONLY_BACKEND_IDS",
     "GenerationBackend",
@@ -40,6 +43,7 @@ __all__ = [
     "LOCAL_CLI_GENERATION_BACKEND_IDS",
     "LITELLM_BACKEND_ID",
     "LiteLLMGenerationBackend",
+    "CodexAppServerGenerationBackend",
     "OPENCODE_CLI_BACKEND_ID",
     "SUPPORTED_AGENT_GENERATION_BACKENDS",
     "SUPPORTED_AGENT_UI_BACKENDS",

@@ -11,6 +11,8 @@
 | 配置大模型渠道 | [LLM 配置指南](LLM_CONFIG_GUIDE.md) | [LLM 服务商配置指南](llm-providers.md) |
 | 配置推送通知 | [通知能力基线](notifications.md) | [完整配置与部署指南](full-guide.md) |
 | 部署到服务器或云平台 | [部署指南](DEPLOY.md) | [云端 WebUI 部署](deploy-webui-cloud.md)、[Zeabur 部署](docker/zeabur-deployment.md) |
+| 本地启动当前 Web/API、Codex 或 Paper/Shadow | [本地运行操作手册](operations-local.md) | [集成改造变更总览](dsa-vibe-integration-changes.md) |
+| 通过 SSH、systemd、Codex 和 Caddy 上线 | [服务器操作手册](operations-server.md) | [部署指南](DEPLOY.md)、[集成改造变更总览](dsa-vibe-integration-changes.md) |
 | 使用 Bot / IM 接入 | [Bot 命令与接入](bot-command.md) | [Bot 平台配置](bot/) |
 | 排查运行问题 | [FAQ](FAQ.md) | [更新日志](CHANGELOG.md) |
 | 处理数据源失败或降级 | [数据源稳定性与故障处理图示](data-source-stability.md) | [FAQ](FAQ.md) |
@@ -44,6 +46,9 @@
 | [Bot 命令与接入](bot-command.md) | Bot 命令、Webhook、平台接入和回调说明 |
 | [Bot 平台配置](bot/) | 飞书、钉钉、Discord 等 Bot 配置截图和补充说明 |
 | [实时告警中心](alerts.md) | EventMonitor 基线、Web 规则管理、通知结果、冷却状态和 Phase 边界 |
+| [Paper Account 与 Shadow Research](paper-account.md) | 纸面账户决策 cycle、point-in-time 守卫、审批模式与 feature flag、模型权限边界、API 与排障 |
+| [Market Data 能力路由与供应商治理](market-data.md) | 统一 fetch 入口、Data Envelope、域族频控/熔断、旁路静态门禁、K 线与 SSE 资源上限 |
+| [DSA × Vibe-Trading 集成改造变更总览](dsa-vibe-integration-changes.md) | 前后端新增/修改文件、Paper/Shadow/Market/Codex/微信能力、feature flag、测试覆盖和上线边界 |
 | [DecisionSignal 决策信号专题](decision-signals.md) | AI 建议池字段语义、API、Web 展示、告警/通知/组合风险联动、后验评估、脱敏、迁移与回滚 |
 | [资讯 / 情报源](intelligence-sources.md) | RSS/Atom 合规资讯源配置、测试、拉取、去重、存储、查询与安全边界 |
 | [分析上下文包契约、运行态消费与可见性](analysis-context-pack.md) | AnalysisContextPack 首版范围、字段质量状态、P1/P2 内部契约、P3 Prompt 摘要消费、P4 历史/API/Web 低敏可见性、P5 数据质量评分、P6 迁移回滚与源码锚点；完整指南补充 #1386 阶段感知分析、迁移与回滚入口 |
@@ -58,6 +63,8 @@
 | [云端 WebUI 部署](deploy-webui-cloud.md) | 云服务器访问 WebUI 的部署说明 |
 | [Zeabur 部署](docker/zeabur-deployment.md) | Zeabur 平台部署说明 |
 | [桌面端打包说明](desktop-package.md) | Electron 桌面端和 Web 构建产物打包说明 |
+| [本地运行操作手册](operations-local.md) | 本地 `.env`、启动器、Codex App Server、Paper/Shadow、微信和验收命令 |
+| [服务器操作手册](operations-server.md) | SSH 密码/sudo、systemd、服务器 Codex 登录、Caddy HTTPS 反代和上线清单 |
 
 ## 参考与开发
 

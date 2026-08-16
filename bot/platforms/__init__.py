@@ -53,6 +53,20 @@ except ImportError:
     get_feishu_stream_client = lambda: None
     start_feishu_stream_background = lambda: False
 
+# Personal WeChat iLink channel (feature-flagged; no SDK import required).
+try:
+    from bot.platforms.wechat_ilink import (
+        FakeILinkServer,
+        WeChatChannelAdapter,
+        WeChatILinkClient,
+        parse_ilink_messages,
+    )
+except ImportError:
+    FakeILinkServer = None
+    WeChatChannelAdapter = None
+    WeChatILinkClient = None
+    parse_ilink_messages = None
+
 __all__ = [
     'BotPlatform',
     'DingtalkPlatform',
@@ -70,4 +84,9 @@ __all__ = [
     'get_feishu_stream_client',
     'start_feishu_stream_background',
     'FEISHU_SDK_AVAILABLE',
+    # Personal WeChat iLink channel
+    'WeChatChannelAdapter',
+    'WeChatILinkClient',
+    'FakeILinkServer',
+    'parse_ilink_messages',
 ]

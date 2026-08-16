@@ -1,0 +1,28 @@
+{
+  "capability": "financial_statement",
+  "captured_at": "2026-08-14T00:00:00Z",
+  "fixture_id": "sina-income-statement-600519-v1",
+  "schema_fingerprint": "750f5fc36e3432e32eb223ada729067d746b48b695bf60c29a866e9806318738",
+  "metadata": {
+    "redacted": true,
+    "report_type": "lrb",
+    "source_domain": "sina.com.cn"
+  },
+  "network": false,
+  "payload": [
+    {
+      "报告期": "2026-06-30",
+      "营业收入": "89300000000",
+      "净利润": "42300000000",
+      "净利润_同比": "8.20%"
+    },
+    {
+      "报告期": "2025-12-31",
+      "营业收入": "174100000000",
+      "净利润": "86200000000",
+      "净利润_同比": "5.10%"
+    }
+  ],
+  "provider": "sina",
+  "source_tier": "backup"
+}

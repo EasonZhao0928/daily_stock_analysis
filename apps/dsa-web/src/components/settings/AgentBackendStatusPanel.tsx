@@ -9,6 +9,7 @@ import type {
 } from '../../types/systemConfig';
 import { ApiErrorAlert, Badge, Button } from '../common';
 import { SettingsAlert } from './SettingsAlert';
+import { CodexAccountControl } from './CodexAccountControl';
 
 interface AgentBackendStatusPanelProps {
   items: SystemConfigUpdateItem[];
@@ -67,6 +68,7 @@ export function AgentBackendStatusPanel({
   const hasDraft = requestItems.length > 0;
   const isCodex = selectedBackend === 'codex_app_server';
   const hasArchitectureConflict = isCodex && agentArch !== 'single';
+  const canManageAccount = isCodex && !hasDraft && !hasArchitectureConflict && statusResponse?.available === true;
 
   const refresh = useCallback(async () => {
     const requestId = refreshRequestIdRef.current + 1;
@@ -184,6 +186,8 @@ export function AgentBackendStatusPanel({
           ) : null}
         </div>
       ) : null}
+
+      <CodexAccountControl enabled={canManageAccount} disabled={disabled} />
     </div>
   );
 }

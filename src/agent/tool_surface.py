@@ -8,6 +8,7 @@ import time
 from dataclasses import replace
 from typing import Any, Dict, Optional
 
+from src.agent.stock_scope import StockScope
 from src.agent.tools.execution import (
     ToolAccessContext,
     ToolExecutionCancelled,
@@ -22,10 +23,14 @@ from src.agent.tools.execution import (
     serialize_tool_result,
 )
 from src.agent.tools.registry import (
+    ExecutionProfile,
     SUPPORTED_TOOL_SURFACE_SCOPE_DIMENSIONS,
     ToolDefinition,
+    ToolInvocation,
     ToolParameter,
     ToolRegistry,
+    ToolResult,
+    check_tool_profile_access,
 )
 
 
@@ -46,18 +51,50 @@ class ToolSurface:
     provider-specific runtime transport.
     """
 
-    def __init__(self, registry: ToolRegistry) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        *,
+        legacy_runner_compat: bool = False,
+        default_profile: Optional[Any] = None,
+    ) -> None:
         self._registry = registry
+        # Legacy ``run_agent_loop(tool_registry=...)`` callers may provide
+        # ad-hoc definitions without ToolPolicy metadata.  Keep that public
+        # compatibility path permissive while the factory-created surface
+        # remains fail-closed for undeclared scope contracts.
+        self._legacy_runner_compat = bool(legacy_runner_compat)
+        # The Execution Profile belongs to the surface, not to each call site.
+        # Carrying it here is what keeps LiteLLM and Codex authorizing against
+        # the same profile (R1.3) instead of both silently running unprofiled.
+        self._default_profile = (
+            ExecutionProfile.coerce(default_profile) if default_profile is not None else None
+        )
+
+    @property
+    def default_profile(self) -> Optional[ExecutionProfile]:
+        """The Execution Profile this surface authorizes against, if any.
+
+        Transports read it from here rather than re-deriving it, so LiteLLM and
+        Codex provably authorize against the same profile.
+        """
+        return self._default_profile
 
     @classmethod
     def empty(cls) -> "ToolSurface":
         """Return an empty Phase 6a surface for protocol-only preflight work."""
         return cls(ToolRegistry())
 
-    def list_tools(self, format: str = "public", *, cancellation_safe_only: bool = False) -> list[dict]:
+    def list_tools(
+        self,
+        format: str = "public",
+        *,
+        cancellation_safe_only: bool = False,
+        profile: Optional[Any] = None,
+    ) -> list[dict]:
         """List tools in a stable schema format."""
         normalized = (format or "public").strip().lower()
-        tools = self._registry.list_tools()
+        tools = self._registry.list_tools(profile=profile)
         if cancellation_safe_only:
             tools = [tool_def for tool_def in tools if tool_def.policy.cancellation_safe]
         if normalized == "openai":
@@ -68,16 +105,91 @@ class ToolSurface:
             return [tool_def.to_mcp_descriptor() for tool_def in tools]
         raise ValueError(f"Unsupported tool surface format: {format}")
 
+    def describe(self, profile: Any) -> list[dict]:
+        """Describe the tools visible to one Execution Profile."""
+        return self.list_tools("public", profile=profile)
+
+    def profile_diagnostics(self, profile: Any) -> list[dict]:
+        """Return profile visibility decisions and stable denial reasons."""
+        return self._registry.profile_diagnostics(profile)
+
+    diagnose_profile = profile_diagnostics
+
+    def execute(self, invocation: Any) -> ToolResult:
+        """Execute a serialized or typed profile-bound tool invocation."""
+        try:
+            if not isinstance(invocation, ToolInvocation):
+                invocation = ToolInvocation.from_dict(invocation)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return ToolResult.from_dict(
+                self._error_result(
+                    tool_name="",
+                    code="invalid_arguments",
+                    message="Tool invocation must be a valid object.",
+                    started_at=time.time(),
+                    context=ToolAccessContext(),
+                    retriable=False,
+                    details={"reason": str(exc)},
+                )
+            )
+
+        started_at = time.time()
+        try:
+            profile = ExecutionProfile.coerce(invocation.profile)
+        except ValueError as exc:
+            return ToolResult.from_dict(
+                self._error_result(
+                    tool_name=invocation.name,
+                    code="invalid_profile",
+                    message="Execution profile is not supported.",
+                    started_at=started_at,
+                    context=invocation.context or ToolAccessContext(),
+                    retriable=False,
+                    details={"profile": invocation.profile, "reason": str(exc)},
+                    arguments=invocation.arguments,
+                )
+            )
+
+        context = _context_with_invocation_scope(invocation)
+        raw_result = self.execute_tool(
+            invocation.name,
+            invocation.arguments,
+            context,
+            profile=profile,
+        )
+        return ToolResult.from_dict(raw_result)
+
     def execute_tool(
         self,
-        name: str,
-        arguments: Any,
+        name: Any,
+        arguments: Any = None,
         context: Optional[ToolAccessContext] = None,
+        *,
+        profile: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Execute one registered tool by exact name and return structured output."""
+        if isinstance(name, ToolInvocation) and arguments is None and profile is None:
+            return self.execute(name)
         ctx = context or ToolAccessContext()
         started_at = time.time()
         tool_name = name if isinstance(name, str) else str(name)
+        normalized_profile = None
+        if profile is None:
+            profile = self._default_profile
+        if profile is not None:
+            try:
+                normalized_profile = ExecutionProfile.coerce(profile)
+            except ValueError as exc:
+                return self._error_result(
+                    tool_name=tool_name,
+                    code="invalid_profile",
+                    message="Execution profile is not supported.",
+                    started_at=started_at,
+                    context=ctx,
+                    retriable=False,
+                    details={"profile": profile, "reason": str(exc)},
+                    arguments=arguments,
+                )
         tool_def = self._registry.resolve(tool_name) if isinstance(name, str) else None
 
         if tool_def is None:
@@ -101,6 +213,51 @@ class ToolSurface:
                 arguments=arguments,
             )
 
+        if self._legacy_runner_compat:
+            # Run the historical stock guard before schema validation.  The
+            # old runner normalized numeric and exchange-affixed codes before
+            # handing arguments to a handler, and callers rely on a scope
+            # denial rather than a generic type error for those attempts.
+            legacy_guard_result = _guard_tool_stock_scope(
+                self._registry,
+                tool_name,
+                arguments,
+                ctx.stock_scope,
+            )
+            if legacy_guard_result is not None:
+                return self._error_result(
+                    tool_name=tool_name,
+                    code="stock_scope_violation",
+                    message="Tool call is outside the allowed stock scope.",
+                    started_at=started_at,
+                    context=ctx,
+                    retriable=False,
+                    details={
+                        "expected_stock_code": legacy_guard_result.get("expected_stock_code"),
+                        "requested_stock_code": legacy_guard_result.get("requested_stock_code"),
+                        "allowed_stock_codes": legacy_guard_result.get("allowed_stock_codes", []),
+                    },
+                    result_text=serialize_tool_result(legacy_guard_result),
+                    arguments=arguments,
+                )
+
+        if normalized_profile is not None:
+            profile_decision = check_tool_profile_access(tool_def, normalized_profile)
+            if not profile_decision["visible"]:
+                return self._error_result(
+                    tool_name=tool_name,
+                    code="tool_not_allowed",
+                    message=profile_decision["message"],
+                    started_at=started_at,
+                    context=ctx,
+                    retriable=False,
+                    details={
+                        "profile": normalized_profile.value,
+                        **profile_decision["details"],
+                    },
+                    arguments=arguments,
+                )
+
         validation_error = _validate_arguments(tool_def, arguments)
         if validation_error is not None:
             return self._error_result(
@@ -114,7 +271,7 @@ class ToolSurface:
             )
 
         scope_contract_error = _validate_scope_contract(tool_def)
-        if scope_contract_error is not None:
+        if scope_contract_error is not None and not self._legacy_runner_compat:
             return self._error_result(
                 tool_name=tool_name,
                 code="scope_contract_violation",
@@ -127,7 +284,7 @@ class ToolSurface:
             )
 
         guard_result = None
-        if _requires_stock_scope(tool_def):
+        if _requires_stock_scope(tool_def) and not self._legacy_runner_compat:
             if ctx.stock_scope is None:
                 return self._error_result(
                     tool_name=tool_name,
@@ -165,6 +322,20 @@ class ToolSurface:
                 result_text=result_text,
                 arguments=arguments,
             )
+
+        if normalized_profile is not None:
+            scope_error = _validate_profile_scope(tool_def, arguments, ctx, normalized_profile)
+            if scope_error is not None:
+                return self._error_result(
+                    tool_name=tool_name,
+                    code=scope_error["code"],
+                    message=scope_error["message"],
+                    started_at=started_at,
+                    context=ctx,
+                    retriable=False,
+                    details=scope_error["details"],
+                    arguments=arguments,
+                )
 
         timeout = ctx.timeout_seconds
         if (
@@ -330,6 +501,136 @@ def _execute_with_control(
         reset_tool_execution_context(token)
 
 
+def _context_with_invocation_scope(invocation: ToolInvocation) -> ToolAccessContext:
+    """Merge serializable invocation scopes into the runtime context."""
+    context = invocation.context or ToolAccessContext()
+    updates: Dict[str, Any] = {}
+    if invocation.account_scope is not None:
+        updates["account_scope"] = invocation.account_scope
+    if invocation.symbol_scope is not None:
+        updates["symbol_scope"] = invocation.symbol_scope
+        if context.stock_scope is None:
+            values = _scope_values(invocation.symbol_scope)
+            if values:
+                ordered = sorted(values)
+                updates["stock_scope"] = StockScope(
+                    expected_stock_code=ordered[0],
+                    allowed_stock_codes=set(ordered),
+                    mode="profile",
+                )
+    return replace(context, **updates) if updates else context
+
+
+def _scope_values(value: Any) -> Optional[set]:
+    if value is None:
+        return None
+    if hasattr(value, "allowed_stock_codes"):
+        values = getattr(value, "allowed_stock_codes", None) or set()
+        expected = getattr(value, "expected_stock_code", None)
+        if expected:
+            values = set(values) | {expected}
+    elif isinstance(value, dict):
+        values = value.values()
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        values = value
+    else:
+        values = [value]
+    return {_normalize_scope_token(item) for item in values if item is not None}
+
+
+def _normalize_scope_token(value: Any) -> str:
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value).strip().upper()
+
+
+def _requested_scope_argument(tool_def: ToolDefinition, arguments: Dict[str, Any], names: tuple) -> Any:
+    for name in names:
+        if any(param.name == name for param in tool_def.parameters):
+            return arguments.get(name)
+    return None
+
+
+def _scope_error(code: str, dimension: str, reason: str, requested: Any = None, allowed: Any = None) -> Dict[str, Any]:
+    details: Dict[str, Any] = {
+        "reason": reason,
+        "scope_dimension": dimension,
+    }
+    if requested is not None:
+        details["requested"] = requested
+    if allowed is not None:
+        details["allowed"] = sorted(_scope_values(allowed) or set())
+    return {
+        "code": code,
+        "message": f"Tool call is outside the allowed {dimension} scope.",
+        "details": details,
+    }
+
+
+def _validate_profile_scope(
+    tool_def: ToolDefinition,
+    arguments: Dict[str, Any],
+    context: ToolAccessContext,
+    profile: ExecutionProfile,
+) -> Optional[Dict[str, Any]]:
+    """Enforce profile-bound account and symbol scope contracts."""
+    dimensions = set(tool_def.policy.scope_dimensions)
+    account_param = _requested_scope_argument(tool_def, arguments, ("account_id",))
+    requires_account = "account" in dimensions
+    if not requires_account and account_param is not None:
+        requires_account = any(
+            permission.startswith(("portfolio:", "paper:"))
+            for permission in tool_def.policy.permissions
+        ) and profile in {
+            ExecutionProfile.PORTFOLIO_READONLY,
+            ExecutionProfile.PAPER_PROPOSAL,
+            ExecutionProfile.PAPER_APPROVAL,
+        }
+    if requires_account:
+        allowed_accounts = _scope_values(getattr(context, "account_scope", None))
+        if not allowed_accounts:
+            return _scope_error(
+                "account_scope_violation",
+                "account",
+                "account_scope_required",
+                requested=account_param,
+            )
+        if account_param is None or _normalize_scope_token(account_param) not in allowed_accounts:
+            return _scope_error(
+                "account_scope_violation",
+                "account",
+                "account_scope_mismatch",
+                requested=account_param,
+                allowed=allowed_accounts,
+            )
+
+    symbol_param = _requested_scope_argument(
+        tool_def,
+        arguments,
+        ("symbol", "symbol_code", "stock_code"),
+    )
+    if "symbol" in dimensions:
+        allowed_symbols = _scope_values(
+            getattr(context, "symbol_scope", None) or getattr(context, "stock_scope", None)
+        )
+        if not allowed_symbols:
+            return _scope_error(
+                "symbol_scope_violation",
+                "symbol",
+                "symbol_scope_required",
+                requested=symbol_param,
+            )
+        if symbol_param is None or _normalize_scope_token(symbol_param) not in allowed_symbols:
+            return _scope_error(
+                "symbol_scope_violation",
+                "symbol",
+                "symbol_scope_mismatch",
+                requested=symbol_param,
+                allowed=allowed_symbols,
+            )
+    return None
+
+
 def _validate_arguments(tool_def: ToolDefinition, arguments: Any) -> Optional[str]:
     if not isinstance(arguments, dict):
         return "arguments must be an object"
@@ -394,6 +695,27 @@ def _validate_scope_contract(tool_def: ToolDefinition) -> Optional[Dict[str, Any
             "details": {
                 "scope_dimensions": dimensions,
                 "missing_parameter": "stock_code",
+            },
+        }
+    if "account" in dimensions and not any(
+        param.name == "account_id" for param in tool_def.parameters
+    ):
+        return {
+            "message": "Tool declares account scope but has no account_id parameter.",
+            "details": {
+                "scope_dimensions": dimensions,
+                "missing_parameter": "account_id",
+            },
+        }
+    if "symbol" in dimensions and not any(
+        param.name in {"symbol", "symbol_code", "stock_code"}
+        for param in tool_def.parameters
+    ):
+        return {
+            "message": "Tool declares symbol scope but has no symbol parameter.",
+            "details": {
+                "scope_dimensions": dimensions,
+                "missing_parameter": "symbol",
             },
         }
     return None

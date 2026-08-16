@@ -10,7 +10,6 @@ This is separate from single-stock realtime quotes.
 import logging
 import json
 import os
-import random
 import threading
 import time
 from datetime import date, datetime, timezone, timedelta
@@ -18,23 +17,28 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from src.services.screening.source_guard import call_with_timeout, parse_source_timeout_seconds
+from data_provider.supplier_runtime import get_supplier_runtime_registry
+from data_provider.eastmoney_client import (
+    DATACENTER_REFERER,
+    DATACENTER_SELECTION_URL,
+    EastMoneyClient,
+    build_eastmoney_session,
+)
+from data_provider.screening_sources import (
+    SINA_MARKET_CENTER_REFERER,
+    SINA_MARKET_CENTER_URL,
+    fetch_akshare_full_market_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
 _SNAPSHOT_CACHE_VERSION = 1
 _DEFAULT_TUSHARE_HTTP_URL = "http://api.waditu.com"
-_EM_REQUEST_MIN_INTERVAL_SECONDS = 1.0
-_EM_REQUEST_JITTER_SECONDS = 0.3
 _SOURCE_HEALTH_FAILURE_THRESHOLD = 3
 _SOURCE_HEALTH_COOLDOWN_SECONDS = 5 * 60
 _SNAPSHOT_CALL_TIMEOUT_SECONDS = 60.0
-_EM_SESSION: requests.Session | None = None
-_EM_LAST_REQUEST_AT = 0.0
-_EM_LOCK = threading.Lock()
 _SOURCE_HEALTH: dict[str, dict[str, object]] = {}
 _SOURCE_HEALTH_LOCK = threading.Lock()
 
@@ -414,9 +418,7 @@ def _fetch_efinance() -> pd.DataFrame:
 
 def _fetch_akshare_em() -> pd.DataFrame:
     """Fetch via akshare (eastmoney)."""
-    import akshare as ak
-
-    df = ak.stock_zh_a_spot_em()
+    df = fetch_akshare_full_market_snapshot()
     if df is None or df.empty:
         raise RuntimeError("akshare returned empty data")
     return _normalize(df, source="akshare_em")
@@ -430,30 +432,36 @@ def _fetch_sina() -> pd.DataFrame:
     non-Eastmoney-first snapshot option before falling back to Eastmoney-heavy
     sources.
     """
-    url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
+    url = SINA_MARKET_CENTER_URL
     page = 1
     # Sina caps this endpoint at 100 rows. Use the cap to reduce full-market
     # pagination round trips without changing the response contract.
     page_size = 100
     all_items = []
+    # Sina is a governed supplier family: this loop issues ~55 requests for a
+    # full-market sweep, so it shares the process-wide session, rate gate and
+    # circuit rather than opening its own connections (R2.7).
+    runtime = get_supplier_runtime_registry()
+    session = runtime.get_session("sina")
     while True:
-        resp = requests.get(
-            url,
-            params={
-                "page": page,
-                "num": page_size,
-                "sort": "symbol",
-                "asc": 1,
-                "node": "hs_a",
-                "symbol": "",
-                "_s_r_a": "page",
-            },
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://vip.stock.finance.sina.com.cn/mkt/",
-            },
-            timeout=15,
-        )
+        with runtime.request("sina"):
+            resp = session.get(
+                url,
+                params={
+                    "page": page,
+                    "num": page_size,
+                    "sort": "symbol",
+                    "asc": 1,
+                    "node": "hs_a",
+                    "symbol": "",
+                    "_s_r_a": "page",
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": SINA_MARKET_CENTER_REFERER,
+                },
+                timeout=15,
+            )
         resp.raise_for_status()
         items = resp.json()
         if not isinstance(items, list):
@@ -479,7 +487,7 @@ def _fetch_em_datacenter() -> pd.DataFrame:
 
     This works even on weekends (returns last trading day data).
     """
-    url = "https://data.eastmoney.com/dataapi/xuangu/list"
+    url = DATACENTER_SELECTION_URL
     all_items = []
     page = 1
     page_size = 500
@@ -499,7 +507,7 @@ def _fetch_em_datacenter() -> pd.DataFrame:
         }
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://data.eastmoney.com/xuangu/",
+            "Referer": DATACENTER_REFERER,
         }
 
         resp = _eastmoney_get(url, params=params, headers=headers, timeout=30)
@@ -524,52 +532,22 @@ def _fetch_em_datacenter() -> pd.DataFrame:
 
 
 def _eastmoney_get(url: str, **kwargs) -> requests.Response:
-    """GET EastMoney endpoints through one throttled shared session.
+    """GET an EastMoney endpoint through the process-wide supplier runtime.
 
-    EastMoney endpoints are useful but more sensitive to bursty access than
-    lightweight direct sources. Keeping all direct calls behind one retrying
-    session, a process-wide interval, and a little jitter follows the same
-    anti-ban pattern used by a-stock-data's ``em_get`` helper.
+    Screening used to keep a private session, timestamp and mutex here.  That
+    made the snapshot path invisible to the hotspot provider and to the normal
+    Market Data adapters, so concurrent callers could still burst the same
+    upstream domain.  The registry owns the shared session, interval/jitter,
+    circuit and health state now; this function only supplies the endpoint
+    specific request and preserves the old ``Response`` contract.
     """
-    global _EM_LAST_REQUEST_AT, _EM_SESSION
-    with _EM_LOCK:
-        if _EM_SESSION is None:
-            _EM_SESSION = _build_eastmoney_session()
-        elapsed = time.monotonic() - _EM_LAST_REQUEST_AT
-        interval = _eastmoney_request_interval_seconds()
-        if elapsed < interval:
-            time.sleep(interval - elapsed)
-        response = _EM_SESSION.get(url, **kwargs)
-        _EM_LAST_REQUEST_AT = time.monotonic()
-    response.raise_for_status()
-    return response
+    client = EastMoneyClient(runtime=get_supplier_runtime_registry())
+    return client.get(url, raise_for_status=True, **kwargs)
 
 
 def _build_eastmoney_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=2,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
-def _eastmoney_request_interval_seconds() -> float:
-    min_interval = _float_env(
-        "SCREENING_EASTMONEY_MIN_INTERVAL_SEC",
-        _EM_REQUEST_MIN_INTERVAL_SECONDS,
-    )
-    jitter = _float_env(
-        "SCREENING_EASTMONEY_JITTER_SEC",
-        _EM_REQUEST_JITTER_SECONDS,
-    )
-    return max(min_interval, 0.0) + random.uniform(0.0, max(jitter, 0.0))
+    """Compatibility alias; session ownership lives in data_provider."""
+    return build_eastmoney_session()
 
 
 def _float_env(name: str, default: float) -> float:

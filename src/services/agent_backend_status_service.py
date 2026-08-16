@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any, Dict, Optional
@@ -230,9 +231,38 @@ class AgentBackendStatusService:
             return self._response(backend="litellm", available=True)
         return self._codex_cheap_status()
 
-    def _codex_cheap_status(self) -> Dict[str, Any]:
+    def codex_capability_status(self) -> Dict[str, Any]:
+        """Run the reusable Codex static/protocol probe with safe details.
+
+        The historical Agent status contract intentionally remains flat.  The
+        unified Generation status endpoint needs a little more context (the
+        platform, binary and protocol phases), so it opts into this additive
+        projection rather than changing the existing Agent response shape.
+        """
+        return self._codex_cheap_status(include_details=True)
+
+    def _codex_cheap_status(self, *, include_details: bool = False) -> Dict[str, Any]:
+        details: Dict[str, Any] = {
+            "platform": {
+                "system": sys.platform,
+                "native_windows": is_native_windows(),
+            },
+            "binary": {
+                "name": "codex",
+                "available": False,
+            },
+            "protocol": {
+                "status": "not_checked",
+            },
+        }
+
+        def response(**kwargs: Any) -> Dict[str, Any]:
+            if include_details:
+                kwargs["details"] = details
+            return self._response(**kwargs)
+
         if is_native_windows():
-            return self._response(
+            return response(
                 backend="codex_app_server",
                 available=False,
                 error_code="platform_unsupported",
@@ -241,7 +271,7 @@ class AgentBackendStatusService:
         try:
             command = resolve_command()
         except CodexAppServerError as exc:
-            return self._response(
+            return response(
                 backend="codex_app_server",
                 available=False,
                 error_code=getattr(exc, "code", "command_not_found"),
@@ -264,22 +294,25 @@ class AgentBackendStatusService:
                     schema_result.returncode == 0
                     and _codex_protocol_schema_is_capable(Path(schema_dir))
                 )
+                details["binary"]["available"] = True
+                details["protocol"]["status"] = "passed" if protocol_capable else "failed"
         except CodexAppServerError as exc:
-            return self._response(
+            return response(
                 backend="codex_app_server",
                 available=False,
                 error_code=exc.code,
                 message="Codex compatibility check could not reclaim its background process",
             )
         except (OSError, subprocess.SubprocessError):
-            return self._response(
+            details["protocol"]["status"] = "failed"
+            return response(
                 backend="codex_app_server",
                 available=False,
                 error_code="capability_unsupported",
                 message="Codex App Server capability check failed",
             )
         if not protocol_capable:
-            return self._response(
+            return response(
                 backend="codex_app_server",
                 available=False,
                 error_code="capability_unsupported",
@@ -296,7 +329,7 @@ class AgentBackendStatusService:
                 version = version_result.stdout.strip() or None
         except (OSError, subprocess.SubprocessError):
             pass
-        return self._response(
+        return response(
             backend="codex_app_server",
             available=True,
             version=version,
@@ -310,8 +343,9 @@ class AgentBackendStatusService:
         error_code: Optional[str] = None,
         message: Optional[str] = None,
         version: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return {
+        payload = {
             "backend": backend,
             "available": available,
             "experimental": backend == "codex_app_server",
@@ -319,6 +353,9 @@ class AgentBackendStatusService:
             "error_code": error_code,
             "message": message,
         }
+        if details is not None:
+            payload.update(details)
+        return payload
 
     def _build_config(self) -> Config:
         if self._config is not None:

@@ -146,7 +146,7 @@ class AlertWorker:
         for runtime_rule in runtime_rules:
             stats["evaluated"] += 1
             try:
-                result = asyncio.run(self.service._evaluate_rule(runtime_rule.rule, monitor, daily_cache=daily_cache))
+                result = asyncio.run(self.service.evaluate_rule(runtime_rule.rule, monitor, daily_cache=daily_cache))
             except Exception as exc:
                 result = {
                     "rule_id": self.service._runtime_rule_id(runtime_rule.rule),
@@ -302,7 +302,8 @@ class AlertWorker:
             "threshold": self._optional_float(result.get("threshold")),
             "reason": result.get("reason") or result.get("message"),
             "data_source": result.get("data_source"),
-            "data_timestamp": result.get("data_timestamp"),
+            "data_timestamp": self.service._coerce_data_timestamp(result.get("data_timestamp")),
+            "source_event_id": self.service._extract_source_event_id(result),
             "status": status,
             "diagnostics": self._diagnostics_for_status(status, result, runtime_rule),
         }
@@ -336,7 +337,7 @@ class AlertWorker:
             runtime_rule.source == "db"
             and fields.get("status") == "triggered"
             and fields.get("rule_id") is not None
-            and fields.get("data_timestamp") is not None
+            and (fields.get("data_timestamp") is not None or fields.get("source_event_id") is not None)
         )
 
     @staticmethod

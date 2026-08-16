@@ -1,0 +1,22 @@
+name: shadow_account_review
+display_name: 影子账户复核
+description: 检查 Shadow Research、Paper Account、Signal、Proposal 与账本之间的可重放性和权限边界。
+summary: 影子账户只生成受限信号/Proposal，不触达真实 broker。
+version: 1.0.0
+category: research
+risk-level: critical
+evidence-policy: required
+required-capabilities: [market_data:read, evidence:read, paper:read]
+required_tools: [get_portfolio_snapshot, get_daily_history, get_skill_backtest_summary]
+aliases: [影子账户, paper复核, 虚拟账户复核]
+instructions: |
+  ## 输入
+  - 冻结 profile/rule version、Market Data cutoff、Evidence refs、账户快照和上一周期结果。
+  - 检查 source snapshot hash、观察值 hash、策略版本和运行 id 是否一致。
+
+  ## 安全边界
+  - 只允许 research_readonly/portfolio_readonly 或 paper_proposal profile；禁止 broker、shell、真实订单和任意文件工具。
+  - Proposal 需要明确 symbol、方向、数量/目标权重、理由、证据引用和风险规则结果。
+
+  ## 输出
+  - 报告 replay 差异、stale/degraded 来源、风险拒绝、幂等状态和下一步人工审批项。

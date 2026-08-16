@@ -13,6 +13,16 @@ CLAUDE = ROOT / "CLAUDE.md"
 COPILOT = ROOT / ".github" / "copilot-instructions.md"
 INSTRUCTIONS_DIR = ROOT / ".github" / "instructions"
 CLAUDE_SKILLS_DIR = ROOT / ".claude" / "skills"
+# `.claude/skills/` is the single source of truth (AGENTS.md 2).  `.agents/skills/`
+# is a mirror for other agent runtimes and may differ only by the review-output
+# directory each runtime writes to.
+AGENTS_SKILLS_DIR = ROOT / ".agents" / "skills"
+MIRRORED_SKILL_FILES = (
+    "analyze-issue/SKILL.md",
+    "analyze-pr/SKILL.md",
+    "fix-issue/SKILL.md",
+)
+MIRROR_PATH_TOKENS = (".claude/reviews/", ".Codex/reviews/")
 
 REQUIRED_INSTRUCTION_FILES = {
     "backend.instructions.md",
@@ -90,6 +100,34 @@ def ensure_skill_files() -> None:
                 fail(f"{path.relative_to(ROOT)} must reference AGENTS.md as the rule source")
 
 
+def ensure_agent_skill_mirror() -> None:
+    """Keep `.agents/skills/` a faithful mirror of the canonical skills.
+
+    Two hand-maintained copies of the same instructions drift silently, which
+    AGENTS.md 2 prohibits.  Normalizing the per-runtime review path lets the
+    check compare the rest byte-for-byte.
+    """
+    if not AGENTS_SKILLS_DIR.exists():
+        return
+    canonical_token = MIRROR_PATH_TOKENS[0]
+    for relative_path in MIRRORED_SKILL_FILES:
+        mirror = AGENTS_SKILLS_DIR / relative_path
+        source = CLAUDE_SKILLS_DIR / relative_path
+        if not mirror.exists():
+            fail(f"missing .agents mirror for {relative_path}; keep it in sync or delete the directory")
+        normalized = []
+        for path in (source, mirror):
+            text = path.read_text(encoding="utf-8")
+            for token in MIRROR_PATH_TOKENS:
+                text = text.replace(token, canonical_token)
+            normalized.append(text)
+        if normalized[0] != normalized[1]:
+            fail(
+                f".agents/skills/{relative_path} has drifted from .claude/skills/{relative_path}; "
+                "update the mirror from the canonical file"
+            )
+
+
 def ensure_gitignore_rules() -> None:
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
     for snippet in REQUIRED_GITIGNORE_SNIPPETS:
@@ -118,6 +156,7 @@ def main() -> None:
     ensure_copilot_entry()
     ensure_instruction_files()
     ensure_skill_files()
+    ensure_agent_skill_mirror()
     ensure_gitignore_rules()
     ensure_no_tracked_claude_artifacts()
     print("[ai-assets] OK")

@@ -836,11 +836,11 @@ class BacktestService:
             return
 
         try:
-            from data_provider.base import DataFetcherManager
+            from data_provider.runtime import get_market_data_manager
 
             # fetch a window that covers start + forward bars
             end_date = analysis_date + timedelta(days=max(eval_window_days * 2, 30))
-            manager = DataFetcherManager()
+            manager = get_market_data_manager()
             df, source = manager.get_daily_data(
                 stock_code=refill_code,
                 start_date=analysis_date.strftime("%Y-%m-%d"),

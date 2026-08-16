@@ -11,7 +11,6 @@ Tools:
 
 import logging
 from datetime import date
-from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.agent.tools.execution import check_tool_execution
@@ -24,12 +23,14 @@ _MARKET_DATA_STOCK_POLICY = ToolPolicy.declared(
     side_effects=["network_read"],
     permissions=["market_data:read"],
     scope_dimensions=["stock"],
+    cancellation_safe=True,
 )
 _MARKET_DATA_CACHE_POLICY = ToolPolicy.declared(
     read_only=True,
     side_effects=["network_read", "db_read", "db_write_cache"],
     permissions=["market_data:read"],
     scope_dimensions=["stock"],
+    cancellation_safe=True,
 )
 _ANALYSIS_CONTEXT_POLICY = ToolPolicy.declared(
     read_only=True,
@@ -42,10 +43,9 @@ _PORTFOLIO_READ_POLICY = ToolPolicy.declared(
     read_only=True,
     side_effects=["db_read"],
     permissions=["portfolio:read"],
+    cancellation_safe=True,
 )
 
-_fetcher_manager_singleton = None
-_fetcher_manager_lock = Lock()
 _DAILY_HISTORY_DEFAULT_DAYS = 60
 _DAILY_HISTORY_MAX_DAYS = 365
 
@@ -57,20 +57,16 @@ def _get_fetcher_manager():
     (~2 s each) and prevents circuit-breaker cooldown from taking effect across
     consecutive tool calls within the same agent run.
     """
-    from data_provider import DataFetcherManager
-    global _fetcher_manager_singleton
-    if _fetcher_manager_singleton is None:
-        with _fetcher_manager_lock:
-            if _fetcher_manager_singleton is None:
-                _fetcher_manager_singleton = DataFetcherManager()
-    return _fetcher_manager_singleton
+    from data_provider.runtime import get_market_data_manager
+
+    return get_market_data_manager()
 
 
 def reset_fetcher_manager() -> None:
     """Clear the cached DataFetcherManager so runtime config reloads take effect."""
-    global _fetcher_manager_singleton
-    with _fetcher_manager_lock:
-        _fetcher_manager_singleton = None
+    from data_provider.runtime import reset_market_data_runtime
+
+    reset_market_data_runtime()
 
 
 def _get_db():

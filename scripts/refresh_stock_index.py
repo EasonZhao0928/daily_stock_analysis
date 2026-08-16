@@ -3,7 +3,7 @@
 """Refresh local stock autocomplete index assets.
 
 Default flow:
-1. Fetch Tushare stock lists into ``data/`` with ``--a-rk`` for A-share name correction.
+1. Fetch Tushare stock and listed ETF lists into ``data/`` with ``--a-rk`` for A-share name correction.
 2. Generate ``apps/dsa-web/public/stocks.index.json`` from CSV plus JP/KR seed rows.
 3. Copy the generated index to ``static/stocks.index.json`` for backend use.
 """
@@ -74,7 +74,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 2
-            _run([sys.executable, "scripts/fetch_tushare_stock_list.py", "--a-rk"])
+            # Include listed ETF/fund rows so autocomplete and the backend
+            # SecurityId classifier see the same instrument universe.
+            _run([sys.executable, "scripts/fetch_tushare_stock_list.py", "--a-rk", "--etf"])
 
         _run([sys.executable, "scripts/generate_index_from_csv.py", "--source", "tushare"])
         _sync_static_index()

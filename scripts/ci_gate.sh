@@ -4,10 +4,14 @@ set -euo pipefail
 
 syntax_check() {
   echo "==> backend-gate: Python syntax check"
+  bash -n scripts/dsa-service.sh scripts/deploy_personal.sh
   python -m py_compile main.py src/config.py src/auth.py src/analyzer.py src/notification.py
   python -m py_compile src/storage.py src/scheduler.py src/search_service.py
   python -m py_compile src/market_analyzer.py src/stock_analyzer.py
   python -m py_compile data_provider/*.py
+  python -m py_compile bot/conversation.py bot/credentials.py bot/commands/paper.py
+  python -m py_compile bot/platforms/feishu_stream.py bot/platforms/dingtalk_stream.py bot/platforms/wechat_ilink.py
+  python -m py_compile src/paper_account/*.py src/services/market_chart_service.py src/services/market_stream_service.py
 }
 
 flake8_checks() {
@@ -17,6 +21,8 @@ flake8_checks() {
 
 deterministic_checks() {
   echo "==> backend-gate: local deterministic checks"
+  python scripts/check_a_stock_data_notice.py
+  python scripts/check_supplier_bypasses.py
   ./scripts/test.sh code
   ./scripts/test.sh yfinance
 }

@@ -19,6 +19,8 @@ import pandas as pd
 import requests
 
 from src.services.screening.source_guard import call_with_timeout, parse_source_timeout_seconds
+from data_provider.screening_sources import SINA_DAILY_KLINE_URL, TENCENT_DAILY_KLINE_URL
+from data_provider.supplier_runtime import get_supplier_runtime_registry
 
 _DAILY_FEATURE_DEFAULTS = {
     "daily_data_points": pd.NA,
@@ -553,12 +555,16 @@ def _fetch_daily_tencent(code: str, *, lookback_days: int) -> pd.DataFrame:
     """
     symbol = _to_tencent_code(code)
     count = max(int(lookback_days), 30)
-    response = requests.get(
-        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
-        params={"param": f"{symbol},day,,,{count},qfq"},
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=10,
-    )
+    # Per-stock call inside a screening sweep: share the process-wide Tencent
+    # session, rate gate and circuit instead of opening ad-hoc connections.
+    runtime = get_supplier_runtime_registry()
+    with runtime.request("tencent"):
+        response = runtime.get_session("tencent").get(
+            TENCENT_DAILY_KLINE_URL,
+            params={"param": f"{symbol},day,,,{count},qfq"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict) or payload.get("code") not in (0, "0", None):
@@ -606,12 +612,14 @@ def _fetch_daily_sina(code: str, *, lookback_days: int) -> pd.DataFrame:
     """
     symbol = _to_tencent_code(code)
     count = max(int(lookback_days), 30)
-    response = requests.get(
-        "https://quotes.sina.cn/cn/api/openapi.php/CN_MarketDataService.getKLineData",
-        params={"symbol": symbol, "scale": 240, "ma": "no", "datalen": count},
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=10,
-    )
+    runtime = get_supplier_runtime_registry()
+    with runtime.request("sina"):
+        response = runtime.get_session("sina").get(
+            SINA_DAILY_KLINE_URL,
+            params={"symbol": symbol, "scale": 240, "ma": "no", "datalen": count},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
     response.raise_for_status()
     payload = response.json()
     data = payload.get("result", {}).get("data") if isinstance(payload, dict) else None

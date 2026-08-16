@@ -27,6 +27,7 @@ from generate_index_from_csv import (
     main,
     compress_index,
     build_stock_index,
+    is_cn_etf_symbol,
     load_tushare_data,
     load_akshare_data,
 )
@@ -118,6 +119,10 @@ class TestDetermineMarket:
         """测试美股 A 类股（GOOG.A）"""
         result = determine_market("GOOG.A")
         assert result == "US"
+
+    def test_cn_etf_code_range_is_recognized(self):
+        assert is_cn_etf_symbol("159202") is True
+        assert is_cn_etf_symbol("600519") is False
 
     def test_us_stock_units(self):
         """测试美股 Unit（AAPL.U）"""
@@ -406,6 +411,15 @@ class TestOutputFormat:
         assert item[7] == "stock"          # assetType
         assert item[8] == True             # active
         assert item[9] == 100              # popularity
+
+    def test_build_index_marks_etf_codes(self):
+        index = build_stock_index([{
+            "ts_code": "159202.SZ",
+            "symbol": "159202",
+            "name": "示例 ETF",
+            "market": "CN",
+        }])
+        assert index[0]["assetType"] == "etf"
 
     def test_compress_index_field_count(self):
         """测试压缩格式的字段数量"""

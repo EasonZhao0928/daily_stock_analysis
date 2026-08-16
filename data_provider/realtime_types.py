@@ -461,3 +461,15 @@ def get_realtime_circuit_breaker() -> CircuitBreaker:
 def get_chip_circuit_breaker() -> CircuitBreaker:
     """获取筹码接口熔断器"""
     return _chip_circuit_breaker
+
+
+# The provider-neutral Market Data contracts live beside the legacy realtime
+# quote models.  Re-export them here so existing adapter imports can migrate
+# incrementally without creating a second public package surface.
+from .market_data_types import (  # noqa: E402,F401
+    DataEnvelope,
+    DataQuery,
+    DataStatus,
+    Provenance,
+    SourcePolicy,
+)

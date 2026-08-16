@@ -76,6 +76,18 @@ const settingsHelpZhCN: SettingsHelpMap = {
     impact: ['影响普通分析、大盘复盘和文本生成的 OpenCode CLI 调用，不影响问股助手。'],
     examples: ['OPENCODE_CLI_MODEL=provider/model'],
   },
+  'settings.ai_model.CODEX_MODEL': {
+    title: 'Codex 模型覆盖',
+    showFieldKey: true,
+    summary: '可选：指定官方 Codex App Server 使用的模型；普通 Generation 与 Agent 会话共享该覆盖值。',
+    usage: '留空时使用已登录 Codex 账号的默认模型。只有在 Codex backend 下才会实际发送该值。',
+    valueNotes: [
+      '模型可用性和订阅额度由当前 Codex 登录账号决定。',
+      '配置时会作为单个参数发送，不能包含空白或 shell 元字符。',
+    ],
+    impact: ['影响日报、市场复盘、普通文本生成及 Codex Agent 会话，不改变工具权限。'],
+    examples: ['CODEX_MODEL=gpt-5'],
+  },
   'settings.ai_model.GENERATION_BACKEND_TIMEOUT_SECONDS': {
     title: '生成超时（秒）',
     summary: '限制一次模型生成最多等待多久。',
@@ -1303,6 +1315,18 @@ const settingsHelpEnUS: SettingsHelpMap = {
     ],
     impact: ['Affects regular analysis, market review, and text generation through OpenCode CLI. It does not affect the ask-stock assistant.'],
     examples: ['OPENCODE_CLI_MODEL=provider/model'],
+  },
+  'settings.ai_model.CODEX_MODEL': {
+    title: 'Codex Model Override',
+    showFieldKey: true,
+    summary: 'Optional model override shared by ordinary Codex Generation and Agent sessions.',
+    usage: 'Leave it empty to use the default model of the signed-in Codex account. It is sent only when a Codex backend is selected.',
+    valueNotes: [
+      'Model availability and subscription limits are controlled by the signed-in Codex account.',
+      'The value is passed as one argument and must not contain whitespace or shell metacharacters.',
+    ],
+    impact: ['Affects daily analysis, market review, regular text generation, and Codex Agent sessions without changing tool permissions.'],
+    examples: ['CODEX_MODEL=gpt-5'],
   },
   'settings.ai_model.GENERATION_BACKEND_TIMEOUT_SECONDS': {
     title: 'Generation Timeout (Seconds)',

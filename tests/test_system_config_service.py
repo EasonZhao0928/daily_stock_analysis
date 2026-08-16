@@ -1260,6 +1260,25 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertNotIn("llm_primary", status["required_missing_keys"])
         self.assertIn("llm_agent", status["required_missing_keys"])
 
+    def test_get_setup_status_uses_codex_app_server_agent_backend_without_litellm_model(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=codex_app_server",
+            "AGENT_BACKEND=codex_app_server",
+            "AGENT_ARCH=single",
+            "AGENT_ORCHESTRATOR_TIMEOUT_S=600",
+            "STOCK_LIST=600519",
+        )
+
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("src.services.system_config_service.shutil.which", return_value="/usr/bin/codex"):
+            status = self.service.get_setup_status()
+
+        checks = {check["key"]: check for check in status["checks"]}
+        self.assertEqual(checks["llm_primary"]["status"], "configured")
+        self.assertEqual(checks["llm_agent"]["status"], "configured")
+        self.assertNotIn("llm_agent", status["required_missing_keys"])
+        self.assertIn("只读 ToolSurface", checks["llm_agent"]["message"])
+
     def test_get_setup_status_allows_local_cli_primary_smoke_without_agent_model(self) -> None:
         self._rewrite_env(
             "GENERATION_BACKEND=claude_code_cli",

@@ -7,11 +7,20 @@ APP_DIR="${APP_DIR:-/opt/trading-projects/code/daily_stock_analysis}"
 SERVICE_NAME="${SERVICE_NAME:-daily-stock-analysis}"
 SERVICE_HOST="${SERVICE_HOST:-127.0.0.1}"
 SERVICE_PORT="${SERVICE_PORT:-8000}"
+SERVICE_MODE="${SERVICE_MODE:-web}"
 # The server's outbound route to pypi.org is bandwidth-constrained; use a
 # HTTPS mirror by default. Override PIP_INDEX when deploying elsewhere.
 PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 
 cd "$APP_DIR"
+
+case "$SERVICE_MODE" in
+  web|full) ;;
+  *)
+    echo "STOP: SERVICE_MODE must be web or full (got: $SERVICE_MODE)" >&2
+    exit 1
+    ;;
+esac
 
 if [[ "$(git branch --show-current)" != "personal" ]]; then
   echo "STOP: deployment must run from the personal branch" >&2
@@ -87,6 +96,7 @@ sed \
   -e "s|@APP_DIR@|$APP_DIR|g" \
   -e "s|@SERVICE_HOST@|$SERVICE_HOST|g" \
   -e "s|@SERVICE_PORT@|$SERVICE_PORT|g" \
+  -e "s|@SERVICE_MODE@|$SERVICE_MODE|g" \
   deploy/daily-stock-analysis.service.in > "$unit_file"
 
 sudo install -m 0644 "$unit_file" "/etc/systemd/system/${SERVICE_NAME}.service"

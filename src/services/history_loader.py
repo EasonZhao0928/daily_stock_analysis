@@ -11,7 +11,6 @@ from __future__ import annotations
 import contextvars
 import logging
 from datetime import date, datetime, timedelta
-from threading import Lock
 from typing import Any, List, Optional, Tuple
 
 import pandas as pd
@@ -40,21 +39,11 @@ def reset_frozen_target_date(token: contextvars.Token) -> None:
     _frozen_target_date.reset(token)
 
 
-# ---------------------------------------------------------------------------
-# Internal DataFetcherManager singleton (fallback only)
-# ---------------------------------------------------------------------------
-_fetcher_singleton = None
-_fetcher_lock = Lock()
-
-
 def _get_fetcher_manager():
-    global _fetcher_singleton
-    if _fetcher_singleton is None:
-        with _fetcher_lock:
-            if _fetcher_singleton is None:
-                from data_provider import DataFetcherManager
-                _fetcher_singleton = DataFetcherManager()
-    return _fetcher_singleton
+    """Return the shared Market Data runtime manager."""
+    from data_provider.runtime import get_market_data_manager
+
+    return get_market_data_manager()
 
 
 # ---------------------------------------------------------------------------

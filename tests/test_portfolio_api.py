@@ -24,6 +24,7 @@ except ModuleNotFoundError:
 import src.auth as auth
 from api.app import create_app
 from src.config import Config
+from src.services.portfolio_ledger_types import LedgerReceipt
 from src.services.portfolio_service import PortfolioBusyError
 from src.storage import DatabaseManager
 
@@ -847,8 +848,12 @@ class PortfolioApiTestCase(unittest.TestCase):
 
     def test_create_trade_busy_returns_409(self) -> None:
         with patch(
-            "api.v1.endpoints.portfolio.PortfolioService.record_trade",
-            side_effect=PortfolioBusyError("Portfolio ledger is busy; please retry shortly."),
+            "api.v1.endpoints.portfolio.PortfolioService.submit",
+            return_value=LedgerReceipt.rejected(
+                event_type="trade",
+                error_code="portfolio_busy",
+                message="Portfolio ledger is busy; please retry shortly.",
+            ),
         ):
             resp = self.client.post(
                 "/api/v1/portfolio/trades",
@@ -883,8 +888,12 @@ class PortfolioApiTestCase(unittest.TestCase):
 
     def test_create_cash_ledger_busy_returns_409(self) -> None:
         with patch(
-            "api.v1.endpoints.portfolio.PortfolioService.record_cash_ledger",
-            side_effect=PortfolioBusyError("Portfolio ledger is busy; please retry shortly."),
+            "api.v1.endpoints.portfolio.PortfolioService.submit",
+            return_value=LedgerReceipt.rejected(
+                event_type="cash_ledger",
+                error_code="portfolio_busy",
+                message="Portfolio ledger is busy; please retry shortly.",
+            ),
         ):
             resp = self.client.post(
                 "/api/v1/portfolio/cash-ledger",
@@ -914,8 +923,12 @@ class PortfolioApiTestCase(unittest.TestCase):
 
     def test_create_corporate_action_busy_returns_409(self) -> None:
         with patch(
-            "api.v1.endpoints.portfolio.PortfolioService.record_corporate_action",
-            side_effect=PortfolioBusyError("Portfolio ledger is busy; please retry shortly."),
+            "api.v1.endpoints.portfolio.PortfolioService.submit",
+            return_value=LedgerReceipt.rejected(
+                event_type="corporate_action",
+                error_code="portfolio_busy",
+                message="Portfolio ledger is busy; please retry shortly.",
+            ),
         ):
             resp = self.client.post(
                 "/api/v1/portfolio/corporate-actions",

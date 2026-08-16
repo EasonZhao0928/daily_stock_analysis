@@ -58,6 +58,50 @@ from src.agent.tools.registry import (  # noqa: E402
 
 GateAError = CodexAppServerError
 
+# The first Codex parity gate intentionally checks a small, stable research
+# core.  More experimental skills are added only after this contract remains
+# green; this keeps the real App Server probe bounded and auditable.
+CORE_CODEX_TOOL_NAMES = frozenset(
+    {
+        "get_realtime_quote",
+        "get_daily_history",
+        "search_stock_news",
+        "get_stock_info",
+        "get_capital_flow",
+        "analyze_trend",
+        "get_market_indices",
+        "get_portfolio_snapshot",
+        "get_analysis_context",
+        "get_strategy_backtest_summary",
+    }
+)
+
+
+def _core_codex_tool_coverage(surface: ToolSurface) -> dict:
+    """Validate the fixed read-only core before opening a real turn."""
+    descriptors = {
+        item["name"]: item
+        for item in surface.list_tools("public", cancellation_safe_only=True)
+    }
+    missing = sorted(CORE_CODEX_TOOL_NAMES - set(descriptors))
+    invalid_schema = sorted(
+        name
+        for name in CORE_CODEX_TOOL_NAMES
+        if name in descriptors
+        and (
+            descriptors[name].get("parameters", {}).get("type") != "object"
+            or not isinstance(descriptors[name].get("parameters", {}).get("required"), list)
+            or not isinstance(descriptors[name].get("parameters", {}).get("additionalProperties"), bool)
+        )
+    )
+    return {
+        "passed": not missing and not invalid_schema,
+        "required_tools": sorted(CORE_CODEX_TOOL_NAMES),
+        "available_tools": sorted(descriptors),
+        "missing_tools": missing,
+        "invalid_schema_tools": invalid_schema,
+    }
+
 
 def _probe_descriptor_handler(label: str) -> dict:
     raise RuntimeError(f"Gate A descriptor handler must run in a child process: {label}")
@@ -165,6 +209,16 @@ def run_gate_a(command: Sequence[str], *, timeout: float = 120.0) -> dict:
     tokens = {"alpha": f"ALPHA_{nonce}", "beta": f"BETA_{nonce}"}
     reserved_stock_code = f"DSAGATEA{secrets.token_hex(6).upper()}"
     surface = _build_probe_surface()
+    report: dict = {
+        "gate": "phase_6_gate_a",
+        "protocol": "codex_app_server_experimental_dynamic_tools",
+        "checks": {},
+        "feasible": False,
+    }
+    report["checks"]["core_tool_coverage"] = _core_codex_tool_coverage(ToolSurface(get_tool_registry()))
+    if not report["checks"]["core_tool_coverage"]["passed"]:
+        report["failed_checks"] = ["core_tool_coverage"]
+        return report
     context = ToolAccessContext(
         stock_scope=StockScope(
             expected_stock_code=reserved_stock_code,
@@ -176,12 +230,6 @@ def run_gate_a(command: Sequence[str], *, timeout: float = 120.0) -> dict:
         max_result_bytes=MAX_TOOL_RESULT_BYTES,
     )
 
-    report: dict = {
-        "gate": "phase_6_gate_a",
-        "protocol": "codex_app_server_experimental_dynamic_tools",
-        "checks": {},
-        "feasible": False,
-    }
     with CodexAppServerTransport(
         command,
         tool_surface=surface,

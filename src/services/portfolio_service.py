@@ -8,8 +8,8 @@ import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
 from src.config import get_config
@@ -19,6 +19,21 @@ from src.repositories.portfolio_repo import (
     PortfolioBusyError as RepoPortfolioBusyError,
     PortfolioRepository,
 )
+from src.services.portfolio_ledger_types import (
+    LEDGER_ERROR_ACCOUNT_INACTIVE,
+    LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+    LEDGER_ERROR_DUPLICATE_TRADE_UID,
+    LEDGER_ERROR_INVALID_COMMAND,
+    LEDGER_ERROR_OVERSELL,
+    LEDGER_ERROR_PORTFOLIO_BUSY,
+    LEDGER_ERROR_VALIDATION,
+    LEDGER_EVENT_CASH,
+    LEDGER_EVENT_CORPORATE_ACTION,
+    LEDGER_EVENT_TRADE,
+    LedgerCommand,
+    LedgerReceipt,
+)
+from src.storage import PortfolioLedgerOutbox
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +81,10 @@ def _merge_portfolio_limitations(*groups: Iterable[str]) -> List[str]:
 class PortfolioConflictError(Exception):
     """Raised when request conflicts with existing portfolio state."""
 
+    def __init__(self, message: str, *, code: str = "conflict") -> None:
+        self.code = code
+        super().__init__(message)
+
 
 class PortfolioOversellError(ValueError):
     """Raised when a sell would exceed the available position quantity."""
@@ -82,6 +101,7 @@ class PortfolioOversellError(ValueError):
         self.trade_date = trade_date
         self.requested_quantity = float(requested_quantity)
         self.available_quantity = max(0.0, float(available_quantity))
+        self.code = LEDGER_ERROR_OVERSELL
         date_hint = f" on {trade_date.isoformat()}" if trade_date is not None else ""
         super().__init__(
             "Oversell detected for "
@@ -123,6 +143,9 @@ class PortfolioService:
         market: str,
         base_currency: str,
         owner_id: Optional[str] = None,
+        account_kind: str = "manual",
+        controller_kind: str = "manual",
+        external_execution_enabled: bool = False,
     ) -> Dict[str, Any]:
         name_norm = (name or "").strip()
         if not name_norm:
@@ -135,6 +158,9 @@ class PortfolioService:
             market=market_norm,
             base_currency=base_currency_norm,
             owner_id=(owner_id or "").strip() or None,
+            account_kind=account_kind,
+            controller_kind=controller_kind,
+            external_execution_enabled=external_execution_enabled,
         )
         return self._account_to_dict(row)
 
@@ -183,6 +209,553 @@ class PortfolioService:
     # ------------------------------------------------------------------
     # Event writes
     # ------------------------------------------------------------------
+    def submit(self, command: LedgerCommand) -> LedgerReceipt:
+        """Submit one account fact through the single portfolio write seam.
+
+        The repository write session remains the transaction boundary for this
+        task.  Domain rejections are converted to receipts only after the
+        session has rolled back, so callers can inspect stable error codes
+        without creating a second write path.
+        """
+
+        if not isinstance(command, LedgerCommand):
+            return LedgerReceipt.rejected(
+                event_type="",
+                error_code=LEDGER_ERROR_INVALID_COMMAND,
+                message="command must be a LedgerCommand",
+            )
+
+        event_type = self._canonical_ledger_event_type(command.kind)
+        if event_type is None:
+            return LedgerReceipt.rejected(
+                event_type=command.kind,
+                error_code=LEDGER_ERROR_INVALID_COMMAND,
+                message=f"Unsupported ledger command kind: {command.kind}",
+            )
+
+        try:
+            with self.repo.ledger_cycle() as session:
+                account = self._require_active_account_in_session(
+                    session=session,
+                    account_id=command.account_id,
+                )
+                if event_type == LEDGER_EVENT_TRADE:
+                    event_id = self._submit_trade_command(
+                        session=session,
+                        account=account,
+                        account_id=command.account_id,
+                        payload=command.payload,
+                    )
+                elif event_type == LEDGER_EVENT_CASH:
+                    event_id = self._submit_cash_command(
+                        session=session,
+                        account=account,
+                        account_id=command.account_id,
+                        payload=command.payload,
+                    )
+                else:
+                    event_id = self._submit_corporate_action_command(
+                        session=session,
+                        account=account,
+                        account_id=command.account_id,
+                        payload=command.payload,
+                    )
+            return LedgerReceipt.accepted_event(event_type=event_type, event_id=event_id)
+        except RepoPortfolioBusyError as exc:
+            return LedgerReceipt.rejected(
+                event_type=event_type,
+                error_code=LEDGER_ERROR_PORTFOLIO_BUSY,
+                message=str(exc),
+            )
+        except DuplicateTradeUidError as exc:
+            return LedgerReceipt.rejected(
+                event_type=event_type,
+                error_code=LEDGER_ERROR_DUPLICATE_TRADE_UID,
+                message=str(exc),
+                idempotent=True,
+            )
+        except DuplicateTradeDedupHashError as exc:
+            return LedgerReceipt.rejected(
+                event_type=event_type,
+                error_code=LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+                message=str(exc),
+                idempotent=True,
+            )
+        except PortfolioOversellError as exc:
+            return LedgerReceipt.rejected(
+                event_type=event_type,
+                error_code=LEDGER_ERROR_OVERSELL,
+                message=str(exc),
+                details={
+                    "symbol": exc.symbol,
+                    "trade_date": exc.trade_date,
+                    "requested_quantity": exc.requested_quantity,
+                    "available_quantity": exc.available_quantity,
+                },
+            )
+        except PortfolioConflictError as exc:
+            return LedgerReceipt.rejected(
+                event_type=event_type,
+                error_code=getattr(exc, "code", "conflict"),
+                message=str(exc),
+                idempotent=getattr(exc, "code", "") in {
+                    LEDGER_ERROR_DUPLICATE_TRADE_UID,
+                    LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+                },
+            )
+        except ValueError as exc:
+            message = str(exc)
+            error_code = (
+                LEDGER_ERROR_ACCOUNT_INACTIVE
+                if message.startswith("Active account not found:")
+                else LEDGER_ERROR_VALIDATION
+            )
+            return LedgerReceipt.rejected(
+                event_type=event_type,
+                error_code=error_code,
+                message=message,
+            )
+
+    # ------------------------------------------------------------------
+    # Virtual-fill ledger outbox
+    # ------------------------------------------------------------------
+    def enqueue_virtual_fill(
+        self,
+        *,
+        account_id: int,
+        fill_id: str,
+        payload: Optional[Mapping[str, Any]] = None,
+        symbol: Optional[str] = None,
+        fill_date: Any = None,
+        trade_date: Any = None,
+        side: Optional[str] = None,
+        quantity: Any = None,
+        price: Any = None,
+        fee: Any = None,
+        tax: Any = None,
+        market: Optional[str] = None,
+        currency: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Store a fake fill until the Account Ledger accepts its trade.
+
+        This is intentionally only an outbox intake seam; it does not create
+        a trade or run matching. The immutable identity is always owned by
+        this service as ``paper:<fill_id>`` and is not accepted from payload.
+        ``payload`` is supported for the future Paper Account adapter while
+        explicit keyword fields keep fake-fill tests and callers readable.
+        """
+        if payload is not None and not isinstance(payload, Mapping):
+            raise ValueError("payload must be a mapping")
+        fill_id_norm = str(fill_id or "").strip()
+        if not fill_id_norm:
+            raise ValueError("fill_id is required")
+
+        account = self._require_active_account(account_id)
+        fill_payload: Dict[str, Any] = dict(payload or {})
+        overrides = {
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": price,
+            "fee": fee,
+            "tax": tax,
+            "market": market,
+            "currency": currency,
+            "note": note,
+        }
+        for key, value in overrides.items():
+            if value is not None:
+                fill_payload[key] = value
+        if fill_date is not None:
+            fill_payload["trade_date"] = fill_date
+        elif trade_date is not None:
+            fill_payload["trade_date"] = trade_date
+        # A caller cannot smuggle a second identity into the reserved paper
+        # namespace. The repository keeps the canonical UID separately.
+        fill_payload.pop("trade_uid", None)
+
+        normalized = self._normalize_virtual_fill_payload(fill_payload, account=account)
+        row = self.repo.enqueue_virtual_fill(
+            account_id=account_id,
+            fill_id=fill_id_norm,
+            payload=normalized,
+        )
+        return self._virtual_fill_row_to_dict(row)
+
+    def apply_virtual_fill(
+        self,
+        *,
+        outbox_id: Optional[int] = None,
+        account_id: Optional[int] = None,
+        fill_id: Optional[str] = None,
+    ) -> LedgerReceipt:
+        """Project one pending fill through ``submit`` and advance its state.
+
+        Ledger insertion and outbox advancement are separate transactions by
+        design. If the process dies after Ledger commit, retry sees the
+        duplicate paper UID, resolves the original trade id, and marks the
+        same outbox row applied without creating another trade.
+        """
+        row = self.repo.get_virtual_fill_outbox(
+            outbox_id=outbox_id,
+            account_id=account_id,
+            fill_id=fill_id,
+        )
+        if row is None:
+            raise ValueError("Virtual fill outbox row not found")
+        if row.status == "applied":
+            return LedgerReceipt(
+                accepted=True,
+                event_type=LEDGER_EVENT_TRADE,
+                event_id=row.ledger_event_id,
+                idempotent=True,
+            )
+
+        try:
+            payload = json.loads(row.payload)
+        except (TypeError, ValueError) as exc:
+            message = f"Invalid virtual fill payload: {exc}"
+            self.repo.record_virtual_fill_failure(outbox_id=row.id, error=message)
+            return LedgerReceipt.rejected(
+                event_type=LEDGER_EVENT_TRADE,
+                error_code=LEDGER_ERROR_VALIDATION,
+                message=message,
+            )
+
+        if not isinstance(payload, dict):
+            message = "Virtual fill payload must be an object"
+            self.repo.record_virtual_fill_failure(outbox_id=row.id, error=message)
+            return LedgerReceipt.rejected(
+                event_type=LEDGER_EVENT_TRADE,
+                error_code=LEDGER_ERROR_VALIDATION,
+                message=message,
+            )
+        payload["trade_uid"] = row.trade_uid
+        receipt = self.submit(
+            LedgerCommand(
+                account_id=int(row.account_id),
+                kind=LEDGER_EVENT_TRADE,
+                payload=payload,
+            )
+        )
+
+        if receipt.accepted:
+            # If this call fails after submit committed, the row stays pending
+            # and the next invocation follows the duplicate recovery branch.
+            self.repo.mark_virtual_fill_applied(
+                outbox_id=int(row.id),
+                ledger_event_id=receipt.event_id,
+            )
+            return receipt
+
+        if receipt.error_code in {
+            LEDGER_ERROR_DUPLICATE_TRADE_UID,
+            LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+        }:
+            existing_id = self.repo.get_trade_id_by_uid(
+                account_id=int(row.account_id),
+                trade_uid=row.trade_uid,
+            )
+            if existing_id is not None:
+                self.repo.mark_virtual_fill_applied(
+                    outbox_id=int(row.id),
+                    ledger_event_id=existing_id,
+                )
+                return LedgerReceipt(
+                    accepted=True,
+                    event_type=LEDGER_EVENT_TRADE,
+                    event_id=int(existing_id),
+                    idempotent=True,
+                )
+
+        self.repo.record_virtual_fill_failure(
+            outbox_id=int(row.id),
+            error=receipt.message or receipt.error_code or "virtual fill projection rejected",
+        )
+        return receipt
+
+    def retry_pending_virtual_fills(self, *, account_id: Optional[int] = None) -> List[LedgerReceipt]:
+        """Retry only durable pending rows, never manufacture a new fill."""
+        return [
+            self.apply_virtual_fill(outbox_id=int(row.id))
+            for row in self.repo.list_pending_virtual_fills(account_id=account_id)
+        ]
+
+    @classmethod
+    def _normalize_virtual_fill_payload(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        account: Any,
+    ) -> Dict[str, Any]:
+        """Validate and canonicalize fake-fill facts before durable enqueue."""
+        normalized: Dict[str, Any] = dict(payload)
+        symbol = cls._normalize_symbol_for_storage(str(normalized.get("symbol") or ""))
+        if not symbol:
+            raise ValueError("symbol is required")
+        side = str(normalized.get("side") or "").strip().lower()
+        if side not in VALID_SIDES:
+            raise ValueError("side must be buy or sell")
+        try:
+            quantity = float(normalized.get("quantity"))
+            price = float(normalized.get("price"))
+            fee = float(normalized.get("fee", 0.0) or 0.0)
+            tax = float(normalized.get("tax", 0.0) or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("quantity and price must be > 0") from exc
+        if quantity <= 0 or price <= 0:
+            raise ValueError("quantity and price must be > 0")
+        if fee < 0 or tax < 0:
+            raise ValueError("fee and tax must be >= 0")
+
+        trade_date_value = normalized.get("trade_date")
+        if isinstance(trade_date_value, datetime):
+            trade_date_value = trade_date_value.date()
+        trade_date = cls._coerce_ledger_date(trade_date_value, "trade_date")
+        market = cls._normalize_market(normalized.get("market") or account.market)
+        currency = cls._normalize_currency(
+            normalized.get("currency") or cls._default_currency_for_market(market)
+        )
+        normalized.update(
+            {
+                "symbol": symbol,
+                "trade_date": trade_date.isoformat(),
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "fee": fee,
+                "tax": tax,
+                "market": market,
+                "currency": currency,
+                "note": str(normalized.get("note") or "").strip() or None,
+            }
+        )
+        return normalized
+
+    @staticmethod
+    def _virtual_fill_row_to_dict(row: PortfolioLedgerOutbox) -> Dict[str, Any]:
+        return {
+            "id": int(row.id),
+            "account_id": int(row.account_id),
+            "fill_id": row.fill_id,
+            "trade_uid": row.trade_uid,
+            "payload": json.loads(row.payload),
+            "status": row.status,
+            "attempt_count": int(row.attempt_count or 0),
+            "last_error": row.last_error,
+            "ledger_event_id": row.ledger_event_id,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "applied_at": row.applied_at.isoformat() if row.applied_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+
+    def _submit_trade_command(
+        self,
+        *,
+        session: Any,
+        account: Any,
+        account_id: int,
+        payload: Dict[str, Any],
+    ) -> int:
+        side_norm = str(payload.get("side") or "").strip().lower()
+        if side_norm not in VALID_SIDES:
+            raise ValueError("side must be buy or sell")
+
+        try:
+            quantity = float(payload.get("quantity"))
+            price = float(payload.get("price"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("quantity and price must be > 0") from exc
+        if quantity <= 0 or price <= 0:
+            raise ValueError("quantity and price must be > 0")
+
+        try:
+            fee = float(payload.get("fee", 0.0) or 0.0)
+            tax = float(payload.get("tax", 0.0) or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("fee and tax must be >= 0") from exc
+        if fee < 0 or tax < 0:
+            raise ValueError("fee and tax must be >= 0")
+
+        symbol = str(payload.get("symbol") or "")
+        symbol_norm = self._normalize_symbol_for_storage(symbol)
+        if not symbol_norm:
+            raise ValueError("symbol is required")
+
+        trade_date = self._coerce_ledger_date(payload.get("trade_date"), "trade_date")
+        trade_uid_norm = str(payload.get("trade_uid") or "").strip() or None
+        dedup_hash_norm = str(payload.get("dedup_hash") or "").strip() or None
+        market_norm = self._normalize_market(payload.get("market") or account.market)
+        currency_norm = self._normalize_currency(
+            payload.get("currency") or self._default_currency_for_market(market_norm)
+        )
+
+        self._validate_trade_identity(
+            account_id=account_id,
+            trade_uid=trade_uid_norm,
+            dedup_hash=dedup_hash_norm,
+            session=session,
+        )
+        if side_norm == "sell":
+            self._validate_sell_quantity(
+                account_id=account_id,
+                symbol=symbol,
+                market=market_norm,
+                currency=currency_norm,
+                trade_date=trade_date,
+                quantity=quantity,
+                session=session,
+            )
+
+        row = self.repo.add_trade_in_session(
+            session=session,
+            account_id=account_id,
+            trade_uid=trade_uid_norm,
+            symbol=symbol_norm,
+            market=market_norm,
+            currency=currency_norm,
+            trade_date=trade_date,
+            side=side_norm,
+            quantity=quantity,
+            price=price,
+            fee=fee,
+            tax=tax,
+            note=str(payload.get("note") or "").strip() or None,
+            dedup_hash=dedup_hash_norm,
+        )
+        return int(row.id)
+
+    def _submit_cash_command(
+        self,
+        *,
+        session: Any,
+        account: Any,
+        account_id: int,
+        payload: Dict[str, Any],
+    ) -> int:
+        direction_norm = str(payload.get("direction") or "").strip().lower()
+        if direction_norm not in VALID_CASH_DIRECTIONS:
+            raise ValueError("direction must be in or out")
+        try:
+            amount = float(payload.get("amount"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("amount must be > 0") from exc
+        if amount <= 0:
+            raise ValueError("amount must be > 0")
+
+        event_date = self._coerce_ledger_date(payload.get("event_date"), "event_date")
+        currency_norm = self._normalize_currency(payload.get("currency") or account.base_currency)
+        row = self.repo.add_cash_ledger_in_session(
+            session=session,
+            account_id=account_id,
+            event_date=event_date,
+            direction=direction_norm,
+            amount=amount,
+            currency=currency_norm,
+            note=str(payload.get("note") or "").strip() or None,
+        )
+        return int(row.id)
+
+    def _submit_corporate_action_command(
+        self,
+        *,
+        session: Any,
+        account: Any,
+        account_id: int,
+        payload: Dict[str, Any],
+    ) -> int:
+        action_type_norm = str(payload.get("action_type") or "").strip().lower()
+        if action_type_norm not in VALID_CORPORATE_ACTIONS:
+            raise ValueError("action_type must be cash_dividend or split_adjustment")
+
+        cash_dividend_per_share = payload.get("cash_dividend_per_share")
+        split_ratio = payload.get("split_ratio")
+        if action_type_norm == "cash_dividend":
+            try:
+                cash_dividend_per_share = float(cash_dividend_per_share)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("cash_dividend_per_share must be >= 0 for cash_dividend") from exc
+            if cash_dividend_per_share < 0:
+                raise ValueError("cash_dividend_per_share must be >= 0 for cash_dividend")
+        if action_type_norm == "split_adjustment":
+            try:
+                split_ratio = float(split_ratio)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("split_ratio must be > 0 for split_adjustment") from exc
+            if split_ratio <= 0:
+                raise ValueError("split_ratio must be > 0 for split_adjustment")
+
+        symbol_norm = self._normalize_symbol_for_storage(str(payload.get("symbol") or ""))
+        if not symbol_norm:
+            raise ValueError("symbol is required")
+        effective_date = self._coerce_ledger_date(payload.get("effective_date"), "effective_date")
+        market_norm = self._normalize_market(payload.get("market") or account.market)
+        currency_norm = self._normalize_currency(
+            payload.get("currency") or self._default_currency_for_market(market_norm)
+        )
+        row = self.repo.add_corporate_action_in_session(
+            session=session,
+            account_id=account_id,
+            symbol=symbol_norm,
+            market=market_norm,
+            currency=currency_norm,
+            effective_date=effective_date,
+            action_type=action_type_norm,
+            cash_dividend_per_share=cash_dividend_per_share,
+            split_ratio=split_ratio,
+            note=str(payload.get("note") or "").strip() or None,
+        )
+        return int(row.id)
+
+    @staticmethod
+    def _canonical_ledger_event_type(kind: str) -> Optional[str]:
+        normalized = (kind or "").strip().lower()
+        if normalized == LEDGER_EVENT_TRADE:
+            return LEDGER_EVENT_TRADE
+        if normalized in {"cash", LEDGER_EVENT_CASH}:
+            return LEDGER_EVENT_CASH
+        if normalized == LEDGER_EVENT_CORPORATE_ACTION:
+            return LEDGER_EVENT_CORPORATE_ACTION
+        return None
+
+    @staticmethod
+    def _coerce_ledger_date(value: Any, field_name: str) -> date:
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(value)
+            except ValueError:
+                pass
+        raise ValueError(f"{field_name} is required")
+
+    def _receipt_to_event_dict(self, receipt: LedgerReceipt) -> Dict[str, Any]:
+        if receipt.accepted and receipt.event_id is not None:
+            return {"id": int(receipt.event_id)}
+        self._raise_for_ledger_receipt(receipt)
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _raise_for_ledger_receipt(receipt: LedgerReceipt) -> None:
+        message = receipt.message or receipt.error_code or "Ledger command rejected"
+        if receipt.error_code == LEDGER_ERROR_OVERSELL:
+            details = receipt.details
+            raise PortfolioOversellError(
+                symbol=str(details.get("symbol") or ""),
+                trade_date=details.get("trade_date"),
+                requested_quantity=float(details.get("requested_quantity", 0.0)),
+                available_quantity=float(details.get("available_quantity", 0.0)),
+            )
+        if receipt.error_code in {
+            LEDGER_ERROR_DUPLICATE_TRADE_UID,
+            LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+        }:
+            raise PortfolioConflictError(message, code=receipt.error_code)
+        if receipt.error_code == LEDGER_ERROR_PORTFOLIO_BUSY:
+            raise PortfolioBusyError(message)
+        raise ValueError(message)
+
     def record_trade(
         self,
         *,
@@ -200,58 +773,28 @@ class PortfolioService:
         dedup_hash: Optional[str] = None,
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
-        side_norm = (side or "").strip().lower()
-        if side_norm not in VALID_SIDES:
-            raise ValueError("side must be buy or sell")
-        if quantity <= 0 or price <= 0:
-            raise ValueError("quantity and price must be > 0")
-        if fee < 0 or tax < 0:
-            raise ValueError("fee and tax must be >= 0")
-        symbol_norm = self._normalize_symbol_for_storage(symbol)
-        if not symbol_norm:
-            raise ValueError("symbol is required")
-        trade_uid_norm = (trade_uid or "").strip() or None
-        dedup_hash_norm = (dedup_hash or "").strip() or None
-        try:
-            with self.repo.portfolio_write_session() as session:
-                account = self._require_active_account_in_session(session=session, account_id=account_id)
-                market_norm = self._normalize_market(market or account.market)
-                currency_norm = self._normalize_currency(currency or self._default_currency_for_market(market_norm))
-                self._validate_trade_identity(
+        return self._receipt_to_event_dict(
+            self.submit(
+                LedgerCommand(
                     account_id=account_id,
-                    trade_uid=trade_uid_norm,
-                    dedup_hash=dedup_hash_norm,
-                    session=session,
-                    )
-                if side_norm == "sell":
-                    self._validate_sell_quantity(
-                        account_id=account_id,
-                        symbol=symbol,
-                        market=market_norm,
-                        currency=currency_norm,
-                        trade_date=trade_date,
-                        quantity=float(quantity),
-                        session=session,
-                    )
-                row = self.repo.add_trade_in_session(
-                    session=session,
-                    account_id=account_id,
-                    trade_uid=trade_uid_norm,
-                    symbol=symbol_norm,
-                    market=market_norm,
-                    currency=currency_norm,
-                    trade_date=trade_date,
-                    side=side_norm,
-                    quantity=float(quantity),
-                    price=float(price),
-                    fee=float(fee),
-                    tax=float(tax),
-                    note=(note or "").strip() or None,
-                    dedup_hash=dedup_hash_norm,
+                    kind=LEDGER_EVENT_TRADE,
+                    payload={
+                        "symbol": symbol,
+                        "trade_date": trade_date,
+                        "side": side,
+                        "quantity": quantity,
+                        "price": price,
+                        "fee": fee,
+                        "tax": tax,
+                        "market": market,
+                        "currency": currency,
+                        "trade_uid": trade_uid,
+                        "dedup_hash": dedup_hash,
+                        "note": note,
+                    },
                 )
-                return {"id": int(row.id)}
-        except (DuplicateTradeUidError, DuplicateTradeDedupHashError) as exc:
-            raise PortfolioConflictError(str(exc)) from exc
+            )
+        )
 
     def record_cash_ledger(
         self,
@@ -263,24 +806,21 @@ class PortfolioService:
         currency: Optional[str] = None,
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
-        direction_norm = (direction or "").strip().lower()
-        if direction_norm not in VALID_CASH_DIRECTIONS:
-            raise ValueError("direction must be in or out")
-        if amount <= 0:
-            raise ValueError("amount must be > 0")
-        with self.repo.portfolio_write_session() as session:
-            account = self._require_active_account_in_session(session=session, account_id=account_id)
-            currency_norm = self._normalize_currency(currency or account.base_currency)
-            row = self.repo.add_cash_ledger_in_session(
-                session=session,
-                account_id=account_id,
-                event_date=event_date,
-                direction=direction_norm,
-                amount=float(amount),
-                currency=currency_norm,
-                note=(note or "").strip() or None,
+        return self._receipt_to_event_dict(
+            self.submit(
+                LedgerCommand(
+                    account_id=account_id,
+                    kind=LEDGER_EVENT_CASH,
+                    payload={
+                        "event_date": event_date,
+                        "direction": direction,
+                        "amount": amount,
+                        "currency": currency,
+                        "note": note,
+                    },
+                )
             )
-            return {"id": int(row.id)}
+        )
 
     def record_corporate_action(
         self,
@@ -295,47 +835,35 @@ class PortfolioService:
         split_ratio: Optional[float] = None,
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
-        action_type_norm = (action_type or "").strip().lower()
-        if action_type_norm not in VALID_CORPORATE_ACTIONS:
-            raise ValueError("action_type must be cash_dividend or split_adjustment")
-
-        if action_type_norm == "cash_dividend":
-            if cash_dividend_per_share is None or cash_dividend_per_share < 0:
-                raise ValueError("cash_dividend_per_share must be >= 0 for cash_dividend")
-        if action_type_norm == "split_adjustment":
-            if split_ratio is None or split_ratio <= 0:
-                raise ValueError("split_ratio must be > 0 for split_adjustment")
-        with self.repo.portfolio_write_session() as session:
-            account = self._require_active_account_in_session(session=session, account_id=account_id)
-            market_norm = self._normalize_market(market or account.market)
-            currency_norm = self._normalize_currency(currency or self._default_currency_for_market(market_norm))
-            symbol_norm = self._normalize_symbol_for_storage(symbol)
-            if not symbol_norm:
-                raise ValueError("symbol is required")
-            row = self.repo.add_corporate_action_in_session(
-                session=session,
-                account_id=account_id,
-                symbol=symbol_norm,
-                market=market_norm,
-                currency=currency_norm,
-                effective_date=effective_date,
-                action_type=action_type_norm,
-                cash_dividend_per_share=cash_dividend_per_share,
-                split_ratio=split_ratio,
-                note=(note or "").strip() or None,
+        return self._receipt_to_event_dict(
+            self.submit(
+                LedgerCommand(
+                    account_id=account_id,
+                    kind=LEDGER_EVENT_CORPORATE_ACTION,
+                    payload={
+                        "symbol": symbol,
+                        "effective_date": effective_date,
+                        "action_type": action_type,
+                        "market": market,
+                        "currency": currency,
+                        "cash_dividend_per_share": cash_dividend_per_share,
+                        "split_ratio": split_ratio,
+                        "note": note,
+                    },
+                )
             )
-            return {"id": int(row.id)}
+        )
 
     def delete_trade_event(self, trade_id: int) -> bool:
-        with self.repo.portfolio_write_session() as session:
+        with self.repo.ledger_cycle() as session:
             return self.repo.delete_trade_in_session(session=session, trade_id=trade_id)
 
     def delete_cash_ledger_event(self, entry_id: int) -> bool:
-        with self.repo.portfolio_write_session() as session:
+        with self.repo.ledger_cycle() as session:
             return self.repo.delete_cash_ledger_in_session(session=session, entry_id=entry_id)
 
     def delete_corporate_action_event(self, action_id: int) -> bool:
-        with self.repo.portfolio_write_session() as session:
+        with self.repo.ledger_cycle() as session:
             return self.repo.delete_corporate_action_in_session(session=session, action_id=action_id)
 
     def list_trade_events(
@@ -486,6 +1014,7 @@ class PortfolioService:
             account_rows = self.repo.list_accounts(include_inactive=False)
 
         accounts_payload: List[Dict[str, Any]] = []
+        processed_account_count = 0
         aggregate_currency = "CNY"
         aggregate = {
             "total_cash": 0.0,
@@ -500,31 +1029,81 @@ class PortfolioService:
         }
 
         for account in account_rows:
-            account_snapshot = self._replay_account(
-                account=account,
-                as_of_date=as_of_date,
-                cost_method=method,
-                include_realtime=include_realtime,
-            )
+            account_id_value = int(account.id)
+            realtime_prices: Optional[Dict[str, Tuple[Optional[float], Optional[str]]]] = None
+            if include_realtime and as_of_date == date.today():
+                # First replay is read-only and deliberately excludes live
+                # prices.  It provides the active symbol set while the ledger
+                # lock is held for only the DB read.
+                with self.repo.ledger_cycle() as session:
+                    current_account = self.repo.get_account_in_session(
+                        session=session,
+                        account_id=account_id_value,
+                        include_inactive=False,
+                    )
+                    if current_account is None:
+                        continue
+                    account = current_account
+                    stable_snapshot = self._replay_account(
+                        account=account,
+                        as_of_date=as_of_date,
+                        cost_method=method,
+                        include_realtime=False,
+                        session=session,
+                    )
+                active_symbols = [
+                    str(position.get("symbol"))
+                    for position in stable_snapshot.get("positions_cache", [])
+                    if position.get("symbol") and float(position.get("quantity") or 0.0) > EPS
+                ]
+                # Network/provider work happens after the read transaction has
+                # closed.  The second replay consumes this frozen quote map and
+                # never performs a live call while replacing projections.
+                realtime_prices = self._prefetch_realtime_position_prices(active_symbols)
 
-            self.repo.replace_positions_lots_and_snapshot(
-                account_id=account.id,
-                snapshot_date=as_of_date,
-                cost_method=method,
-                base_currency=account.base_currency,
-                total_cash=account_snapshot["total_cash"],
-                total_market_value=account_snapshot["total_market_value"],
-                total_equity=account_snapshot["total_equity"],
-                unrealized_pnl=account_snapshot["unrealized_pnl"],
-                realized_pnl=account_snapshot["realized_pnl"],
-                fee_total=account_snapshot["fee_total"],
-                tax_total=account_snapshot["tax_total"],
-                fx_stale=account_snapshot["fx_stale"],
-                payload=json.dumps(account_snapshot["payload"], ensure_ascii=False),
-                positions=account_snapshot["positions_cache"],
-                lots=account_snapshot["lots_cache"],
-                valuation_currency=account.base_currency,
-            )
+            # Re-read source events in a short transaction immediately before
+            # replacing projections.  This is the only transaction that writes
+            # derived state; no provider/network call is reachable from it.
+            with self.repo.ledger_cycle() as session:
+                current_account = self.repo.get_account_in_session(
+                    session=session,
+                    account_id=account_id_value,
+                    include_inactive=False,
+                )
+                if current_account is None:
+                    continue
+                account = current_account
+                account_base_currency = account.base_currency
+                account_snapshot = self._replay_account(
+                    account=account,
+                    as_of_date=as_of_date,
+                    cost_method=method,
+                    include_realtime=include_realtime,
+                    realtime_prices=realtime_prices,
+                    session=session,
+                )
+
+                self.repo.replace_positions_lots_and_snapshot_in_session(
+                    session=session,
+                    account_id=account_id_value,
+                    snapshot_date=as_of_date,
+                    cost_method=method,
+                    base_currency=account_base_currency,
+                    total_cash=account_snapshot["total_cash"],
+                    total_market_value=account_snapshot["total_market_value"],
+                    total_equity=account_snapshot["total_equity"],
+                    unrealized_pnl=account_snapshot["unrealized_pnl"],
+                    realized_pnl=account_snapshot["realized_pnl"],
+                    fee_total=account_snapshot["fee_total"],
+                    tax_total=account_snapshot["tax_total"],
+                    fx_stale=account_snapshot["fx_stale"],
+                    payload=json.dumps(account_snapshot["payload"], ensure_ascii=False),
+                    positions=account_snapshot["positions_cache"],
+                    lots=account_snapshot["lots_cache"],
+                    valuation_currency=account_base_currency,
+                )
+
+            processed_account_count += 1
 
             accounts_payload.append(account_snapshot["public"])
             aggregate["limitations"] = _merge_portfolio_limitations(
@@ -534,43 +1113,43 @@ class PortfolioService:
 
             cash_cny, stale_cash, _ = self._convert_amount(
                 amount=account_snapshot["total_cash"],
-                from_currency=account.base_currency,
+                from_currency=account_base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
             mv_cny, stale_mv, _ = self._convert_amount(
                 amount=account_snapshot["total_market_value"],
-                from_currency=account.base_currency,
+                from_currency=account_base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
             eq_cny, stale_eq, _ = self._convert_amount(
                 amount=account_snapshot["total_equity"],
-                from_currency=account.base_currency,
+                from_currency=account_base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
             realized_cny, stale_realized, _ = self._convert_amount(
                 amount=account_snapshot["realized_pnl"],
-                from_currency=account.base_currency,
+                from_currency=account_base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
             unrealized_cny, stale_unrealized, _ = self._convert_amount(
                 amount=account_snapshot["unrealized_pnl"],
-                from_currency=account.base_currency,
+                from_currency=account_base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
             fee_cny, stale_fee, _ = self._convert_amount(
                 amount=account_snapshot["fee_total"],
-                from_currency=account.base_currency,
+                from_currency=account_base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
             tax_cny, stale_tax, _ = self._convert_amount(
                 amount=account_snapshot["tax_total"],
-                from_currency=account.base_currency,
+                from_currency=account_base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
             )
@@ -598,7 +1177,7 @@ class PortfolioService:
             "as_of": as_of_date.isoformat(),
             "cost_method": method,
             "currency": aggregate_currency,
-            "account_count": len(account_rows),
+            "account_count": processed_account_count,
             "total_cash": round(aggregate["total_cash"], 6),
             "total_market_value": round(aggregate["total_market_value"], 6),
             "total_equity": round(aggregate["total_equity"], 6),
@@ -661,9 +1240,15 @@ class PortfolioService:
         session: Optional[Any] = None,
     ) -> None:
         if trade_uid and self._has_trade_uid(account_id=account_id, trade_uid=trade_uid, session=session):
-            raise PortfolioConflictError(f"Duplicate trade_uid for account_id={account_id}: {trade_uid}")
+            raise PortfolioConflictError(
+                f"Duplicate trade_uid for account_id={account_id}: {trade_uid}",
+                code=LEDGER_ERROR_DUPLICATE_TRADE_UID,
+            )
         if dedup_hash and self._has_trade_dedup_hash(account_id=account_id, dedup_hash=dedup_hash, session=session):
-            raise PortfolioConflictError(f"Duplicate dedup_hash for account_id={account_id}: {dedup_hash}")
+            raise PortfolioConflictError(
+                f"Duplicate dedup_hash for account_id={account_id}: {dedup_hash}",
+                code=LEDGER_ERROR_DUPLICATE_DEDUP_HASH,
+            )
 
     def _validate_sell_quantity(
         self,
@@ -781,10 +1366,29 @@ class PortfolioService:
         as_of_date: date,
         cost_method: str,
         include_realtime: bool,
+        realtime_prices: Optional[Dict[str, Tuple[Optional[float], Optional[str]]]] = None,
+        session: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        trades = self.repo.list_trades(account.id, as_of=as_of_date)
-        cash_ledger = self.repo.list_cash_ledger(account.id, as_of=as_of_date)
-        corporate_actions = self.repo.list_corporate_actions(account.id, as_of=as_of_date)
+        if session is None:
+            trades = self.repo.list_trades(account.id, as_of=as_of_date)
+            cash_ledger = self.repo.list_cash_ledger(account.id, as_of=as_of_date)
+            corporate_actions = self.repo.list_corporate_actions(account.id, as_of=as_of_date)
+        else:
+            trades = self.repo.list_trades_in_session(
+                session=session,
+                account_id=account.id,
+                as_of=as_of_date,
+            )
+            cash_ledger = self.repo.list_cash_ledger_in_session(
+                session=session,
+                account_id=account.id,
+                as_of=as_of_date,
+            )
+            corporate_actions = self.repo.list_corporate_actions_in_session(
+                session=session,
+                account_id=account.id,
+                as_of=as_of_date,
+            )
 
         events = []
         for row in cash_ledger:
@@ -941,6 +1545,7 @@ class PortfolioService:
             fifo_lots=fifo_lots,
             avg_state=avg_state,
             include_realtime=include_realtime,
+            realtime_prices=realtime_prices,
         )
         fx_stale = fx_stale or stale_pos
 
@@ -1013,6 +1618,7 @@ class PortfolioService:
         fifo_lots: Dict[Tuple[str, str, str], List[Dict[str, Any]]],
         avg_state: Dict[Tuple[str, str, str], _AvgState],
         include_realtime: bool = True,
+        realtime_prices: Optional[Dict[str, Tuple[Optional[float], Optional[str]]]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, float, bool]:
         position_rows: List[Dict[str, Any]] = []
         lot_rows: List[Dict[str, Any]] = []
@@ -1040,11 +1646,8 @@ class PortfolioService:
                     qty = float(avg_state[key].quantity)
                 if qty > EPS:
                     active_symbols.append(symbol)
-        realtime_prices = (
-            self._prefetch_realtime_position_prices(active_symbols)
-            if active_symbols
-            else None
-        )
+        if realtime_prices is None and active_symbols:
+            realtime_prices = self._prefetch_realtime_position_prices(active_symbols)
 
         for key in sorted(keys):
             symbol, market, currency = key
@@ -1197,9 +1800,9 @@ class PortfolioService:
         # markets, cache miss, or bulk source returning fewer rows than requested).
         if len(unique_symbols) >= 5:
             try:
-                from data_provider.base import DataFetcherManager
+                from data_provider.runtime import get_market_data_manager
 
-                DataFetcherManager().prefetch_realtime_quotes(unique_symbols)
+                get_market_data_manager().prefetch_realtime_quotes(unique_symbols)
             except Exception as exc:
                 logger.warning("Failed to prefetch realtime portfolio quotes: %s", exc)
 
@@ -1227,10 +1830,20 @@ class PortfolioService:
     @staticmethod
     def _fetch_realtime_position_price(symbol: str) -> Tuple[Optional[float], Optional[str]]:
         try:
-            from data_provider.base import DataFetcherManager
+            from data_provider.runtime import get_market_data_manager
 
-            fetcher_manager = DataFetcherManager()
-            quote = fetcher_manager.get_realtime_quote(symbol, log_final_failure=False)
+            fetcher_manager = get_market_data_manager()
+            try:
+                quote = fetcher_manager.get_realtime_quote(
+                    symbol,
+                    log_final_failure=False,
+                    concurrent=True,
+                )
+            except TypeError:
+                # Keep compatibility with narrow manager doubles used by
+                # integrations while production managers use the shared
+                # runtime gate with symbol-level fan-out.
+                quote = fetcher_manager.get_realtime_quote(symbol, log_final_failure=False)
         except Exception as exc:
             logger.warning("Failed to fetch realtime portfolio price for %s: %s", symbol, exc)
             return None, None
@@ -1657,6 +2270,9 @@ class PortfolioService:
             "market": row.market,
             "base_currency": row.base_currency,
             "is_active": bool(row.is_active),
+            "account_kind": getattr(row, "account_kind", "manual") or "manual",
+            "controller_kind": getattr(row, "controller_kind", "manual") or "manual",
+            "external_execution_enabled": bool(getattr(row, "external_execution_enabled", False)),
             "created_at": row.created_at.isoformat() if row.created_at else None,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }

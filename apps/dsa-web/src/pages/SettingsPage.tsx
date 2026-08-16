@@ -13,9 +13,11 @@ import {
   AuthSettingsCard,
   ChangePasswordCard,
   GenerationBackendStatusPanel,
+  UnifiedCodexPreset,
   IntelligentImport,
   LLMChannelEditor,
   NotificationTestPanel,
+  WeChatChannelStatusPanel,
   SettingsCategoryNav,
   SettingsAlert,
   SettingsField,
@@ -103,6 +105,7 @@ const GENERATION_BACKEND_STATUS_KEYS = new Set([
   'GENERATION_BACKEND_MAX_CONCURRENCY',
   'LOCAL_CLI_BACKEND_MAX_CONCURRENCY',
   'OPENCODE_CLI_MODEL',
+  'CODEX_MODEL',
   'LITELLM_CONFIG',
   'LITELLM_MODEL',
   'LITELLM_FALLBACK_MODELS',
@@ -1045,6 +1048,8 @@ const SettingsPage: React.FC = () => {
 
   const rawActiveItems = itemsByCategory[activeCategory] || [];
   const rawActiveItemMap = new Map(rawActiveItems.map((item) => [item.key, String(item.value ?? '')]));
+  const allConfigItems = Object.values(itemsByCategory).flat();
+  const allConfigItemMap = new Map(allConfigItems.map((item) => [item.key, String(item.value ?? '')]));
   const firstSetupStockCode = parseSetupStockList(getConfigItem(itemsByCategory.base || [], 'STOCK_LIST')?.value)[0] || '';
   const screeningItem = (itemsByCategory.base || []).find((item) => item.key === 'SCREENING_ENABLED');
   const screeningEnabled = String(screeningItem?.value ?? '').trim().toLowerCase() === 'true';
@@ -1401,8 +1406,18 @@ const SettingsPage: React.FC = () => {
     : t('settings.diagnosticHintWeb');
   const activeCategoryTitle = getCategoryTitle(activeCategory as SystemConfigCategory, t('settings.activePanelTitle'), uiLanguage);
   const activeCategoryDescription = getCategoryDescription(activeCategory as SystemConfigCategory, '', uiLanguage);
-  const selectedAgentBackend = (rawActiveItemMap.get('AGENT_BACKEND') || 'auto').trim().toLowerCase();
-  const selectedAgentArch = (rawActiveItemMap.get('AGENT_ARCH') || 'single').trim().toLowerCase();
+  const selectedGenerationBackend = (allConfigItemMap.get('GENERATION_BACKEND') || 'litellm').trim().toLowerCase();
+  const selectedAgentBackend = (allConfigItemMap.get('AGENT_BACKEND') || 'auto').trim().toLowerCase();
+  const selectedAgentArch = (allConfigItemMap.get('AGENT_ARCH') || 'single').trim().toLowerCase();
+  const unifiedCodexDraftActive = selectedGenerationBackend === 'codex_app_server'
+    && selectedAgentBackend === 'codex_app_server';
+  const applyUnifiedCodexPreset = useCallback(() => {
+    setDraftValue('GENERATION_BACKEND', 'codex_app_server');
+    setDraftValue('GENERATION_FALLBACK_BACKEND', '');
+    setDraftValue('AGENT_BACKEND', 'codex_app_server');
+    setDraftValue('AGENT_ARCH', 'single');
+    setDraftValue('AGENT_MODE', 'true');
+  }, [setDraftValue]);
   const hasCodexArchitectureConflict = selectedAgentBackend === 'codex_app_server' && selectedAgentArch !== 'single';
   const codexArchitectureIssue: ConfigValidationIssue = {
     key: 'AGENT_ARCH',
@@ -1799,6 +1814,11 @@ const SettingsPage: React.FC = () => {
                 title={t('settings.llmAccess')}
                 description={t('settings.llmAccessDescription')}
               >
+                <UnifiedCodexPreset
+                  active={unifiedCodexDraftActive}
+                  disabled={isSaving || isLoading}
+                  onApply={applyUnifiedCodexPreset}
+                />
                 <GenerationBackendStatusPanel
                   items={generationBackendDraftItems}
                   maskToken={maskToken}
@@ -1833,6 +1853,7 @@ const SettingsPage: React.FC = () => {
                   maskToken={maskToken}
                   disabled={isSaving || isLoading}
                 />
+                <WeChatChannelStatusPanel disabled={isSaving || isLoading} />
               </SettingsPanelErrorBoundary>
             ) : null}
             {activeCategory === 'agent' ? (

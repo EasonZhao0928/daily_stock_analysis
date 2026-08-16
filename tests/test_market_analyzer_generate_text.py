@@ -22,6 +22,8 @@ for _mod in ("litellm", "google.generativeai", "google.genai", "anthropic"):
 
 import pytest
 
+from tests.generation_route_support import RecordingGenerationBackend
+
 
 @pytest.fixture(autouse=True)
 def _llm_usage_hmac_env(monkeypatch):
@@ -191,6 +193,34 @@ class TestAnalyzerGenerateText:
                 "写一份复盘",
                 generation_config={"max_tokens": 1024, "temperature": 0.5},
             )
+
+    def test_generate_text_uses_codex_generation_backend_without_litellm(self):
+        analyzer = self._make_analyzer()
+        analyzer._litellm_available = False
+        analyzer._router = None
+        analyzer._config_override = SimpleNamespace(
+            generation_backend="codex_app_server",
+            generation_fallback_backend="",
+            generation_backend_timeout_seconds=30,
+            generation_backend_max_output_bytes=1024,
+            generation_backend_max_concurrency=1,
+            litellm_model="",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+            llm_blocks_legacy_fallback=False,
+            llm_channel_config_issues=[],
+        )
+        backend = RecordingGenerationBackend(
+            backend_id="codex_app_server",
+            response_text="Codex market review",
+        )
+
+        with patch.object(analyzer, "_get_generation_backend", return_value=backend), \
+             patch.object(analyzer, "_call_litellm_impl", side_effect=AssertionError("LiteLLM bypass")):
+            result = analyzer.generate_text("写一份 Codex 复盘")
+
+        assert result == "Codex market review"
+        assert len(backend.calls) == 1
 
     def test_generate_text_does_not_persist_unavailable_usage(self):
         analyzer = self._make_analyzer()
@@ -1019,7 +1049,7 @@ class TestAnalyzerGenerateText:
             return response
 
         with patch("src.analyzer.open_hermes_no_proxy_client", side_effect=fake_no_proxy_client), \
-             patch("src.analyzer.litellm.completion", side_effect=fake_completion):
+             patch("src.llm.litellm_transport.completion", side_effect=fake_completion):
             text, model, _usage = analyzer._call_litellm(
                 "prompt",
                 {"max_tokens": 128, "temperature": 0.0},
@@ -1065,7 +1095,7 @@ class TestAnalyzerGenerateText:
 
         caplog.set_level("WARNING", logger="src.analyzer")
         with patch("src.analyzer.open_hermes_no_proxy_client", side_effect=fake_no_proxy_client), \
-             patch("src.analyzer.litellm.completion", side_effect=RuntimeError("upstream saw saved-secret-token")):
+             patch("src.llm.litellm_transport.completion", side_effect=RuntimeError("upstream saw saved-secret-token")):
             with pytest.raises(_AllModelsFailedError) as exc_info:
                 analyzer._call_litellm("prompt", {"max_tokens": 4})
 
@@ -1326,7 +1356,7 @@ class TestAnalyzerGenerateText:
         assert error.details["field"] == "LITELLM_MODEL"
         assert analyzer.is_available() is False
 
-        with patch("src.analyzer.litellm.completion") as completion:
+        with patch("src.llm.litellm_transport.completion") as completion:
             with pytest.raises(GenerationError):
                 analyzer._call_litellm("prompt", {"max_tokens": 4})
         completion.assert_not_called()
@@ -1362,7 +1392,7 @@ class TestAnalyzerGenerateText:
         assert error.details["field"] == "LITELLM_FALLBACK_MODELS"
         assert analyzer.is_available() is False
 
-        with patch("src.analyzer.litellm.completion") as completion:
+        with patch("src.llm.litellm_transport.completion") as completion:
             with pytest.raises(GenerationError):
                 analyzer._call_litellm("prompt", {"max_tokens": 4})
         completion.assert_not_called()
@@ -1396,7 +1426,7 @@ class TestAnalyzerGenerateText:
         assert error.details["code"] == "explicit_hermes_route_invalid"
         assert error.details["field"] == "LITELLM_MODEL"
 
-        with patch("src.analyzer.litellm.completion") as completion:
+        with patch("src.llm.litellm_transport.completion") as completion:
             with pytest.raises(GenerationError):
                 analyzer._call_litellm("prompt", {"max_tokens": 4})
         completion.assert_not_called()
@@ -1423,7 +1453,7 @@ class TestAnalyzerGenerateText:
         )
 
         with patch("src.analyzer.canonicalize_hermes_model_ref", side_effect=ValueError("bad model")), \
-             patch("src.analyzer.litellm.completion") as completion:
+             patch("src.llm.litellm_transport.completion") as completion:
             error = analyzer.get_generation_backend_config_error()
 
         assert error is not None

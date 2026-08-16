@@ -186,10 +186,21 @@ class LLMRun:
     provider: Optional[str] = None
     model: Optional[str] = None
     call_type: str = "analysis"
+    business_entry: Optional[str] = None
+    primary_backend: Optional[str] = None
+    effective_backend: Optional[str] = None
+    attempt: Optional[int] = None
     success: bool = True
+    status: Optional[str] = None
     tokens: Optional[int] = None
+    usage_available: Optional[bool] = None
+    cost_status: Optional[str] = None
     duration_ms: Optional[int] = None
     fallback_model: Optional[str] = None
+    fallback_from: Optional[str] = None
+    fallback_to: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    error_code: Optional[str] = None
     error_type: Optional[str] = None
     error_message_sanitized: Optional[str] = None
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -200,10 +211,21 @@ class LLMRun:
             "provider": self.provider,
             "model": self.model,
             "call_type": self.call_type,
+            "business_entry": self.business_entry,
+            "primary_backend": self.primary_backend,
+            "effective_backend": self.effective_backend,
+            "attempt": self.attempt,
             "success": self.success,
+            "status": self.status,
             "tokens": self.tokens,
+            "usage_available": self.usage_available,
+            "cost_status": self.cost_status,
             "duration_ms": self.duration_ms,
             "fallback_model": self.fallback_model,
+            "fallback_from": self.fallback_from,
+            "fallback_to": self.fallback_to,
+            "fallback_reason": self.fallback_reason,
+            "error_code": self.error_code,
             "error_type": self.error_type,
             "error_message_sanitized": self.error_message_sanitized,
             "created_at": self.created_at,
@@ -403,6 +425,18 @@ class RunDiagnosticContext:
             else:
                 attempt_index = self.llm_attempt_index_by_type.get(call_type_key, 0) + 1
                 self.llm_attempt_index_by_type[call_type_key] = attempt_index
+        if llm_run.attempt is None:
+            llm_run.attempt = attempt_index
+        if llm_run.business_entry is None:
+            llm_run.business_entry = llm_run.call_type
+        if llm_run.effective_backend is None:
+            llm_run.effective_backend = llm_run.provider
+        if llm_run.status is None:
+            llm_run.status = "success" if llm_run.success else "failed"
+        if llm_run.usage_available is None and llm_run.tokens is not None:
+            llm_run.usage_available = True
+        if llm_run.cost_status is None and llm_run.effective_backend == "codex_app_server":
+            llm_run.cost_status = "unknown"
         self._emit_flow_event(_llm_flow_event(self, llm_run, attempt_index))
 
     def _remove_llm_pending_call_type_index(self, call_type_key: str, attempt_index: int) -> None:
@@ -431,6 +465,10 @@ class RunDiagnosticContext:
         call_type: str = "analysis",
         provider: Optional[str] = None,
         model: Optional[str] = None,
+        business_entry: Optional[str] = None,
+        primary_backend: Optional[str] = None,
+        effective_backend: Optional[str] = None,
+        attempt: Optional[int] = None,
     ) -> None:
         call_type_key = _safe_event_key(call_type) or "analysis"
         attempt_index = self.llm_attempt_index_by_type.get(call_type_key, 0) + 1
@@ -448,6 +486,10 @@ class RunDiagnosticContext:
                 call_type=call_type,
                 provider=provider,
                 model=model,
+                business_entry=business_entry,
+                primary_backend=primary_backend,
+                effective_backend=effective_backend,
+                attempt=attempt or attempt_index,
                 index=attempt_index,
             )
         )
@@ -701,6 +743,10 @@ def _llm_started_flow_event(
     call_type: str,
     provider: Optional[str],
     model: Optional[str],
+    business_entry: Optional[str],
+    primary_backend: Optional[str],
+    effective_backend: Optional[str],
+    attempt: int,
     index: int,
 ) -> Dict[str, Any]:
     call_type_key = _safe_event_key(call_type) or "analysis"
@@ -721,6 +767,10 @@ def _llm_started_flow_event(
                 "provider": provider,
                 "model": model,
                 "call_type": call_type,
+                "business_entry": business_entry or call_type,
+                "primary_backend": primary_backend,
+                "effective_backend": effective_backend or provider,
+                "attempt": attempt,
                 "node": {
                     "id": node_id,
                     "lane": "analysis",
@@ -729,7 +779,7 @@ def _llm_started_flow_event(
                     "status": "running",
                     "provider": display_model,
                     "started_at": timestamp,
-                    "attempts": 1,
+                    "attempts": attempt,
                     "message": message,
                 },
             }
@@ -744,7 +794,15 @@ def _llm_flow_event(
 ) -> Dict[str, Any]:
     call_type = _safe_event_key(run.call_type) or "analysis"
     model = run.model or run.provider or "unknown"
-    status = _flow_status_for_success(run.success, fallback=bool(run.fallback_model or index > 1))
+    status = _flow_status_for_success(
+        run.success,
+        fallback=bool(
+            run.fallback_model
+            or run.fallback_from
+            or run.status in {"fallback", "fallback_success"}
+            or index > 1
+        ),
+    )
     node_id = f"llm_{call_type}_{index}"
     started_at = _started_at_from_end_and_duration(run.created_at, run.duration_ms)
     message = (
@@ -765,8 +823,19 @@ def _llm_flow_event(
                 "provider": run.provider,
                 "model": run.model,
                 "call_type": run.call_type,
+                "business_entry": run.business_entry or run.call_type,
+                "primary_backend": run.primary_backend,
+                "effective_backend": run.effective_backend or run.provider,
+                "attempt": run.attempt or index,
+                "status": run.status or ("success" if run.success else "failed"),
                 "duration_ms": run.duration_ms,
                 "fallback_model": run.fallback_model,
+                "fallback_from": run.fallback_from,
+                "fallback_to": run.fallback_to,
+                "fallback_reason": run.fallback_reason,
+                "error_code": run.error_code,
+                "usage_available": run.usage_available,
+                "cost_status": run.cost_status,
                 "error_type": run.error_type,
                 "node": {
                     "id": node_id,
@@ -934,9 +1003,20 @@ def record_llm_run(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     call_type: str = "analysis",
+    business_entry: Optional[str] = None,
+    primary_backend: Optional[str] = None,
+    effective_backend: Optional[str] = None,
+    attempt: Optional[int] = None,
     tokens: Optional[int] = None,
+    usage_available: Optional[bool] = None,
+    cost_status: Optional[str] = None,
+    status: Optional[str] = None,
     duration_ms: Optional[int] = None,
     fallback_model: Optional[str] = None,
+    fallback_from: Optional[str] = None,
+    fallback_to: Optional[str] = None,
+    fallback_reason: Optional[str] = None,
+    error_code: Optional[str] = None,
     error_type: Optional[str] = None,
     error_message: Optional[Any] = None,
 ) -> None:
@@ -952,10 +1032,21 @@ def record_llm_run(
                 provider=provider,
                 model=model,
                 call_type=call_type,
+                business_entry=business_entry or call_type,
+                primary_backend=primary_backend,
+                effective_backend=effective_backend,
+                attempt=attempt,
                 success=success,
+                status=status or ("success" if success else "failed"),
                 tokens=tokens,
+                usage_available=usage_available,
+                cost_status=cost_status,
                 duration_ms=duration_ms,
                 fallback_model=fallback_model,
+                fallback_from=fallback_from,
+                fallback_to=fallback_to,
+                fallback_reason=fallback_reason,
+                error_code=error_code,
                 error_type=error_type,
                 error_message_sanitized=sanitize_diagnostic_text(error_message),
             )
@@ -969,6 +1060,10 @@ def record_llm_run_started(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     call_type: str = "analysis",
+    business_entry: Optional[str] = None,
+    primary_backend: Optional[str] = None,
+    effective_backend: Optional[str] = None,
+    attempt: Optional[int] = None,
 ) -> None:
     """Emit a live LLM-start event without changing persisted diagnostics."""
     context = get_current_diagnostic_context()
@@ -980,6 +1075,10 @@ def record_llm_run_started(
             provider=provider,
             model=model,
             call_type=call_type,
+            business_entry=business_entry or call_type,
+            primary_backend=primary_backend,
+            effective_backend=effective_backend,
+            attempt=attempt,
         )
     except Exception as exc:  # pragma: no cover - defensive fail-open guard
         logger.warning("llm started diagnostic record failed: %s", exc)
@@ -1300,9 +1399,18 @@ def _llm_component(diagnostics: Dict[str, Any], raw_result: Dict[str, Any]) -> R
                 message,
                 {
                     "model": model,
+                    "primary_backend": success_run.get("primary_backend"),
+                    "effective_backend": success_run.get("effective_backend") or success_run.get("provider"),
+                    "business_entry": success_run.get("business_entry") or success_run.get("call_type"),
+                    "attempt": success_run.get("attempt"),
                     "tokens": success_run.get("tokens"),
+                    "usage_available": success_run.get("usage_available"),
+                    "cost_status": success_run.get("cost_status"),
                     "duration_ms": success_run.get("duration_ms"),
                     "fallback_model": success_run.get("fallback_model"),
+                    "fallback_from": success_run.get("fallback_from"),
+                    "fallback_to": success_run.get("fallback_to"),
+                    "fallback_reason": success_run.get("fallback_reason"),
                 },
             )
         return _component(
@@ -1310,7 +1418,13 @@ def _llm_component(diagnostics: Dict[str, Any], raw_result: Dict[str, Any]) -> R
             label,
             "failed",
             f"LLM 失败：{last_run.get('error_message_sanitized') or last_run.get('error_type') or '未知错误'}",
-            {"model": last_run.get("model"), "error_type": last_run.get("error_type")},
+            {
+                "model": last_run.get("model"),
+                "primary_backend": last_run.get("primary_backend"),
+                "effective_backend": last_run.get("effective_backend") or last_run.get("provider"),
+                "error_code": last_run.get("error_code"),
+                "error_type": last_run.get("error_type"),
+            },
         )
 
     if raw_result:

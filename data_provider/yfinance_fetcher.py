@@ -160,9 +160,10 @@ class YfinanceFetcher(BaseFetcher):
         # 去除可能的 .SH 后缀
         code = code.replace('.SH', '')
 
-        # ETF: Shanghai ETF (51xx, 52xx, 56xx, 58xx) -> .SS; Shenzhen ETF (15xx, 16xx, 18xx) -> .SZ
+        # ETF: Shanghai funds (50xx, 51xx, 52xx, 56xx, 58xx) -> .SS;
+        # Shenzhen ETF (15xx, 16xx, 18xx) -> .SZ
         if len(code) == 6:
-            if code.startswith(('51', '52', '56', '58')):
+            if code.startswith(('50', '51', '52', '56', '58')):
                 return f"{code}.SS"
             if code.startswith(('15', '16', '18')):
                 return f"{code}.SZ"

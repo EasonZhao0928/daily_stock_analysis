@@ -15,7 +15,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,75 @@ class Skill:
     execution_context: str = "inline"
     subagent_type: str = ""
     preferred_model: str = ""
+    # Research Capability metadata.  These fields are optional for legacy
+    # strategy YAML and SKILL.md bundles; old files receive safe defaults.
+    version: str = "1.0.0"
+    required_capabilities: List[str] = field(default_factory=list)
+    risk_level: str = "low"
+    evidence_policy: str = "optional"
+    section_index: List[Dict[str, Any]] = field(default_factory=list)
+    summary: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.summary:
+            self.summary = self.description[:280]
+        if not self.section_index:
+            self.section_index = _build_section_index(self.instructions)
+
+    def load_instructions(
+        self,
+        *,
+        sections: Optional[Sequence[str]] = None,
+        max_chars: Optional[int] = None,
+    ) -> str:
+        """Load selected body sections on demand and apply a character budget.
+
+        Legacy callers already receive ``instructions`` at construction time;
+        this method still provides the bounded selection seam for Research
+        Capability callers and custom bundles whose entrypoint is on disk.
+        """
+
+        text = self.instructions or ""
+        if sections:
+            wanted = {str(item).strip().lower() for item in sections if str(item).strip()}
+            chunks: List[str] = []
+            current_title = ""
+            current_lines: List[str] = []
+            for line in text.splitlines():
+                heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+                if heading:
+                    if current_lines and (not wanted or current_title.lower() in wanted):
+                        chunks.extend(current_lines)
+                    current_title = heading.group(2).strip()
+                    current_lines = [line]
+                else:
+                    current_lines.append(line)
+            if current_lines and (not wanted or current_title.lower() in wanted):
+                chunks.extend(current_lines)
+            text = "\n".join(chunks).strip()
+        if max_chars is not None and max_chars >= 0:
+            text = text[: int(max_chars)]
+        return text
+
+    def metadata(self) -> Dict[str, Any]:
+        """Return summary/capability metadata without full instructions."""
+
+        return {
+            "name": self.name,
+            "display_name": self.display_name,
+            "description": self.description,
+            "summary": self.summary or self.description,
+            "version": self.version,
+            "category": self.category,
+            "required_tools": list(self.required_tools),
+            "required_capabilities": list(self.required_capabilities),
+            "risk_level": self.risk_level,
+            "evidence_policy": self.evidence_policy,
+            "section_index": [dict(item) for item in self.section_index],
+            "aliases": list(self.aliases),
+            "source": self.source,
+            "entrypoint": self.entrypoint,
+        }
 
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?(.*)$", re.DOTALL)
@@ -115,6 +184,66 @@ def _coerce_int(value: object, default: int = 100) -> int:
         return default
 
 
+_SKILL_RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
+_SKILL_EVIDENCE_POLICIES = frozenset({"optional", "required", "fact_only", "artifact_only"})
+
+
+def _coerce_section_index(value: object) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [{"title": item.strip(), "level": 2} for item in value.split(",") if item.strip()]
+    if not isinstance(value, list):
+        raise ValueError("section_index must be a list or comma-separated string")
+    result: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            title = item.strip()
+            if title:
+                result.append({"title": title, "level": 2})
+            continue
+        if not isinstance(item, Mapping) or not str(item.get("title") or "").strip():
+            raise ValueError("section_index entries must contain a title")
+        result.append({"title": str(item["title"]).strip(), "level": _coerce_int(item.get("level"), 2)})
+    return result
+
+
+def _build_section_index(instructions: str) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for line in (instructions or "").splitlines():
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            result.append({"title": match.group(2).strip(), "level": len(match.group(1))})
+    return result
+
+
+def _research_metadata(metadata: Mapping[str, Any], instructions: str) -> Dict[str, Any]:
+    """Normalize Research Capability fields while preserving legacy defaults."""
+
+    version = str(metadata.get("version", "1.0.0")).strip() or "1.0.0"
+    risk_level = str(metadata.get("risk-level", metadata.get("risk_level", "low"))).strip().lower() or "low"
+    if risk_level not in _SKILL_RISK_LEVELS:
+        raise ValueError(f"invalid skill risk_level: {risk_level}")
+    evidence_policy = str(
+        metadata.get("evidence-policy", metadata.get("evidence_policy", "optional"))
+    ).strip().lower() or "optional"
+    if evidence_policy not in _SKILL_EVIDENCE_POLICIES:
+        raise ValueError(f"invalid skill evidence_policy: {evidence_policy}")
+    required_capabilities = _coerce_string_list(
+        metadata.get("required-capabilities", metadata.get("required_capabilities"))
+    )
+    section_index = _coerce_section_index(
+        metadata.get("section-index", metadata.get("section_index"))
+    ) or _build_section_index(instructions)
+    summary = str(metadata.get("summary") or metadata.get("short-description") or "").strip()
+    return {
+        "version": version,
+        "required_capabilities": required_capabilities,
+        "risk_level": risk_level,
+        "evidence_policy": evidence_policy,
+        "section_index": section_index,
+        "summary": summary,
+    }
 def _parse_skill_frontmatter(raw_text: str) -> tuple[Dict[str, object], str]:
     import yaml
 
@@ -173,6 +302,7 @@ def load_skill_from_yaml(filepath: Union[str, Path]) -> Skill:
             f"Skill file {filepath.name} missing required fields: {missing}"
         )
 
+    research_metadata = _research_metadata(data, str(data["instructions"]).strip())
     return Skill(
         name=str(data["name"]).strip(),
         display_name=str(data["display_name"]).strip(),
@@ -199,6 +329,7 @@ def load_skill_from_yaml(filepath: Union[str, Path]) -> Skill:
         execution_context=str(data.get("context", "inline")).strip() or "inline",
         subagent_type=str(data.get("agent", "")).strip(),
         preferred_model=str(data.get("model", "")).strip(),
+        **research_metadata,
     )
 
 
@@ -233,6 +364,7 @@ def load_skill_from_markdown(filepath: Union[str, Path]) -> Skill:
     if not required_tools:
         required_tools = _coerce_string_list(metadata.get("required_tools"))
 
+    research_metadata = _research_metadata(metadata, instructions)
     return Skill(
         name=skill_name,
         display_name=display_name,
@@ -268,6 +400,7 @@ def load_skill_from_markdown(filepath: Union[str, Path]) -> Skill:
         execution_context=str(metadata.get("context", "inline")).strip() or "inline",
         subagent_type=str(metadata.get("agent", "")).strip(),
         preferred_model=str(metadata.get("model", "")).strip(),
+        **research_metadata,
     )
 
 
@@ -411,6 +544,78 @@ class SkillManager:
         """List only active (enabled) skills."""
         return [s for s in self._skills.values() if s.enabled]
 
+    def get_skill_catalog(self, *, include_instructions: bool = False) -> List[Dict[str, Any]]:
+        """Return a summary-first catalog for discovery endpoints/UI.
+
+        Full skill bodies are only included when explicitly requested.  This
+        keeps the default catalog small even when a workspace contains long
+        SKILL.md bundles.
+        """
+
+        catalog = []
+        for skill in self._skills.values():
+            item = skill.metadata()
+            if include_instructions:
+                item["instructions"] = skill.load_instructions()
+            catalog.append(item)
+        return catalog
+
+    def load_skill_content(
+        self,
+        name: str,
+        *,
+        sections: Optional[Sequence[str]] = None,
+        max_chars: Optional[int] = None,
+    ) -> str:
+        skill = self.get(name)
+        if skill is None:
+            raise KeyError(f"Unknown skill: {name}")
+        return skill.load_instructions(sections=sections, max_chars=max_chars)
+
+    def validate_required_tools(self, name: str, tool_surface: Any, profile: Any = "research_readonly") -> Dict[str, Any]:
+        """Validate skill requirements against the canonical ToolSurface."""
+
+        skill = self.get(name)
+        if skill is None:
+            return {"available": False, "skill": name, "reason": "skill_not_found", "missing_tools": [], "missing_capabilities": []}
+        try:
+            descriptors = tool_surface.describe(profile)
+        except Exception as exc:
+            return {
+                "available": False,
+                "skill": name,
+                "reason": "profile_unavailable",
+                "error": type(exc).__name__,
+                "missing_tools": list(skill.required_tools),
+                "missing_capabilities": list(skill.required_capabilities),
+            }
+        available_tools = {str(item.get("name")) for item in descriptors if isinstance(item, Mapping)}
+        available_permissions = {
+            str(permission)
+            for item in descriptors
+            if isinstance(item, Mapping)
+            for permission in (item.get("policy", {}) or {}).get("permissions", [])
+        }
+        missing_tools = [tool for tool in skill.required_tools if tool not in available_tools]
+        missing_capabilities = [
+            capability
+            for capability in skill.required_capabilities
+            if not any(capability == permission or permission.startswith(f"{capability}:") for permission in available_permissions)
+        ]
+        reason = "available"
+        if missing_tools:
+            reason = "missing_tool"
+        elif missing_capabilities:
+            reason = "missing_capability"
+        return {
+            "available": not missing_tools and not missing_capabilities,
+            "skill": name,
+            "profile": str(profile),
+            "reason": reason,
+            "missing_tools": missing_tools,
+            "missing_capabilities": missing_capabilities,
+        }
+
     def activate(self, skill_names: List[str]) -> None:
         """Activate specific skills by name. Deactivate all others.
 
@@ -467,7 +672,7 @@ class SkillManager:
                 parts.append(
                     f"### 技能 {idx}: {skill.display_name} {rules_ref}{support_ref}\n\n"
                     f"**适用场景**: {skill.description}\n\n"
-                    f"{skill.instructions}\n"
+                    f"{skill.load_instructions()}\n"
                 )
                 idx += 1
 

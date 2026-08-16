@@ -24,6 +24,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence
 
+from src.agent.codex_account import (
+    ACCOUNT_NOTIFICATION_METHODS,
+    CodexAccountClient,
+    CodexAccountNotification,
+    CodexAccountProtocolError,
+    CodexAccountStatus,
+    CodexLoginCancellation,
+    CodexLoginStart,
+    CodexLogoutResult,
+    CodexRateLimits,
+)
 from src.agent.codex_tool_process import MAX_TOOL_RESULT_BYTES, CodexToolProcessRunner
 from src.agent.tool_surface import ToolSurface
 from src.agent.tools.execution import ToolAccessContext, redact_diagnostic_value
@@ -61,6 +72,7 @@ _RELEVANT_NOTIFICATIONS = {
     "item/completed",
     "thread/tokenUsage/updated",
     "turn/completed",
+    *ACCOUNT_NOTIFICATION_METHODS,
 }
 _ALLOWED_ENV_NAMES = {
     "CODEX_HOME",
@@ -149,9 +161,17 @@ def controlled_environment(source: Optional[Dict[str, str]] = None) -> Dict[str,
     return {name: environment[name] for name in _ALLOWED_ENV_NAMES if environment.get(name)}
 
 
-def dynamic_tool_specs(surface: ToolSurface, names: Iterable[str]) -> list[dict]:
-    """Convert ToolSurface MCP descriptors into App Server dynamic tools."""
-    descriptors = {item["name"]: item for item in surface.list_tools("mcp_descriptor")}
+def dynamic_tool_specs(
+    surface: ToolSurface,
+    names: Iterable[str],
+    *,
+    profile: Optional[Any] = None,
+) -> list[dict]:
+    """Convert profile-visible ToolSurface descriptors into App Server tools."""
+    descriptors = {
+        item["name"]: item
+        for item in surface.list_tools("mcp_descriptor", profile=profile)
+    }
     specs = []
     for name in names:
         descriptor = descriptors.get(name)
@@ -183,6 +203,8 @@ class CodexAppServerTransport:
         deadline: Optional[float] = None,
         cancel_event: Optional[threading.Event] = None,
         tool_runner: Optional[CodexToolProcessRunner] = None,
+        tool_profile: Optional[Any] = None,
+        execution_profile: Optional[Any] = None,
         max_tool_calls: int = 10,
     ) -> None:
         if not command:
@@ -204,7 +226,16 @@ class CodexAppServerTransport:
         self._stdout_thread: Optional[threading.Thread] = None
         self._stderr_thread: Optional[threading.Thread] = None
         self._tool_pool = ThreadPoolExecutor(max_workers=TOOL_WORKERS, thread_name_prefix="codex-agent-tool")
-        self._tool_runner = tool_runner or CodexToolProcessRunner()
+        # ``tool_profile`` is the Codex *sandbox* permission profile negotiated
+        # with App Server; ``execution_profile`` is the DSA ExecutionProfile that
+        # authorizes tools inside the worker.  They are separate namespaces and
+        # must never be substituted for one another.
+        self.tool_profile = tool_profile if tool_profile is not None else PERMISSION_PROFILE
+        self.execution_profile = execution_profile
+        self._tool_runner = tool_runner or CodexToolProcessRunner(
+            tool_surface=tool_surface,
+            execution_profile=execution_profile,
+        )
         self._process_lock = threading.Lock()
         self._writer_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -224,6 +255,8 @@ class CodexAppServerTransport:
         self._stdout_frame_count = 0
         self._completed_item_count = 0
         self._tool_call_count = 0
+        self._account_notifications: list[CodexAccountNotification] = []
+        self._account_client = CodexAccountClient(self.request)
         self._closed = False
 
     def __enter__(self) -> "CodexAppServerTransport":
@@ -242,6 +275,32 @@ class CodexAppServerTransport:
     def stderr_preview(self) -> str:
         with self._state_lock:
             return redact_diagnostic_value("".join(self._stderr_parts), limit=2000)
+
+    @property
+    def account(self) -> CodexAccountClient:
+        """Return the token-free account RPC facade for this App Server process."""
+        return self._account_client
+
+    @property
+    def account_notifications(self) -> tuple[CodexAccountNotification, ...]:
+        """Return account notifications in the order received from App Server."""
+        with self._state_lock:
+            return tuple(self._account_notifications)
+
+    def read_account(self, *, refresh_token: bool = False) -> CodexAccountStatus:
+        return self.account.read(refresh_token=refresh_token)
+
+    def start_account_login(self, mode: str = "browser") -> CodexLoginStart:
+        return self.account.start_login(mode)
+
+    def cancel_account_login(self, login_id: str) -> CodexLoginCancellation:
+        return self.account.cancel_login(login_id)
+
+    def logout_account(self) -> CodexLogoutResult:
+        return self.account.logout()
+
+    def read_account_rate_limits(self) -> CodexRateLimits:
+        return self.account.read_rate_limits()
 
     def start(self) -> None:
         if self.process is not None:
@@ -411,22 +470,31 @@ class CodexAppServerTransport:
         tool_names: Sequence[str],
         base_instructions: str,
         developer_instructions: str,
+        model: Optional[str] = None,
     ) -> str:
         if self.safe_cwd is None:
             raise RuntimeError("transport not started")
+        thread_params = {
+            "approvalPolicy": "never",
+            "baseInstructions": base_instructions,
+            "cwd": str(self.safe_cwd),
+            "developerInstructions": developer_instructions,
+            "dynamicTools": dynamic_tool_specs(
+                self.tool_surface,
+                tool_names,
+                profile=self.execution_profile,
+            ),
+            "environments": [],
+            "ephemeral": True,
+            "permissions": PERMISSION_PROFILE,
+            "runtimeWorkspaceRoots": [str(self.safe_cwd)],
+        }
+        normalized_model = str(model or "").strip()
+        if normalized_model:
+            thread_params["model"] = normalized_model
         result = self.request(
             "thread/start",
-            {
-                "approvalPolicy": "never",
-                "baseInstructions": base_instructions,
-                "cwd": str(self.safe_cwd),
-                "developerInstructions": developer_instructions,
-                "dynamicTools": dynamic_tool_specs(self.tool_surface, tool_names),
-                "environments": [],
-                "ephemeral": True,
-                "permissions": PERMISSION_PROFILE,
-                "runtimeWorkspaceRoots": [str(self.safe_cwd)],
-            },
+            thread_params,
         )
         thread = result.get("thread") or {}
         thread_id = thread.get("id")
@@ -528,7 +596,22 @@ class CodexAppServerTransport:
                 code = "cancelled"
             else:
                 normalized_info = str(info or "").strip().casefold()
-                code = "login_required" if normalized_info == "unauthorized" else "unknown_backend_error"
+                normalized_message = str(error.get("message") or "").strip().casefold()
+                if normalized_info in {"unauthorized", "authentication_required"}:
+                    code = "login_required"
+                elif any(
+                    marker in f"{normalized_info} {normalized_message}"
+                    for marker in (
+                        "rate_limit",
+                        "ratelimit",
+                        "quota_exceeded",
+                        "usage_limit",
+                        "too_many_requests",
+                    )
+                ):
+                    code = "rate_limit_exceeded"
+                else:
+                    code = "unknown_backend_error"
             message = redact_diagnostic_value(
                 error.get("message", f"Turn ended with status {status}"),
                 limit=500,
@@ -774,6 +857,24 @@ class CodexAppServerTransport:
                 return
             with self._notification_condition:
                 params = message.get("params") or {}
+                if method in ACCOUNT_NOTIFICATION_METHODS:
+                    try:
+                        notification = self._account_client.parse_notification(method, params)
+                    except CodexAccountProtocolError as exc:
+                        self._fatal_error = CodexAppServerError(
+                            "protocol_error",
+                            redact_diagnostic_value(str(exc), limit=500),
+                        )
+                        self._notification_condition.notify_all()
+                        return
+                    if notification is not None:
+                        # Keep a bounded history.  Account events are useful
+                        # for UI state transitions, but must not become an
+                        # unbounded process-memory sink.
+                        self._account_notifications.append(notification)
+                        del self._account_notifications[:-128]
+                    self._notification_condition.notify_all()
+                    return
                 thread_id = params.get("threadId")
                 turn_id = params.get("turnId")
                 if method == "item/completed" and isinstance(thread_id, str) and isinstance(turn_id, str):

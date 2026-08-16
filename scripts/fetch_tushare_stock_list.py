@@ -7,7 +7,7 @@ Tushare 股票列表获取脚本
 
 使用方法：
     python3 scripts/fetch_tushare_stock_list.py
-    python3 scripts/fetch_tushare_stock_list.py --a-rk
+    python3 scripts/fetch_tushare_stock_list.py --a-rk --etf
 
 环境要求：
     - 需要在 .env 中配置 TUSHARE_TOKEN
@@ -20,6 +20,7 @@ Tushare 股票列表获取脚本
     - data/stock_list_a.csv      A股列表（--a-rk 时会覆盖为修正后名称）
     - data/stock_list_hk.csv     港股列表
     - data/stock_list_us.csv     美股列表
+    - data/fund_list_etf.csv   可选 ETF 列表（--etf）
     - data/README_stock_list.md  数据说明文档
 """
 
@@ -135,6 +136,28 @@ def fetch_a_stock_list(api: ts.pro_api) -> Optional[pd.DataFrame]:
     except Exception as e:
         print(f"[错误] 获取 A股列表失败: {e}")
         return None
+
+
+def fetch_etf_list(api: ts.pro_api) -> Optional[pd.DataFrame]:
+    """Fetch listed exchange-traded funds for the autocomplete index.
+
+    Tushare keeps funds behind ``fund_basic`` rather than ``stock_basic``;
+    this is opt-in because fund permissions/quotas vary by account.
+    """
+    print("\n[ETF] 正在获取交易型开放式基金列表...")
+    try:
+        df = api.fund_basic(
+            market='E',
+            status='L',
+            fields='ts_code,symbol,name,market,exchange,list_status,list_date,delist_date',
+        )
+        if df is not None and len(df) > 0:
+            print(f"✓ ETF 列表获取成功，共 {len(df)} 只")
+            return df
+        print("[警告] ETF 数据为空")
+    except Exception as exc:
+        print(f"[警告] ETF 列表获取失败（不影响股票列表）：{exc}")
+    return None
 
 
 def should_fix_a_stock_name(name: str) -> bool:
@@ -593,6 +616,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="使用 rt_k 修正 A 股中带 XD/XR/DR/N/C 前缀的名称，并覆盖输出到 stock_list_a.csv",
     )
+    parser.add_argument(
+        "--etf",
+        action="store_true",
+        help="额外调用 fund_basic(market='E') 保存 data/fund_list_etf.csv，补全 ETF 搜索索引",
+    )
     return parser
 
 
@@ -624,6 +652,13 @@ def main(argv: Optional[List[str]] = None):
 
         save_to_csv(a_df, a_filename, a_market_name)
 
+    etf_df = None
+    if args.etf:
+        random_sleep()
+        etf_df = fetch_etf_list(api)
+        if etf_df is not None:
+            save_to_csv(etf_df, 'fund_list_etf.csv', 'ETF')
+
     # 3. 获取港股数据
     random_sleep()  # 休息后再获取港股
     hk_df = fetch_hk_stock_list(api)
@@ -651,6 +686,8 @@ def main(argv: Optional[List[str]] = None):
     if a_df is not None:
         total_count += len(a_df)
         print(f"  ✓ A股：{len(a_df)} 只")
+    if etf_df is not None:
+        print(f"  ✓ ETF：{len(etf_df)} 只（单独索引输入）")
     if hk_df is not None:
         total_count += len(hk_df)
         print(f"  ✓ 港股：{len(hk_df)} 只")

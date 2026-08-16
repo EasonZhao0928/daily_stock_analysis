@@ -92,27 +92,24 @@ class TestCommandDispatcherAsync(unittest.IsolatedAsyncioTestCase):
         command.execute_async.assert_awaited_once()
 
     async def test_parse_intent_via_llm_offloads_to_thread(self):
-        fake_response = SimpleNamespace(
-            content='{"intent":"analysis","codes":["600519"],"strategy":null}',
-            provider="gemini",
-            usage={"total_tokens": 12},
+        fake_response = '{"intent":"analysis","codes":["600519"],"strategy":null}'
+        config = SimpleNamespace(
+            generation_backend="codex_app_server",
+            generation_fallback_backend="",
+            codex_model="gpt-5.5",
         )
-        config = SimpleNamespace(litellm_model="gemini/test-model")
 
         with patch(
             "bot.dispatcher.asyncio.to_thread",
             new=AsyncMock(side_effect=lambda func, *args, **kwargs: func(*args, **kwargs)),
         ) as to_thread:
-            with patch("src.agent.llm_adapter.LLMToolAdapter") as adapter_cls:
-                adapter = MagicMock()
-                adapter.call_text.return_value = fake_response
-                adapter_cls.return_value = adapter
+            with patch.object(CommandDispatcher, "_generate_intent_text", return_value=fake_response) as generate:
                 result = await CommandDispatcher._parse_intent_via_llm("分析600519", config)
 
         self.assertEqual(result["intent"], "analysis")
         self.assertEqual(result["codes"], ["600519"])
         to_thread.assert_awaited_once()
-        adapter.call_text.assert_called_once()
+        generate.assert_called_once_with("分析600519", config)
 
     async def test_try_nl_routing_uses_async_command_execution(self):
         dispatcher = CommandDispatcher()

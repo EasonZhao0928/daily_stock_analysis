@@ -261,6 +261,50 @@ describe('systemConfigApi', () => {
     expect(result.primary.lastErrorCode).toBe('command_not_found');
   });
 
+  it('runs the Codex quick check with draft values and no model-turn flag', async () => {
+    post.mockResolvedValueOnce({
+      data: {
+        primary_backend_id: 'codex_app_server',
+        fallback_backend_id: null,
+        primary: {
+          backend_id: 'codex_app_server',
+          backend_type: 'codex_app_server',
+          provider_id: 'codex_app_server',
+          available: true,
+          health_status: 'passed',
+          supports_json: true,
+          supports_tools: false,
+          supports_stream: true,
+          supports_vision: false,
+          is_primary: true,
+          fallback_target: null,
+          max_concurrency: 1,
+          usage_available: true,
+          cost_status: 'unknown',
+          last_error_code: null,
+          last_error_message: null,
+        },
+        fallback: null,
+        backends: [],
+        unified_codex_effective: true,
+      },
+    });
+
+    const result = await systemConfigApi.quickCheckGenerationBackends({
+      items: [{ key: 'GENERATION_BACKEND', value: 'codex_app_server' }],
+      maskToken: '******',
+    });
+
+    expect(post).toHaveBeenCalledWith(
+      '/api/v1/system/config/generation-backends/quick-check',
+      {
+        items: [{ key: 'GENERATION_BACKEND', value: 'codex_app_server' }],
+        mask_token: '******',
+      },
+    );
+    expect(result.unifiedCodexEffective).toBe(true);
+  });
+
   it('runs generation backend smoke tests with snake_case fields', async () => {
     post.mockResolvedValueOnce({
       data: {
@@ -307,6 +351,23 @@ describe('systemConfigApi', () => {
     );
     expect(result.success).toBe(true);
     expect(result.status.healthStatus).toBe('passed');
+  });
+
+  it('serializes explicit Codex quota confirmation for a smoke test', async () => {
+    await systemConfigApi.testGenerationBackend({
+      backendId: 'codex_app_server',
+      mode: 'text',
+      confirmQuotaRisk: true,
+    });
+
+    expect(post).toHaveBeenCalledWith(
+      '/api/v1/system/config/generation-backends/smoke-test',
+      expect.objectContaining({
+        backend_id: 'codex_app_server',
+        mode: 'text',
+        confirm_quota_risk: true,
+      }),
+    );
   });
 
   it('loads the flat Agent backend compatibility status', async () => {

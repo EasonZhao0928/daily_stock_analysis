@@ -5,7 +5,12 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from src.llm.backend_registry import LOCAL_CLI_GENERATION_BACKEND_IDS, LITELLM_BACKEND_ID
+from src.llm.backend_registry import (
+    CODEX_APP_SERVER_BACKEND_ID,
+    LOCAL_CLI_GENERATION_BACKEND_IDS,
+    LITELLM_BACKEND_ID,
+)
+from src.llm.codex_app_server_backend import CodexAppServerGenerationBackend
 from src.llm.generation_backend import GenerationBackend, GenerationError, GenerationErrorCode
 from src.llm.litellm_backend import LiteLLMCallable, LiteLLMGenerationBackend
 from src.llm.local_cli_backend import LocalCliGenerationBackend
@@ -32,6 +37,8 @@ def create_generation_backend(
                 details={"reason": "missing_litellm_completion_callable"},
             )
         return LiteLLMGenerationBackend(litellm_completion_callable)
+    if normalized == CODEX_APP_SERVER_BACKEND_ID:
+        return CodexAppServerGenerationBackend(config)
     if normalized in LOCAL_CLI_GENERATION_BACKEND_IDS:
         return LocalCliGenerationBackend(config, preset_id=normalized)
 

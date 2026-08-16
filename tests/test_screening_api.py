@@ -694,8 +694,11 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
 
     def test_hotspot_provider_retries_transient_eastmoney_failure(self) -> None:
         import requests
+        from data_provider.supplier_runtime import SupplierPolicy, SupplierRuntimeRegistry
 
-        provider = screening_service.DsaEastMoneyHotspotProvider()
+        runtime = SupplierRuntimeRegistry(
+            policies={"eastmoney": SupplierPolicy(max_concurrency=1, min_interval_seconds=0.0)}
+        )
 
         class FakeResponse:
             def raise_for_status(self) -> None:
@@ -711,9 +714,11 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
                 }
 
         get_mock = MagicMock(side_effect=[requests.exceptions.ConnectionError("Connection aborted"), FakeResponse()])
-        provider._last_request_ts = time.monotonic()
         with (
-            patch("src.services.screening_service.time.sleep") as sleep_mock,
+            patch("src.services.screening_service.get_supplier_runtime_registry", return_value=runtime),
+        ):
+            provider = screening_service.DsaEastMoneyHotspotProvider()
+        with (
             patch.object(provider._session, "get", get_mock),
             patch("requests.get", side_effect=AssertionError("bare requests.get should not be used for EastMoney hotspots")) as bare_get,
         ):
@@ -723,9 +728,8 @@ class ScreeningOpportunitiesApiTestCase(unittest.TestCase):
         self.assertEqual(frame.iloc[0]["name"], "AI算力")
         self.assertEqual(get_mock.call_count, 2)
         bare_get.assert_not_called()
-        sleep_values = [call.args[0] for call in sleep_mock.call_args_list if call.args]
-        self.assertIn(0.3, sleep_values)
-        self.assertTrue(any(0 < value <= provider._min_request_interval for value in sleep_values))
+        self.assertEqual(runtime.health("eastmoney").state, "closed")
+        self.assertEqual(runtime.health("eastmoney").in_flight, 0)
 
     def test_hotspots_respects_custom_screening_data_dir_for_cache_paths(self) -> None:
         config = self._config(enabled=True)

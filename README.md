@@ -231,14 +231,20 @@ python main.py --serve-only
 
 完整环境变量、模型渠道、通知渠道、数据源优先级、交易纪律、基本面 P0 语义和部署说明请参考 [完整配置指南](docs/full-guide.md)。
 
+服务运行与上线：
+
+- [本地运行操作手册](docs/operations-local.md)
+- [服务器部署与运行操作手册](docs/operations-server.md)
+
 ## 🖥️ Web 界面
 
 Web 工作台提供配置管理、任务监控、手动分析、历史报告、完整 Markdown 报告、Agent 问股、回测、持仓管理、智能导入和浅色 / 深色主题。启动方式：
 
 ```bash
-python main.py --webui
-python main.py --webui-only
+./scripts/dsa-service.sh web
 ```
+
+如需让同一进程按 `.env` 启动 runtime scheduler，使用 `./scripts/dsa-service.sh full`；旧的 `python main.py --webui-only` 仍兼容，但不建议作为长期服务入口。
 
 访问 `http://127.0.0.1:8000` 即可使用。认证、智能导入、搜索补全、历史报告复制、云服务器访问等细节见 [本地 WebUI 管理界面](docs/full-guide.md#本地-webui-管理界面)。
 

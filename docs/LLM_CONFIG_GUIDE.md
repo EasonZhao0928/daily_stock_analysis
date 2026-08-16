@@ -36,15 +36,18 @@ GENERATION_BACKEND_TIMEOUT_SECONDS=300
 GENERATION_BACKEND_MAX_OUTPUT_BYTES=1048576
 GENERATION_BACKEND_MAX_CONCURRENCY=1
 LOCAL_CLI_BACKEND_MAX_CONCURRENCY=1
+# 可选：同时用于普通 Generation 与 Codex Agent；留空使用 Codex 运行时默认模型。
+# CODEX_MODEL=gpt-5.5
 # 可选：留空时使用本机 OpenCode 默认模型；配置时作为 --model 覆盖值传给 OpenCode。
 # OPENCODE_CLI_MODEL=provider/model
 AGENT_BACKEND=auto
 AGENT_GENERATION_BACKEND=auto
 ```
 
-- `GENERATION_BACKEND=litellm|codex_cli|claude_code_cli|opencode_cli`。本地 CLI backend 是 generation backend，不是 LiteLLM provider；不要写 `LITELLM_MODEL=codex_cli/...`、`LITELLM_MODEL=claude_code_cli/...` 或 `LITELLM_MODEL=opencode_cli/...`。
+- `GENERATION_BACKEND=litellm|codex_app_server|codex_cli|claude_code_cli|opencode_cli`。`codex_app_server` 是官方 Codex App Server 的普通 Generation adapter；本地 CLI backend 是 generation backend，不是 LiteLLM provider；不要写 `LITELLM_MODEL=codex_cli/...`、`LITELLM_MODEL=claude_code_cli/...` 或 `LITELLM_MODEL=opencode_cli/...`。
+- `GENERATION_BACKEND=codex_app_server` 时，普通日报、市场复盘、screening ranking 和已登记的轻量文本/JSON 旁路使用 Codex 登录态；`AGENT_BACKEND=codex_app_server` 仍单独控制问股 Agent/Paper 工具会话。要同时启用两者，设置两个 backend，而不是增加第三个总开关。`CODEX_MODEL` 非空时作为显式模型覆盖，否则使用 Codex 运行时默认模型。
 - `GENERATION_BACKEND=opencode_cli` 时默认不传 `--model`，由本机 OpenCode 使用自身默认模型配置；`OPENCODE_CLI_MODEL` 只是可选覆盖值，配置时才作为单个 `--model` 参数传给 OpenCode。provider 认证、账号和模型可用性由本机 OpenCode 自身配置负责；DSA 不接管这些配置。
-- `GENERATION_FALLBACK_BACKEND` 未配置时默认 `litellm`；本地 `.env` 显式空值 `GENERATION_FALLBACK_BACKEND=` 表示禁用 backend-level fallback；primary 与 fallback 相同时解析为 no-op。仓库自带 GitHub Actions workflow 未配置该变量时会显式导出 `litellm`，如果要在 Actions 中禁用 backend fallback，请把 fallback 设为 primary backend，例如 `GENERATION_BACKEND=codex_cli` + `GENERATION_FALLBACK_BACKEND=codex_cli`。
+- 对历史 generation backend，`GENERATION_FALLBACK_BACKEND` 未配置时默认 `litellm`；当 primary 是 `codex_app_server` 时 Config 默认 fail closed。无论哪种 primary，本地 `.env` 显式空值 `GENERATION_FALLBACK_BACKEND=` 都表示禁用 backend-level fallback；primary 与 fallback 相同时解析为 no-op。仓库自带 GitHub Actions workflow 未配置该变量时会显式导出 `litellm`，如果要在 Actions 中禁用 backend fallback，请把 fallback 设为 primary backend，例如 `GENERATION_BACKEND=codex_cli` + `GENERATION_FALLBACK_BACKEND=codex_cli`。
 - `GENERATION_BACKEND=codex_cli|claude_code_cli` 且没有 Gemini/OpenAI/Anthropic/DeepSeek API Key 时，普通分析和大盘复盘仍会尝试本地 CLI backend；如果对应 executable 不存在，会返回结构化 `command_not_found`，不会报“API Key 未配置”。
 - 当前 `codex_cli` preset 使用 `codex --ask-for-approval never exec --sandbox read-only --output-last-message <temp-file> -`：普通分析是无人值守生成任务，固定 `never` 可避免非交互运行停在人工批准请求，同时仍由 `read-only` 保持只读边界。DSA 从临时文件读取最终响应；Codex CLI 同时打印到 stdout 的重复内容会从诊断预览和输出大小统计中剔除，不参与主分析 JSON 解析。官方依据见 [Codex non-interactive mode](https://developers.openai.com/codex/noninteractive) 与 [Codex CLI command line options](https://developers.openai.com/codex/cli/reference)。本仓库当前真实验证 `codex-cli 0.144.3`，不声明更宽最低版本；如果 CLI 版本不支持 preset 参数，DSA 会返回结构化 `capability_unsupported` / `cli_contract_unsupported` 诊断，并在配置 backend fallback 时回退到 `litellm`。
 - 当前 `claude_code_cli` preset 使用 `claude --safe-mode --tools "" --disallowedTools "mcp__*" --strict-mcp-config --no-session-persistence --output-format json -p <static instruction>`，完整 DSA prompt 通过 stdin 传入。DSA 只从 Claude JSON envelope 的 `result/success` 最终字段提取文本；如果后续启用 `--json-schema`，schema mode 必须提取 `structured_output`，并且仍会继续经过 DSA 现有 JSON validator、minimal parser contract、`_parse_response()`、integrity retry、placeholder fill 和 usage telemetry。参数依据见 [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference)；本 PR smoke 验证版本为 `claude 2.1.177 (Claude Code)`，不声明更宽最低版本。
@@ -56,12 +59,13 @@ AGENT_GENERATION_BACKEND=auto
 - 本地 CLI 默认并发为 1；有效并发为 `min(LOCAL_CLI_BACKEND_MAX_CONCURRENCY, GENERATION_BACKEND_MAX_CONCURRENCY)`，不继承 `MAX_WORKERS`。
 - `AGENT_GENERATION_BACKEND=auto` 不会继承 `GENERATION_BACKEND` 的 local CLI 值；Agent 工具调用继续使用 LiteLLM。Web 设置页仅暴露 `auto|litellm`；手写 `AGENT_GENERATION_BACKEND=codex_cli|claude_code_cli|opencode_cli` 不实现 text-only Agent mode，会返回明确 unsupported tool-calling 诊断。
 - Phase 6a 的 DSA Tool Surface 仍是唯一工具 schema、权限元数据、scope guard、结构化错误和审计/脱敏边界；Phase 6 的 Codex AgentBackend 只能通过该 Tool Surface 执行工具。`codex_cli` / `claude_code_cli` / `opencode_cli` 仍是 generation-only，不能作为 Agent tool fallback。
-- Web 设置页的生成后端快速检查只读取已保存的 `.env`、运行时兜底值和未保存草稿；它不会写配置、重载运行时，也不会发起真实模型请求。`available` 只表示当前配置具备尝试运行的条件。JSON 冒烟测试是单独的显式操作，会使用服务端固定的 JSON 提示词和 schema 发起一次真实的生成后端请求，用于验证提取器、JSON 契约、超时、输出限制和 usage-unavailable 语义。
-- `GET /api/v1/system/config/generation-backends/status` 只读取已保存配置；未保存草稿需调用 `POST /api/v1/system/config/generation-backends/status/preview` 或 `POST /api/v1/system/config/generation-backends/smoke-test`。被遮罩的密钥字段会继续沿用已保存值。`health_status` 与 `last_error_code/message` 只代表本次计算结果，不是历史持久健康状态。
+- Web 设置页的生成后端 quick check 只做配置、Codex 可执行文件/协议、账号和 rate-limit RPC 检查；它不会写配置、重载运行时、访问行情或发起模型 turn，也不会消耗生成额度。统一状态同时返回 generation primary/fallback、Agent primary、fallback policy、Codex 模型/平台/binary、vision/Deep Research 首期例外和脱敏账号投影。
+- `GET /api/v1/system/config/generation-backends/status` 返回保存配置的组合状态；未保存草稿可调用 `POST /api/v1/system/config/generation-backends/status/preview`，需要账号/rate-limit quick check 时调用 `POST /api/v1/system/config/generation-backends/quick-check`。被遮罩的密钥字段会继续沿用已保存值。`health_status` 与 `last_error_code/message` 只代表本次计算结果，不是历史持久健康状态。
+- JSON/text smoke 是单独的管理员显式操作，会使用固定提示词、零工具 ephemeral session，不落业务报告、不访问市场数据。Codex smoke 在执行前默认返回一次订阅额度风险提示；确认 `confirm_quota_risk=true` 后才会发送一次真实模型请求。smoke 与 quick check 的 POST API 需要有效管理员会话和同源 Origin/Referer（或浏览器 `X-Requested-With`）标识。
 
 ### Codex 本地 Agent（Phase 6 实验原型）
 
-`AGENT_BACKEND` 只决定现有问股 Chat 的运行方式，不影响普通报告、定时分析、大盘复盘、普通 Agent 分析 pipeline、LiteLLM Multi Agent 或 Deep Research：
+`AGENT_BACKEND` 只决定现有问股 Chat/Paper 工具会话的运行方式；它不会单独改道普通报告。普通报告是否使用 Codex 由 `GENERATION_BACKEND` 决定；LiteLLM Multi Agent 或 Deep Research 仍是独立能力：
 
 ```env
 # auto（推荐）不会自动启用实验性的 Codex；auto 与 litellm 均保持原有默认模型路径。
@@ -75,7 +79,7 @@ Web 启用步骤：打开「设置 → Agent 设置 → 问股生成方式」，
 
 - Codex 必须安装并登录在**运行 DSA 后端的设备**上；DSA 不读取或保存 Codex 凭据，App Server 进程使用 Codex 自身登录态。Docker、远程服务器和 Desktop 的 PATH / 登录态彼此独立。在 Desktop 中从 Finder/Dock 启动时，后端只继承 Desktop 构造的真实 PATH；若状态提示找不到 Codex，请将 Codex CLI 安装到后端 PATH 可见位置并完全重启 DSA，不要只在另一个终端窗口验证。
 - Phase 6 的 Codex App Server Agent 当前支持 macOS、Linux，以及 DSA 后端完整运行于 WSL 的环境；原生 Windows 后端会在状态检查和 transport 启动前明确拒绝。此限制不影响 Phase 2 `GENERATION_BACKEND=codex_cli` 已有的 Windows 生成能力。
-- Codex 当前只开放已保存分析上下文、全局回测汇总和策略回测汇总的只读查询。本期只验证并承诺这三个工具的独立进程、停止、超时和回收闭环；实时行情、新闻、市场热点、技术指标重算、个股回测明细和持仓工具未纳入本期验证，因此不会出现在 Codex 的工具列表中。需要这些能力时，请在 Web 中选择「默认模型」。明确股票代码或 Web 已选择的唯一股票只会为已开放的历史分析上下文工具建立股票范围；遇到同名歧义时不会猜测。
+- Codex Agent 当前通过 `portfolio_readonly` ToolSurface 暴露 DSA 的 profile-bound 只读工具：实时行情、历史 K 线、筹码/资金流、技术指标重算、新闻与综合资讯、市场指数/板块、基本面/公告/研报、全局/策略/个股回测明细、Paper/持仓快照和风险读取。工具描述与执行阶段都按当前 Execution Profile、股票范围和 cancellation safety 校验；Paper 提案/审批、真实交易写入、Shell、文件、MCP 和插件仍不开放。工具返回空数据或供应商不可用时，Codex 必须说明缺失，不能把数据问题误报为“没有 Agent 配置”。明确股票代码或 Web 已选择的唯一股票会建立股票范围；遇到同名歧义时不会猜测。
 - 该能力不是离线模型。股票代码、问题、新闻、持仓上下文和脱敏后的工具结果可能由 Codex 自身配置的服务处理。
 - 当前只支持 single-agent Chat；不支持 Codex Multi Agent 或 Codex Deep Research。现有 LiteLLM Multi Agent 与 Deep Research 不受影响。
 - 每次 Chat 都创建新的 ephemeral App Server thread；DSA 继续保存原有可见会话历史，并在下一轮注入，但不会注入 LiteLLM provider trace。Web 客户端不会收到 chain-of-thought、原始 JSON-RPC、stderr 或完整工具参数/结果；Codex 只接收完成该轮分析所需的脱敏工具结果。

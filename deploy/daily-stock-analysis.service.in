@@ -10,7 +10,8 @@ Group=@SERVICE_GROUP@
 WorkingDirectory=@APP_DIR@
 EnvironmentFile=-@APP_DIR@/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=@APP_DIR@/.venv/bin/python @APP_DIR@/main.py --serve-only --host @SERVICE_HOST@ --port @SERVICE_PORT@
+Environment=DSA_SERVICE_MODE=@SERVICE_MODE@
+ExecStart=@APP_DIR@/scripts/dsa-service.sh service --host @SERVICE_HOST@ --port @SERVICE_PORT@
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=180

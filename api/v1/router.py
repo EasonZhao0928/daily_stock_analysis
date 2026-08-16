@@ -26,6 +26,9 @@ from api.v1.endpoints import (
     stocks,
     system_config,
     usage,
+    shadow,
+    paper,
+    market,
 )
 
 # 创建 v1 版本主路由。
@@ -102,6 +105,24 @@ router.include_router(
     screening.router,
     prefix="/screening",
     tags=["Screening"]
+)
+
+router.include_router(
+    shadow.router,
+    prefix="/shadow",
+    tags=["Shadow Research"]
+)
+
+router.include_router(
+    paper.router,
+    prefix="/paper",
+    tags=["Paper Account"],
+)
+
+router.include_router(
+    market.router,
+    prefix="/market",
+    tags=["Market Chart"],
 )
 
 router.include_router(

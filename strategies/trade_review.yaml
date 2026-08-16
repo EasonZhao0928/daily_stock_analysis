@@ -1,0 +1,19 @@
+name: trade_review
+display_name: 交易复盘
+description: 以行情、账户账本、证据和决策记录复盘交易假设、执行偏差与风险。
+summary: 复盘交易过程，不用结果倒推当时未知信息。
+version: 1.0.0
+category: research
+risk-level: high
+evidence-policy: required
+required-capabilities: [market_data:read, evidence:read, portfolio:read]
+required_tools: [get_portfolio_snapshot, get_daily_history, get_analysis_context]
+aliases: [复盘, 交易复盘, 决策复盘]
+instructions: |
+  ## 冻结时点
+  - 以 decision time 的 observation、账本事件和当时可见 Evidence 为准，禁止 hindsight。
+  - 区分信号质量、仓位/风险决策、订单执行和事后市场结果。
+
+  ## 归因
+  - 记录计划、实际成交、费用/滑点、持有期、退出原因和违反的 mandate/rule code。
+  - 给出可重复的改进动作与下次验证指标，避免泛化成“应该更有耐心”。

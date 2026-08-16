@@ -22,7 +22,7 @@ import pandas as pd
 
 from src.config import get_config
 from src.report_language import normalize_report_language
-from src.search_service import SearchService
+from src.search_service import SearchService, SearchResult
 from src.core.market_profile import get_profile, MarketProfile
 from src.core.market_strategy import get_market_strategy_blueprint
 from src.llm.backend_registry import (
@@ -34,6 +34,7 @@ from src.schemas.market_light import MARKET_LIGHT_REGIONS, MarketLightSnapshot
 from src.services.run_diagnostics import record_llm_run, record_llm_run_started
 from src.services.intelligence_service import IntelligenceService
 from data_provider.base import DataFetcherManager
+from data_provider.cls_telegraph import fetch_cls_telegraph
 
 logger = logging.getLogger(__name__)
 
@@ -597,55 +598,92 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         Returns:
             新闻列表
         """
+        all_news = []
+
         if not self.search_service:
             logger.warning(
                 "[大盘] %s action=search_market_news status=skipped reason=no_search_service",
                 self._log_context(),
             )
-            return []
-        
-        all_news = []
+        else:
+            # 按 region 使用不同的新闻搜索词
+            search_queries = self.profile.news_queries
+            review_language = self._get_review_language()
+            market_names = {
+                "cn": "大盘" if review_language == "zh" else "A-share market",
+                "us": "美股市场" if review_language == "zh" else "US market",
+                "hk": "港股市场" if review_language == "zh" else "HK market",
+                "jp": "日本股市" if review_language == "zh" else "Japan stock market",
+                "kr": "韩国股市" if review_language == "zh" else "Korea stock market",
+            }
 
-        # 按 region 使用不同的新闻搜索词
-        search_queries = self.profile.news_queries
-        review_language = self._get_review_language()
-        market_names = {
-            "cn": "大盘" if review_language == "zh" else "A-share market",
-            "us": "美股市场" if review_language == "zh" else "US market",
-            "hk": "港股市场" if review_language == "zh" else "HK market",
-            "jp": "日本股市" if review_language == "zh" else "Japan stock market",
-            "kr": "韩国股市" if review_language == "zh" else "Korea stock market",
-        }
-        
-        try:
-            logger.info("[大盘] %s action=search_market_news status=start", self._log_context())
-            
-            # 根据 region 设置搜索上下文名称，避免美股搜索被解读为 A 股语境
-            market_name = market_names.get(self.region, "大盘")
-            for query in search_queries:
-                response = self.search_service.search_stock_news(
-                    stock_code="market",
-                    stock_name=market_name,
-                    max_results=3,
-                    focus_keywords=query.split()
-                )
-                if response and response.results:
-                    all_news.extend(response.results)
-                    logger.info(
-                        "[大盘] %s action=search_market_news status=query_success count=%d",
-                        self._log_context(),
-                        len(response.results),
+            try:
+                logger.info("[大盘] %s action=search_market_news status=start", self._log_context())
+
+                # 根据 region 设置搜索上下文名称，避免美股搜索被解读为 A 股语境
+                market_name = market_names.get(self.region, "大盘")
+                for query in search_queries:
+                    response = self.search_service.search_stock_news(
+                        stock_code="market",
+                        stock_name=market_name,
+                        max_results=3,
+                        focus_keywords=query.split()
                     )
-            
-            logger.info(
-                "[大盘] %s action=search_market_news status=success count=%d",
-                self._log_context(),
-                len(all_news),
-            )
-            
-        except Exception as e:
-            logger.error("[大盘] %s action=search_market_news status=failed error=%s", self._log_context(), e)
-        
+                    if response and response.results:
+                        all_news.extend(response.results)
+                        logger.info(
+                            "[大盘] %s action=search_market_news status=query_success count=%d",
+                            self._log_context(),
+                            len(response.results),
+                        )
+
+                # 注意：这里只统计 SearXNG 等通用搜索的结果，不是本方法最终返回的总数——
+                # 财联社电报在下面单独追加，真正的最终总数以方法末尾的
+                # action=search_market_news status=success 汇总日志为准，不要用这一条判断
+                # "本次新闻是不是真的 0 条"。
+                logger.info(
+                    "[大盘] %s action=search_market_news_searxng status=success count=%d",
+                    self._log_context(),
+                    len(all_news),
+                )
+
+            except Exception as e:
+                logger.error("[大盘] %s action=search_market_news status=failed error=%s", self._log_context(), e)
+
+        # 财联社电报作为 A 股场景的补充信息源（不影响上面 SearXNG 通用搜索的结果）。
+        # 时效性更强，覆盖面比通用搜索窄，所以是追加而不是替代；fail-open，失败不影响已有新闻。
+        if self.region == "cn":
+            try:
+                cls_items = fetch_cls_telegraph(limit=5)
+                if cls_items:
+                    all_news.extend(
+                        SearchResult(
+                            title=item["title"],
+                            snippet=item["snippet"],
+                            url=item["url"],
+                            source=item["source"],
+                            published_date=item["published_date"] or None,
+                        )
+                        for item in cls_items
+                    )
+                logger.info(
+                    "[大盘] %s action=search_cls_telegraph status=%s count=%d",
+                    self._log_context(),
+                    "success" if cls_items else "empty",
+                    len(cls_items),
+                )
+            except Exception as e:
+                logger.warning(
+                    "[大盘] %s action=search_cls_telegraph status=failed error=%s", self._log_context(), e
+                )
+
+        # 汇总日志：SearXNG + 财联社电报之后的最终总数，判断"本次新闻是不是真的 0 条"
+        # 应该看这一条，而不是上面 search_market_news_searxng 那条中间结果。
+        logger.info(
+            "[大盘] %s action=search_market_news status=success count=%d",
+            self._log_context(),
+            len(all_news),
+        )
         return all_news
     
     def generate_market_review(self, overview: MarketOverview, news: List) -> str:
@@ -669,9 +707,15 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             )
             record_llm_run(
                 success=False,
-                provider="litellm",
-                model=getattr(self.config, "litellm_model", None),
+                provider=getattr(backend_error, "backend", None),
+                model=getattr(self.config, "codex_model", None)
+                or getattr(self.config, "litellm_model", None),
                 call_type="market_review",
+                business_entry="market_review",
+                primary_backend=getattr(self.config, "generation_backend", None) or "litellm",
+                effective_backend=getattr(backend_error, "backend", None),
+                status="failed",
+                error_code=getattr(getattr(backend_error, "error_code", None), "value", None),
                 error_type=type(backend_error).__name__,
                 error_message=backend_error,
             )
@@ -682,7 +726,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "[大盘] %s action=generate_review status=fallback_template reason=no_analyzer",
                 self._log_context(),
             )
-            return self._generate_template_review(overview, news)
+            return self._apply_news_availability_notice(self._generate_template_review(overview, news), news)
 
         # 构建 Prompt
         prompt = self._build_review_prompt(overview, news)
@@ -690,30 +734,72 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         logger.info("[大盘] %s action=generate_review status=start", self._log_context())
         # Use the public generate_text() entry point - never access private analyzer attributes.
         llm_started_at = time.perf_counter()
+        primary_backend = str(getattr(self.config, "generation_backend", None) or "litellm")
         try:
             record_llm_run_started(
-                provider="litellm",
-                model=getattr(self.config, "litellm_model", None),
+                provider=primary_backend,
+                model=getattr(self.config, "codex_model", None)
+                or getattr(self.config, "litellm_model", None),
                 call_type="market_review",
+                business_entry="market_review",
+                primary_backend=primary_backend,
+                effective_backend=primary_backend,
             )
             review = self.analyzer.generate_text(prompt, max_tokens=8192, temperature=0.7)
         except Exception as exc:
+            metadata = {}
+            getter = getattr(self.analyzer, "get_generation_call_metadata", None)
+            if callable(getter):
+                try:
+                    metadata = getter()
+                except Exception:
+                    metadata = {}
             record_llm_run(
                 success=False,
-                provider="litellm",
-                model=getattr(self.config, "litellm_model", None),
+                provider=metadata.get("effective_backend") or primary_backend,
+                model=getattr(self.config, "codex_model", None)
+                or getattr(self.config, "litellm_model", None),
                 call_type="market_review",
+                business_entry="market_review",
+                primary_backend=metadata.get("primary_backend") or primary_backend,
+                effective_backend=metadata.get("effective_backend") or primary_backend,
+                attempt=metadata.get("attempt"),
+                status="failed",
+                fallback_from=metadata.get("fallback_from"),
+                fallback_to=metadata.get("effective_backend") if metadata.get("fallback_from") else None,
+                fallback_reason=metadata.get("fallback_reason"),
+                error_code=getattr(getattr(exc, "error_code", None), "value", None),
                 duration_ms=int((time.perf_counter() - llm_started_at) * 1000),
                 error_type=type(exc).__name__,
                 error_message=exc,
             )
             raise
 
+        metadata = {}
+        getter = getattr(self.analyzer, "get_generation_call_metadata", None)
+        if callable(getter):
+            try:
+                metadata = getter()
+            except Exception:
+                metadata = {}
+        effective_backend = metadata.get("effective_backend") or primary_backend
         record_llm_run(
             success=bool(review),
-            provider="litellm",
-            model=getattr(self.config, "litellm_model", None),
+            provider=effective_backend,
+            model=getattr(self.config, "codex_model", None)
+            or getattr(self.config, "litellm_model", None),
             call_type="market_review",
+            business_entry="market_review",
+            primary_backend=metadata.get("primary_backend") or primary_backend,
+            effective_backend=effective_backend,
+            attempt=metadata.get("attempt"),
+            usage_available=metadata.get("usage_available"),
+            tokens=metadata.get("tokens"),
+            cost_status="unknown" if effective_backend == "codex_app_server" else None,
+            status=metadata.get("status") or ("success" if review else "failed"),
+            fallback_from=metadata.get("fallback_from"),
+            fallback_to=effective_backend if metadata.get("fallback_from") else None,
+            fallback_reason=metadata.get("fallback_reason"),
             duration_ms=int((time.perf_counter() - llm_started_at) * 1000),
             error_type=None if review else "EmptyResponse",
             error_message=None if review else "empty market review response",
@@ -726,13 +812,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 len(review),
             )
             # Inject structured data tables into LLM prose sections
-            return self._inject_data_into_review(review, overview, news)
+            review = self._inject_data_into_review(review, overview, news)
+            return self._apply_news_availability_notice(review, news)
 
         logger.warning(
             "[大盘] %s action=generate_review status=fallback_template reason=empty_llm_response",
             self._log_context(),
         )
-        return self._generate_template_review(overview, news)
+        return self._apply_news_availability_notice(self._generate_template_review(overview, news), news)
 
     def _get_analyzer_generation_backend_config_error(self) -> Optional[GenerationError]:
         """Return analyzer backend config errors without relying on dynamic mock attributes."""
@@ -1652,7 +1739,24 @@ Output the report content directly, no extra commentary.
 
 请直接输出复盘报告内容，不要输出其他说明文字。
 """
-    
+
+    def _apply_news_availability_notice(self, review: str, news: Optional[List]) -> str:
+        """新闻搜索本次未获取到任何结果时，在报告开头显式提示。
+
+        新闻是否缺失只是 LLM prompt 里的软性"数据边界"提示（`data_limits_block`），
+        不保证 LLM 一定会在输出里主动说明；这里在代码层面确定性地插入提示，不依赖
+        模型是否听话，读者不用去翻 debug log 才知道这次分析没有消息面支撑。
+        """
+        if news:
+            return review
+        notice = (
+            "> ⚠️ No news results were retrieved for this run — the analysis below "
+            "relies mainly on market and technical data, without news-driven catalysts.\n\n"
+            if self._get_review_language() == "en"
+            else "> ⚠️ 本次未获取到有效新闻资讯，以下分析主要基于行情与技术面数据，不包含消息面判断。\n\n"
+        )
+        return notice + review
+
     def _generate_template_review(self, overview: MarketOverview, news: List) -> str:
         """使用模板生成复盘报告（无大模型时的备选方案）"""
         template_language = self._get_template_review_language()

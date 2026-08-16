@@ -145,7 +145,8 @@ _etf_realtime_cache: Dict[str, Any] = {
     'ttl': 600  # 10分钟缓存有效期
 }
 
-_ETF_SH_PREFIXES = ('51', '52', '56', '58')
+# Shanghai fund/ETF families, including the legacy 50xxxx range.
+_ETF_SH_PREFIXES = ('50', '51', '52', '56', '58')
 _ETF_SZ_PREFIXES = ('15', '16', '18')
 
 

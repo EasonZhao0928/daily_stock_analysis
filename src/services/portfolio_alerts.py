@@ -23,6 +23,16 @@ PORTFOLIO_ALERT_TYPES = frozenset({
     "portfolio_drawdown",
     "portfolio_price_stale",
 })
+PAPER_ALERT_TYPES = frozenset({
+    "paper_signal",
+    "paper_proposal",
+    "paper_fill",
+    "paper_risk",
+    "paper_stale",
+    "paper_quota",
+    "shadow_signal",
+    "shadow_degraded",
+})
 
 EXPANDED_TARGET_SOFT_CAP = 100
 TARGET_RESULTS_LIMIT = 20
@@ -75,6 +85,94 @@ class StaticAlertEvaluation:
     record_status: str = "skipped"
     metadata: Dict[str, Any] = field(default_factory=dict)
     description: str = ""
+
+
+@dataclass
+class PaperEventAlert:
+    """Runtime event rule for Paper/Shadow account lifecycle signals."""
+
+    target_scope: str
+    target: str
+    alert_type: str
+    parameters: Dict[str, Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    description: str = ""
+    stock_code: str = ""
+
+    def __post_init__(self) -> None:
+        self.stock_code = str(self.metadata.get("effective_target") or self.target)
+
+
+def normalize_paper_alert_parameters(alert_type: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+    if alert_type not in PAPER_ALERT_TYPES:
+        raise ValueError(f"unsupported paper alert_type: {alert_type}")
+    if not isinstance(parameters, dict):
+        raise ValueError("parameters must be an object")
+    active = parameters.get("active", False)
+    if not isinstance(active, bool):
+        raise ValueError("paper alert active must be boolean")
+    message = str(parameters.get("message") or alert_type).strip()
+    if len(message) > 500:
+        raise ValueError("paper alert message is too long")
+    observed = parameters.get("observed_value")
+    threshold = parameters.get("threshold")
+    for name, value in (("observed_value", observed), ("threshold", threshold)):
+        if value is not None:
+            try:
+                float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be numeric") from exc
+    return {
+        "active": active,
+        "message": message,
+        "observed_value": float(observed) if observed is not None else None,
+        "threshold": float(threshold) if threshold is not None else None,
+        "event_id": str(parameters.get("event_id") or "").strip() or None,
+    }
+
+
+def make_paper_event_payload(*, parent_key: str, data: Dict[str, Any]) -> RuntimeAlertPayload:
+    target = str(data["target"])
+    rule = PaperEventAlert(
+        target_scope=data["target_scope"],
+        target=target,
+        alert_type=data["alert_type"],
+        parameters=dict(data.get("parameters") or {}),
+        metadata={
+            "persisted_rule_id": data["id"],
+            "effective_target": target,
+            "display_target": f"Paper/Shadow {target}",
+        },
+        description=data.get("name") or data["alert_type"],
+    )
+    return RuntimeAlertPayload(
+        key=f"{parent_key}|{target}",
+        rule=rule,
+        effective_target=target,
+        display_target=f"Paper/Shadow {target}",
+    )
+
+
+def evaluate_paper_event_alert(rule: PaperEventAlert) -> Dict[str, Any]:
+    active = bool(rule.parameters.get("active", False))
+    message = str(rule.parameters.get("message") or rule.alert_type)
+    return {
+        "rule_id": int(rule.metadata.get("persisted_rule_id", 0) or 0),
+        "status": "triggered" if active else "not_triggered",
+        "record_status": "triggered" if active else "not_triggered",
+        "triggered": active,
+        "observed_value": rule.parameters.get("observed_value"),
+        "threshold": rule.parameters.get("threshold"),
+        "data_source": "paper_account" if rule.alert_type.startswith("paper_") else "shadow_research",
+        "data_timestamp": rule.parameters.get("event_id"),
+        "source_event_id": rule.parameters.get("event_id"),
+        "reason": message,
+        "message": message,
+        "diagnostics": {
+            "event_type": rule.alert_type,
+            "event_id": rule.parameters.get("event_id"),
+        },
+    }
 
 
 def normalize_portfolio_alert_parameters(alert_type: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
@@ -266,6 +364,8 @@ def evaluate_portfolio_risk_alert(
 def result_to_target_result(payload: RuntimeAlertPayload, result: Dict[str, Any]) -> Dict[str, Any]:
     record_status = result.get("record_status")
     return {
+        "key": payload.key,
+        "rule_id": result.get("rule_id"),
         "target": payload.effective_target,
         "display_target": payload.display_target,
         "status": result.get("status") or "evaluation_error",
@@ -274,6 +374,10 @@ def result_to_target_result(payload: RuntimeAlertPayload, result: Dict[str, Any]
         "observed_value": result.get("observed_value"),
         "threshold": result.get("threshold"),
         "message": result.get("message") or result.get("reason") or "",
+        "reason": result.get("reason"),
+        "data_source": result.get("data_source"),
+        "data_timestamp": result.get("data_timestamp"),
+        "diagnostics": result.get("diagnostics"),
     }
 
 

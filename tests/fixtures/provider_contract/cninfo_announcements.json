@@ -1,0 +1,22 @@
+{
+  "capability": "announcements",
+  "captured_at": "2026-08-14T00:00:00Z",
+  "fixture_id": "cninfo-announcements-600519-v1",
+  "schema_fingerprint": "166725d0dc6f5ce6695be3ef88250b6ab77613292f40c5d926f563697e9a5988",
+  "metadata": {
+    "redacted": true,
+    "source_domain": "cninfo.com.cn"
+  },
+  "network": false,
+  "payload": [
+    {
+      "announcementId": "redacted-001",
+      "announcementTime": 1786665600000,
+      "announcementTitle": "2025 年年度报告摘要（脱敏）",
+      "announcementTypeName": "定期报告",
+      "adjunctUrl": "disclosure/2026/08/14/redacted-001.PDF"
+    }
+  ],
+  "provider": "cninfo",
+  "source_tier": "official"
+}

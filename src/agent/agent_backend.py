@@ -11,8 +11,16 @@ from typing import Any, Callable, Dict, List, Optional
 from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.runner import run_agent_loop
 from src.agent.stock_scope import StockScope
-from src.agent.tools.registry import ToolRegistry
+from src.agent.tool_surface import ToolSurface
 
+
+# Shared by both transports so LiteLLM and Codex explain an unscoped turn the
+# same way (R1.3 parity covers behaviour, not just result envelopes).
+NO_STOCK_SCOPE_INSTRUCTION = (
+    "No stock scope was established for this turn. Do not call any DSA tool that requires a "
+    "stock_code. If the user asks about a specific stock, ask them in plain language to provide "
+    "or select an exact stock code. Non-stock market tools remain available."
+)
 
 AGENT_BACKEND_ERROR_CODES = frozenset(
     {
@@ -99,19 +107,32 @@ class LiteLLMAgentBackend(AgentBackend):
     backend_id = "litellm"
     runtime_owns_loop = False
 
-    def __init__(self, tool_registry: ToolRegistry, llm_adapter: LLMToolAdapter) -> None:
-        self.tool_registry = tool_registry
+    def __init__(self, tool_surface: Any, llm_adapter: LLMToolAdapter) -> None:
+        # Accept the historical registry positional argument, but normalize it
+        # immediately so the LiteLLM loop has the same execution seam as Codex.
+        self.tool_surface = (
+            tool_surface
+            if isinstance(tool_surface, ToolSurface)
+            else ToolSurface(tool_surface, legacy_runner_compat=True)
+        )
         self.llm_adapter = llm_adapter
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
+        # The factory-built surface is strict (not legacy_runner_compat), so a
+        # turn with no resolved stock scope refuses stock-scoped tools just like
+        # Codex does.  Tell the model that up front, otherwise it retries and
+        # the user only sees an unexplained refusal.
+        system_prompt = request.system_prompt
+        if request.stock_scope is None:
+            system_prompt = f"{system_prompt}\n\n{NO_STOCK_SCOPE_INSTRUCTION}"
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": request.system_prompt},
+            {"role": "system", "content": system_prompt},
             *request.history_messages,
             {"role": "user", "content": request.user_message},
         ]
         loop_result = run_agent_loop(
             messages=messages,
-            tool_registry=self.tool_registry,
+            tool_surface=self.tool_surface,
             llm_adapter=self.llm_adapter,
             max_steps=request.max_steps,
             progress_callback=request.progress_callback,

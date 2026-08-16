@@ -1,0 +1,29 @@
+{
+  "capability": "consensus_estimate",
+  "captured_at": "2026-08-14T00:00:00Z",
+  "fixture_id": "ths-eps-600519-v1",
+  "schema_fingerprint": "a427553a5321ab823da23a7d7dc1fe49998ffebab27f5e79ab0efe918aff3f1c",
+  "metadata": {
+    "redacted": true,
+    "source_domain": "10jqka.com.cn"
+  },
+  "network": false,
+  "payload": [
+    {
+      "年度": "2026E",
+      "预测机构数": "24",
+      "最小值": "2.01",
+      "均值": "2.18",
+      "最大值": "2.35"
+    },
+    {
+      "年度": "2027E",
+      "预测机构数": "21",
+      "最小值": "2.28",
+      "均值": "2.51",
+      "最大值": "2.80"
+    }
+  ],
+  "provider": "ths",
+  "source_tier": "primary"
+}

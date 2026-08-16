@@ -580,6 +580,7 @@ class TestAgentResultConversion(unittest.TestCase):
             mock_cfg = MagicMock()
             mock_cfg.max_workers = 2
             mock_cfg.agent_mode = True
+            mock_cfg.agent_backend = "litellm"
             mock_cfg.agent_max_steps = 10
             mock_cfg.agent_orchestrator_timeout_s = 0
             mock_cfg.agent_skills = []
@@ -1597,6 +1598,50 @@ class TestPipelineRouting(unittest.TestCase):
             self.assertEqual(call_args[0][2], "q1")
             # trend_result (8th arg) should be present (may be a TrendAnalysisResult or None)
             self.assertEqual(len(call_args[0]), 8)
+
+    def test_codex_agent_backend_does_not_route_regular_analysis_to_litellm_agent(self):
+        """The unified Codex preset must keep stock reports on Generation."""
+        with patch('src.core.pipeline.get_config') as mock_config, \
+             patch('src.core.pipeline.get_db'), \
+             patch('src.core.pipeline.DataFetcherManager'), \
+             patch('src.core.pipeline.GeminiAnalyzer'), \
+             patch('src.core.pipeline.NotificationService'), \
+             patch('src.core.pipeline.SearchService'):
+
+            mock_cfg = MagicMock()
+            mock_cfg.max_workers = 2
+            mock_cfg.agent_mode = True
+            mock_cfg.agent_backend = "codex_app_server"
+            mock_cfg.agent_max_steps = 5
+            mock_cfg.agent_skills = []
+            mock_cfg.bocha_api_keys = []
+            mock_cfg.tavily_api_keys = []
+            mock_cfg.brave_api_keys = []
+            mock_cfg.serpapi_keys = []
+            mock_cfg.searxng_base_urls = []
+            mock_cfg.searxng_public_instances_enabled = False
+            mock_cfg.news_max_age_days = 7
+            mock_cfg.enable_realtime_quote = True
+            mock_cfg.enable_chip_distribution = True
+            mock_cfg.realtime_source_priority = []
+            mock_cfg.save_context_snapshot = False
+            mock_config.return_value = mock_cfg
+
+            from src.core.pipeline import StockAnalysisPipeline
+            from src.enums import ReportType
+
+            pipeline = StockAnalysisPipeline(config=mock_cfg)
+            pipeline._analyze_with_agent = MagicMock(return_value=None)
+            pipeline.analyzer.analyze.return_value = None
+            pipeline.search_service.is_available = False
+            pipeline.fetcher_manager.get_realtime_quote.return_value = None
+            pipeline.fetcher_manager.get_chip_distribution.return_value = None
+            pipeline.db.get_analysis_context.return_value = None
+
+            pipeline.analyze_stock("600519", ReportType.SIMPLE, "q-codex")
+
+            pipeline._analyze_with_agent.assert_not_called()
+            pipeline.analyzer.analyze.assert_called_once()
 
     def test_legacy_mode_does_not_call_agent(self):
         """When agent_mode=False, analyze_stock should NOT call _analyze_with_agent."""

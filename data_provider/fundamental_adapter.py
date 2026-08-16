@@ -15,6 +15,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from .financial_types import (
+    FinancialStatementAdapter,
+    align_statement_periods,
+    normalize_consensus_estimates,
+    normalize_financial_statement,
+)
+
 logger = logging.getLogger(__name__)
 
 _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
@@ -263,6 +270,51 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
 
 class AkshareFundamentalAdapter:
     """AkShare adapter for fundamentals, capital flow and dragon-tiger signals."""
+
+    @staticmethod
+    def normalize_financial_statement(
+        rows: Any,
+        *,
+        statement_type: str,
+        stock_code: str,
+        source: str,
+        source_tier: str,
+        **kwargs: Any,
+    ):
+        """Normalize Sina/AkShare-compatible three-statement rows.
+
+        The network fetch remains injectable; this facade keeps callers that
+        already depend on ``fundamental_adapter`` on the same contract as the
+        new Market Data adapters.
+        """
+
+        return normalize_financial_statement(
+            rows,
+            statement_type=statement_type,
+            security_id=stock_code,
+            source=source,
+            source_tier=source_tier,
+            **kwargs,
+        )
+
+    @staticmethod
+    def normalize_consensus_estimate(
+        rows: Any,
+        *,
+        stock_code: str,
+        source: str,
+        source_tier: str,
+        **kwargs: Any,
+    ):
+        """Normalize THS/EastMoney consensus EPS rows."""
+
+        return normalize_consensus_estimates(
+            rows,
+            security_id=stock_code,
+            source=source,
+            source_tier=source_tier,
+            **kwargs,
+        )
 
     def _call_df_candidates(
         self,

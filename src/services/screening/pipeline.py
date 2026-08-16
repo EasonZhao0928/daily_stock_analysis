@@ -5,6 +5,7 @@
 
 import copy
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,7 @@ from src.services.screening.scorer import compute_screen_scores, factor_score_co
 from src.services.screening.selection_variant import apply_seeded_selection_variant
 from src.services.screening.snapshot import fetch_snapshot_with_fallback
 from src.services.screening.strategy import load_all_strategies
+from src.services.run_diagnostics import record_llm_run, record_llm_run_started
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +353,20 @@ def screen(
     llm_failure_reason = ""
     if use_llm and config.has_llm_config():
         _emit_progress(progress_callback, 66, "正在执行 LLM 候选重排")
+        dsa_context = context.get("dsa") if isinstance(context, dict) else None
+        dsa_context = dsa_context if isinstance(dsa_context, dict) else {}
+        generation_backend = dsa_context.get("generation_backend")
+        generation_fallback_backend = dsa_context.get("generation_fallback_backend")
+        if generation_backend is None:
+            # Keep direct screening callers compatible while routing the
+            # ranking algorithm through the GenerationBackend contract.
+            from src.services.screening.ranker import ScreeningLiteLLMGenerationBackend
+
+            generation_backend = ScreeningLiteLLMGenerationBackend(config)
+        if generation_fallback_backend is None and dsa_context.get("generation_fallback_backend_id") == "litellm":
+            from src.services.screening.ranker import ScreeningLiteLLMGenerationBackend
+
+            generation_fallback_backend = ScreeningLiteLLMGenerationBackend(config)
         candidate_context_rows: list[dict[str, object]] = []
         event_source_weights = _event_source_weights(screening.event_profile)
         should_collect_candidate_context = (
@@ -424,6 +440,8 @@ def screen(
             timeout_sec=config.llm_timeout_sec,
             max_tokens=config.llm_max_tokens,
             degradation=llm_prompt_degradation,
+            generation_backend=generation_backend,
+            generation_fallback_backend=generation_fallback_backend,
         )
         degradation.extend(llm_prompt_degradation)
         picks = llm_result.picks

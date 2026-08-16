@@ -16,7 +16,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 refresh_stock_index = importlib.import_module("refresh_stock_index")
 
 
-def test_main_fetches_tushare_with_a_rk_by_default():
+def test_main_fetches_tushare_with_a_rk_and_etf_by_default():
     with (
         patch.object(refresh_stock_index, "_has_tushare_token", return_value=True),
         patch.object(refresh_stock_index, "_run") as run,
@@ -29,6 +29,7 @@ def test_main_fetches_tushare_with_a_rk_by_default():
         sys.executable,
         "scripts/fetch_tushare_stock_list.py",
         "--a-rk",
+        "--etf",
     ]
     assert run.call_args_list[1].args[0] == [
         sys.executable,

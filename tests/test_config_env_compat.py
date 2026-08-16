@@ -218,6 +218,44 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_codex_generation_defaults_to_fail_closed_without_fallback_key(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "GENERATION_BACKEND": "codex_app_server",
+                "CODEX_MODEL": "gpt-codex-test",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.generation_backend, "codex_app_server")
+        self.assertEqual(config.generation_fallback_backend, "")
+        self.assertEqual(config.codex_model, "gpt-codex-test")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_codex_generation_requires_explicit_litellm_fallback(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "GENERATION_BACKEND": "codex_app_server",
+                "GENERATION_FALLBACK_BACKEND": "litellm",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.generation_fallback_backend, "litellm")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_generation_backend_env_clamps_phase2_numeric_maxima(
         self, _mock_parse_litellm_yaml, _mock_setup_env
     ):

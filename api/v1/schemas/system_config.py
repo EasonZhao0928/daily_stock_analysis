@@ -133,7 +133,7 @@ class GenerationBackendStatus(BaseModel):
     """
 
     backend_id: str
-    backend_type: Literal["litellm", "local_cli"]
+    backend_type: Literal["litellm", "local_cli", "codex_app_server"]
     provider_id: str
     available: bool
     health_status: GenerationBackendHealthStatus = "not_tested"
@@ -145,6 +145,7 @@ class GenerationBackendStatus(BaseModel):
     fallback_target: Optional[str] = None
     max_concurrency: int
     usage_available: bool
+    cost_status: Optional[str] = None
     last_error_code: Optional[str] = None
     last_error_message: Optional[str] = None
 
@@ -157,6 +158,13 @@ class GenerationBackendStatusResponse(BaseModel):
     primary: GenerationBackendStatus
     fallback: Optional[GenerationBackendStatus] = None
     backends: List[GenerationBackendStatus] = Field(default_factory=list)
+    generation: Dict[str, Any] = Field(default_factory=dict)
+    agent: Dict[str, Any] = Field(default_factory=dict)
+    fallback_policy: Dict[str, Any] = Field(default_factory=dict)
+    unified_codex_effective: bool = False
+    codex_model: Optional[str] = None
+    codex: Dict[str, Any] = Field(default_factory=dict)
+    capability_exceptions: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentBackendStatusResponse(BaseModel):
@@ -207,6 +215,7 @@ class TestGenerationBackendRequest(BaseModel):
     items: List[SystemConfigUpdateItem] = Field(default_factory=list)
     mask_token: str = "******"
     timeout_seconds: Optional[float] = Field(default=None, ge=1.0, le=3600.0)
+    confirm_quota_risk: bool = False
 
 
 class TestGenerationBackendResponse(BaseModel):
@@ -216,6 +225,16 @@ class TestGenerationBackendResponse(BaseModel):
     mode: GenerationBackendSmokeMode
     message: str
     status: GenerationBackendStatus
+    requires_confirmation: bool = False
+    quota_risk: Dict[str, Any] = Field(default_factory=dict)
+    scope: Dict[str, bool] = Field(default_factory=dict)
+
+
+class CodexQuickCheckRequest(BaseModel):
+    """Optional unsaved draft for a no-model Codex account/protocol check."""
+
+    items: List[SystemConfigUpdateItem] = Field(default_factory=list)
+    mask_token: str = "******"
 
 
 class UpdateSystemConfigRequest(BaseModel):
@@ -350,6 +369,19 @@ class TestNotificationChannelResponse(BaseModel):
     retryable: bool = False
     latency_ms: Optional[int] = None
     attempts: List[NotificationTestAttempt] = Field(default_factory=list)
+
+
+class WeChatChannelStatusResponse(BaseModel):
+    """Credential-free status for the personal WeChat iLink channel."""
+
+    enabled: bool
+    base_url_configured: bool
+    token_ref_configured: bool
+    credential_configured: bool
+    allowlist_count: int = 0
+    poll_timeout_ms: int = 30000
+    ready: bool
+    message: str
 
 
 class DiscoverLLMChannelModelsRequest(BaseModel):

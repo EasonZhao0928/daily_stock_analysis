@@ -16,3 +16,15 @@ following notice applies to the files identified below.
 The included code has been modified and integrated into
 `daily_stock_analysis`. Per-file headers identify the source revision and
 modification status.
+
+## a-stock-data (reference only)
+
+- Project: a-stock-data
+- Source: https://github.com/simonlin1212/a-stock-data
+- Referenced revision: `3a3149dedbe30cda58b5c94387039d7e707cedcd`
+- License: Apache License 2.0 (reference checkout: `LICENSE`)
+- Use in DSA: endpoint knowledge, field aliases, failure cases and redacted
+  fixtures. The DSA adapters under `data_provider/` are independent rewrites;
+  no executable code or long provider payload from the reference is copied.
+- Modification statement: all DSA files carrying this reference header are
+  newly authored for DSA's DataEnvelope, supplier runtime and Evidence store.
