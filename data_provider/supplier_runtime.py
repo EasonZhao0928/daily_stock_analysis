@@ -135,6 +135,8 @@ DEFAULT_SUPPLIER_POLICIES: Mapping[str, SupplierPolicy] = {
     "tushare": SupplierPolicy(max_concurrency=2, min_interval_seconds=0.1, jitter_seconds=0.02),
     "yahoo": SupplierPolicy(max_concurrency=3, min_interval_seconds=0.05, jitter_seconds=0.02),
     "tickflow": SupplierPolicy(max_concurrency=3, min_interval_seconds=0.05, jitter_seconds=0.02),
+    "cninfo": SupplierPolicy(max_concurrency=2, min_interval_seconds=0.2, jitter_seconds=0.05),
+    "szse": SupplierPolicy(max_concurrency=2, min_interval_seconds=0.2, jitter_seconds=0.05),
 }
 
 

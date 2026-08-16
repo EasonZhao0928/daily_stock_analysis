@@ -118,11 +118,98 @@ class AkshareExtendedSource:
         return self._call_first(candidates.get(capability, ()))
 
 
+class CninfoAnnouncementSource:
+    """巨潮资讯网公告直连——announcement 能力的独立备胎。
+
+    与 ``AkshareExtendedSource`` 的东财路径（``stock_notice_report``）走完全不同的
+    上游域名与限流面（巨潮 vs 东财），东财被限流时不会一起失效。
+    只承接 ``announcement`` 能力；其余能力立即抛出，不发起网络请求，交给列表里的
+    下一个 source（通常是 akshare）处理，代价可忽略。
+    """
+
+    name = "cninfo"
+    source_tier = "official"
+
+    _TIMEOUT_SECONDS = 10.0
+
+    def fetch(self, query: DataQuery, *, statement_type: str = "", **_kwargs: Any) -> Any:
+        if query.capability != "announcement":
+            raise ValueError(f"CninfoAnnouncementSource does not support capability={query.capability!r}")
+
+        from .screening_sources import cninfo_resolve_org_id, fetch_cninfo_announcements
+
+        exchange = (query.security_id.exchange or "").upper()
+        code = query.security_id.canonical_code
+        org_id = cninfo_resolve_org_id(code, timeout=self._TIMEOUT_SECONDS)
+        if not org_id:
+            raise ValueError(f"cninfo could not resolve orgId for {code!r}")
+        return fetch_cninfo_announcements(code, org_id, exchange, timeout=self._TIMEOUT_SECONDS)
+
+
+class SinaCapitalFlowSource:
+    """新浪资金流直连——capital_flow 能力的独立备胎（东财主源被限流时降级使用）。
+
+    东财（``stock_individual_fund_flow``）仍是 capital_flow 的默认主源，新浪只在
+    东财失败时才被尝试；两者走不同上游域名与限流面。只承接 ``capital_flow`` 能力，
+    其余能力立即抛出，不发起网络请求。
+    """
+
+    name = "sina"
+    source_tier = "backup"
+
+    _TIMEOUT_SECONDS = 10.0
+
+    def fetch(self, query: DataQuery, *, statement_type: str = "", **_kwargs: Any) -> Any:
+        if query.capability != "capital_flow":
+            raise ValueError(f"SinaCapitalFlowSource does not support capability={query.capability!r}")
+
+        from .screening_sources import fetch_sina_capital_flow
+
+        exchange = (query.security_id.exchange or "").upper()
+        code = query.security_id.canonical_code
+        return fetch_sina_capital_flow(code, exchange, timeout=self._TIMEOUT_SECONDS)
+
+
+class SzseDragonTigerSource:
+    """深交所官方直连——dragon_tiger 能力的独立备胎（东财主源被限流时降级使用）。
+
+    东财（``stock_lhb_detail_em``）仍是默认主源，深交所只在东财失败时才被尝试。
+    龙虎榜本质是"当日全市场上榜列表"而不是按单只标的查询——这一点沿用了现有
+    ``AkshareExtendedSource`` 的既有语义（它同样忽略 ``query.security_id``，
+    只按 ``query.as_of`` 取当日全部上榜记录）。只覆盖深市，上交所暂无结构化
+    公开接口（详见 screening_sources.py 里的说明），只承接 ``dragon_tiger`` 能力，
+    其余能力立即抛出，不发起网络请求。
+    """
+
+    name = "szse"
+    source_tier = "backup"
+
+    _TIMEOUT_SECONDS = 10.0
+
+    def fetch(self, query: DataQuery, *, statement_type: str = "", **_kwargs: Any) -> Any:
+        if query.capability != "dragon_tiger":
+            raise ValueError(f"SzseDragonTigerSource does not support capability={query.capability!r}")
+
+        from .screening_sources import fetch_szse_dragon_tiger
+
+        cutoff = query.as_of.date() if isinstance(query.as_of, datetime) else query.as_of
+        trade_date = cutoff or date.today()
+        return fetch_szse_dragon_tiger(trade_date, timeout=self._TIMEOUT_SECONDS)
+
+
 class ExtendedCapabilityAdapter:
     """Route extended capabilities through independently replaceable sources."""
 
     def __init__(self, sources: Optional[Mapping[str, Any]] = None) -> None:
-        self._sources = dict(sources or {"akshare": AkshareExtendedSource()})
+        self._sources = dict(
+            sources
+            or {
+                "cninfo": CninfoAnnouncementSource(),
+                "akshare": AkshareExtendedSource(),
+                "sina": SinaCapitalFlowSource(),
+                "szse": SzseDragonTigerSource(),
+            }
+        )
 
     def fetch(self, query: DataQuery, policy: SourcePolicy) -> DataEnvelope:
         if query.capability not in EXTENDED_CAPABILITIES:

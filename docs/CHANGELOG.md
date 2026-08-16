@@ -48,6 +48,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] Generation backend 状态页新增 generation/Agent 组合状态、Codex 平台/协议/账号/rate-limit quick check、vision/Deep Research 能力例外和 Codex smoke 额度确认；quick-check 不发送模型 turn，smoke 默认要求显式确认。
 - [修复] 用户验收问题收敛：Codex Agent 暴露 28 个取消安全的研究/持仓只读工具并修正 setup 状态，Paper 空代码改为显式加载且不因输入打开 SSE，Shadow 查询增加日期范围/防抖/有界数据源，ETF 50xxxx 识别和个人微信状态卡片补齐。
 - [修复] 继续收敛 Paper/Shadow/分析失败路径：Paper 表单和侧栏增加响应式宽度约束，Shadow 日期窗口统一为 ISO 并将单源默认超时设为 15 秒；Codex unified preset 不再把普通个股/ETF 报告误路由到旧 LiteLLM Agent。
+- [新功能] 新增 `scripts/benchmark_data_sources.py`，逐一独立测试常驻数据源的日线获取成功率与延迟（不经过自动 fallback），支持 `--label` 区分本地/服务器等环境产出，用于数据源优先级调整前的决策依据。
+- [新功能] A 股大盘复盘新增财联社电报（`ak.stock_info_global_cls`）作为新闻补充信息源，与现有 SearXNG 通用搜索并列追加，不依赖任何搜索 API Key，即使未配置搜索服务也能提供基础新闻覆盖。
+- [改进] 扩展能力（`EXTENDED_MARKET_DATA_ENABLED`）里的公告（announcement）能力新增巨潮资讯网直连作为默认主源，东财 `stock_notice_report` 降级为独立备胎，两者走不同域名与限流面，东财被限流时公告能力不再跟着一起不可用。
+- [改进] 扩展能力里的资金流（capital_flow）能力新增新浪资金流直连作为独立备胎（东财 `stock_individual_fund_flow` 仍是默认主源），东财被限流时自动降级到新浪，不再直接返回不可用。
+- [改进] 扩展能力里的龙虎榜（dragon_tiger）能力新增深交所官方直连作为独立备胎（东财 `stock_lhb_detail_em` 仍是默认主源，覆盖沪深两市；新备胎仅覆盖深市），东财被限流时深市龙虎榜数据可自动降级。
+- [改进] 大盘复盘本次未获取到任何新闻资讯时，报告开头会显式提示"本次未获取到有效新闻资讯"，不再让读者误以为消息面判断有真实资讯支撑却无从得知；同时修正 `search_market_news` 中间日志的措辞，避免和最终新闻总数混淆。
 
 ## [3.30.0] - 2026-08-09
 
