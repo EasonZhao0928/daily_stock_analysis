@@ -1,9 +1,9 @@
-# 数据源审计与优化配置方案（零代码）
+# 数据源审计与优化方案
 
-> 适用范围：本方案只调整启动环境 / `.env` 环境变量 / 调度（yaml）配置 / 运维 SOP，**不修改任何 `.py` 代码**。
+> 本文档是**零代码配置方案**（只调整启动环境 / `.env` / 调度配置 / 运维 SOP，不改 `.py`，其中 5.1 的代理豁免已在本机验证生效）。涉及真实代码改动的架构演进实施计划已抽出到独立文档 [`docs/data_source_architecture_roadmap.md`](./data_source_architecture_roadmap.md)（第 8 节留了指向它的入口）。
 > 依据：`data_provider/` 全量静态核查（12 个 Fetcher + 供应商域族治理层）+ 今日实测日志
 > `logs/api_server_20260816.log`（288KB，覆盖 01:10–12:32）与
-> `logs/api_server_debug_20260816.log`（覆盖至 13:22）+ `.env` / `src/config.py` 实际取值核对。
+> `logs/api_server_debug_20260816.log`（覆盖至 13:22）+ `.env` / `src/config.py` 实际取值核对 + 本地 `a-stock-data` 参考 checkout（`/Users/coldenzyc/Trading Projects/a-stock-data`，revision `3a3149d`，与 `THIRD_PARTY_NOTICES.md` 记录的引用版本一致）。
 > 上一版方案中关于 Skill 通道的结论未能在本仓库当前环境复核，已在第 2 节改写为待验证事项，请勿直接照搬执行。
 
 ---
@@ -143,6 +143,14 @@ EfinanceFetcher(代理失败，~2-3s) → AkshareFetcher 东财分支(代理失�
 
 外加 Baostock 一处不影响今日整体成功率、但影响可观测性的代码缺陷（4.4），建议记录为独立 `fix` 任务。
 
+### 4.6 本机代理修复的实测结果（已验证，部分生效）
+
+已按 5.1 把 `USE_PROXY=true`/`PROXY_HOST=127.0.0.1`/`PROXY_PORT=1082` 写入本机 `.env`（激活 `src/config.py` 里原本就存在但从未被触发的智能 NO_PROXY 逻辑），并顺手在 `domestic_domains` 里补了 `gtimg.cn`（腾讯）、`10jqka.com.cn`（同花顺），用真实 `python main.py --stocks 600519 --dry-run --force-run` 验证：
+
+- `ProxyError: Unable to connect to proxy` **完全消失**——应用层不再尝试连本地代理 `127.0.0.1:1082`。
+- 但 `push2.eastmoney.com` 直连仍然出现 `RemoteDisconnected`，板块排行靠 Akshare 内部切新浪才成功（约 13 秒）。根因是本机除了系统级 HTTP 代理，还有一个 `utun8` TUN 接口接管了默认路由（`netstat -nr` 确认）——NO_PROXY 只影响应用层"要不要走 127.0.0.1:1082 这一跳"，不影响操作系统路由表本身，TUN 模式下"直连"的包仍会被送进 VPN 隧道。
+- **结论**：本机场景下，`.env` 代理豁免只解决了"本地代理握手失败"这一层，`utun8` 路由劫持这一层必须在 VPN 客户端里给国内数据域名/GeoIP-CN 加直连规则才能解决，本方案管不到（不是本仓库配置能解决的问题）。**这台本机的验证结果不能直接当作生产基线**——目标是中国大陆服务器部署，服务器上没有本地 VPN/TUN，这套代理豁免逻辑届时大概率完全用不上（`USE_PROXY` 默认 `false` 即可），只有当服务器选择的 LLM 后端需要代理时才会用到，参见 `docs/operations-server.md`。
+
 ---
 
 ## 5. 配置层优化建议（可立即执行）
@@ -229,3 +237,9 @@ TICKFLOW_KLINE_ADJUST=qfq    # 复权口径统一（none/forward/backward/forwar
 8. **核实真实兜底通道**：按 5.6 核实当前环境是否有可用的金融数据 MCP/Skill，写入运维 SOP 前先验证而非假设。
 9. **监控基线**：以今日日志为基线（Efinance 0/11、Pytdx 0/6、Akshare 5/6、Baostock 9/13、概念排行&筹码分布 0/8），复测后对比成功率 + 单标的耗时 + 概念排行/筹码分布是否恢复。
 10. **（超出本方案范围，建议另开 `fix` 任务跟踪）**：`BaostockFetcher.get_daily_data` 中 `bs.login()` 返回 `None` 时的判空处理（`data_provider/baostock_fetcher.py:112-114`）。
+
+---
+
+## 8. 架构演进建议：对标 `a-stock-data`
+
+> 已抽出为独立实施文档：[`docs/data_source_architecture_roadmap.md`](./data_source_architecture_roadmap.md)——涉及真实代码改动的分阶段实施计划（优先级哲学对齐、扩展能力去单点备胎、可复用 akshare 现成函数补齐的信息源、需要产品决策的缺口），本文档只保留零代码诊断与配置部分。
