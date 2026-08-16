@@ -28,6 +28,7 @@ from src.llm.generation_backend import (  # noqa: E402
 )
 from src.llm.litellm_backend import LiteLLMGenerationBackend  # noqa: E402
 from src.llm.local_cli_backend import LocalCliGenerationBackend  # noqa: E402
+from src.llm.codex_app_server_backend import CodexAppServerGenerationBackend  # noqa: E402
 
 
 def _config(**overrides):
@@ -89,6 +90,10 @@ def test_generation_error_codes_include_phase2_values() -> None:
         "interactive_prompt_required",
         "approval_required",
         "login_required",
+        "rate_limit_exceeded",
+        "cancelled",
+        "protocol_error",
+        "process_failed",
         "capability_unsupported",
         "unsafe_config",
         "unknown_backend_error",
@@ -196,6 +201,12 @@ def test_generation_backend_factory_dispatches_litellm_and_local_cli_backends() 
         assert isinstance(local_backend, LocalCliGenerationBackend)
         assert local_backend.preset_id == backend_id
 
+    codex_backend = create_generation_backend(
+        "codex_app_server",
+        config=_config(generation_backend="codex_app_server", generation_fallback_backend=""),
+    )
+    assert isinstance(codex_backend, CodexAppServerGenerationBackend)
+
 
 def test_resolvers_default_to_litellm_and_self_fallback_is_noop() -> None:
     config = _config(
@@ -257,6 +268,7 @@ def test_unknown_generation_backend_raises_structured_config_error() -> None:
     assert error.details["requested_backend"] == "codex"
     assert error.details["supported_backends"] == [
         "claude_code_cli",
+        "codex_app_server",
         "codex_cli",
         "litellm",
         "opencode_cli",
@@ -268,6 +280,13 @@ def test_codex_cli_generation_backend_can_fallback_to_litellm() -> None:
 
     assert resolve_generation_backend_id(config) == "codex_cli"
     assert resolve_generation_fallback_backend_id(config) == "litellm"
+
+
+def test_codex_app_server_generation_backend_is_supported_and_defaults_without_fallback() -> None:
+    config = _config(generation_backend="codex_app_server", generation_fallback_backend="")
+
+    assert resolve_generation_backend_id(config) == "codex_app_server"
+    assert resolve_generation_fallback_backend_id(config) is None
 
 
 def test_claude_code_cli_is_supported_generation_backend() -> None:

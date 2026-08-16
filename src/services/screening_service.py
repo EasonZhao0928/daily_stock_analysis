@@ -30,6 +30,13 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from src.config import Config, get_configured_llm_models, normalize_llm_channel_api_surface
+from src.llm.backend_registry import (
+    CODEX_APP_SERVER_BACKEND_ID,
+    LITELLM_BACKEND_ID,
+    resolve_generation_backend_id,
+    resolve_generation_fallback_backend_id,
+)
+from src.llm.backend_factory import create_generation_backend
 from src.services.screening import REFERENCE_PROJECT, REFERENCE_REVISION, __version__ as SCREENING_VERSION
 from src.services.screening import hotspot as screening_hotspot
 from src.services.screening.config import Config as ScreeningPipelineConfig
@@ -1882,10 +1889,25 @@ def _build_screening_runtime_env(config: Config, *, max_results: Optional[int] =
         put(key, value)
 
     litellm_model, fallback_models = _resolve_screening_llm_models(config)
+    try:
+        generation_backend = resolve_generation_backend_id(config)
+    except Exception:
+        generation_backend = LITELLM_BACKEND_ID
+    if generation_backend == CODEX_APP_SERVER_BACKEND_ID:
+        litellm_model = str(getattr(config, "codex_model", "") or "codex").strip() or "codex"
+        fallback_models = []
     put("LITELLM_MODEL", litellm_model)
     if fallback_models:
         put("LITELLM_FALLBACK_MODELS", ",".join(fallback_models))
     put("LITELLM_CONFIG", config.litellm_config_path)
+    put("GENERATION_BACKEND", generation_backend)
+    try:
+        fallback_backend = resolve_generation_fallback_backend_id(config)
+    except Exception:
+        fallback_backend = None
+    if fallback_backend:
+        put("GENERATION_FALLBACK_BACKEND", fallback_backend)
+    put("CODEX_MODEL", getattr(config, "codex_model", ""))
     if os.getenv("LLM_TEMPERATURE") not in (None, ""):
         put("LLM_TEMPERATURE", config.llm_temperature)
 
@@ -2888,6 +2910,20 @@ def _build_screening_context(config: Config, *, max_results: Optional[int] = Non
     # 参见 https://docs.litellm.ai/docs/proxy/configs#the-model_list-key
     channels = _normalize_dsa_llm_channels(config)
     litellm_model, fallback_models = _resolve_screening_llm_models(config)
+    try:
+        generation_backend_id = resolve_generation_backend_id(config)
+    except Exception:
+        generation_backend_id = LITELLM_BACKEND_ID
+    generation_backend = None
+    if generation_backend_id != LITELLM_BACKEND_ID:
+        generation_backend = create_generation_backend(
+            generation_backend_id,
+            config=config,
+        )
+    try:
+        generation_fallback_backend_id = resolve_generation_fallback_backend_id(config)
+    except Exception:
+        generation_fallback_backend_id = None
     return {
         "llm": {
             "model": litellm_model,
@@ -2917,6 +2953,8 @@ def _build_screening_context(config: Config, *, max_results: Optional[int] = Non
             "get_daily_history": get_dsa_daily_history,
             "get_realtime_quote": get_dsa_realtime_quote,
             "get_fundamental_context": get_dsa_fundamental_context,
+            "generation_backend": generation_backend,
+            "generation_fallback_backend_id": generation_fallback_backend_id,
         },
     }
 

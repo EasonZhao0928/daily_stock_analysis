@@ -21,7 +21,7 @@ import time
 from threading import BoundedSemaphore, RLock, Thread, local
 from abc import ABC, abstractmethod
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Callable, Optional, List, Tuple, Dict, Any, Mapping
 
 import pandas as pd
@@ -165,7 +165,10 @@ def normalize_stock_code(stock_code: str) -> str:
     return code
 
 
-ETF_PREFIXES = ("51", "52", "56", "58", "15", "16", "18")
+# Keep the provider-facing helper aligned with the canonical SecurityId
+# classifier.  50xxxx is a Shanghai fund/ETF family still present in index
+# and fund lists.
+ETF_PREFIXES = _security_id.ETF_PREFIXES
 
 
 def _is_us_market(code: str) -> bool:
@@ -1346,8 +1349,20 @@ class DataFetcherManager:
 
     @staticmethod
     def _window_date_text(value: Any) -> str:
-        """Render a query bound as the ``YYYYMMDD`` form fetchers expect."""
-        return value.strftime("%Y%m%d")
+        """Render a query bound as the canonical ``YYYY-MM-DD`` text.
+
+        ``DataQuery`` stores date bounds as ``date`` or timezone-aware
+        ``datetime`` values.  The provider contract is ISO date text; a
+        compact ``YYYYMMDD`` value is only appropriate for individual
+        upstream APIs and is normalized inside those adapters.  Passing the
+        compact form here made Baostock/YFinance/Tencent/Tickflow reject a
+        valid Shadow Research window before fallback routing could finish.
+        """
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        return str(value)
 
     @staticmethod
     def _capability_window_kwargs(method: Any, query: DataQuery) -> Dict[str, Any]:

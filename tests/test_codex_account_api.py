@@ -24,6 +24,21 @@ def _codex_config():
     )
 
 
+def _generation_codex_config():
+    """Config with Codex selected for reports while Agent remains automatic."""
+    config = SimpleNamespace(
+        agent_backend="auto",
+        agent_arch="single",
+        agent_orchestrator_timeout_s=30,
+        _agent_mode_explicit=False,
+        agent_mode=True,
+        generation_backend="codex_app_server",
+        generation_fallback_backend="",
+    )
+    config.is_agent_available = lambda: True
+    return config
+
+
 class _FakeTransport:
     process = None
 
@@ -155,3 +170,9 @@ def test_account_api_maps_service_errors_to_structured_http_error() -> None:
     assert caught.value.status_code == 409
     assert caught.value.detail == {"error": "login_required", "message": "login required"}
     service.close()
+
+
+def test_account_api_allows_generation_codex_without_agent_codex() -> None:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(agent_endpoint, "get_config", _generation_codex_config)
+        agent_endpoint._require_codex_account_backend()

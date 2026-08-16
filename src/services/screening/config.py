@@ -158,6 +158,9 @@ class Config:
     """Runtime configuration, loaded from env vars."""
 
     # LLM
+    generation_backend: str = "litellm"
+    generation_fallback_backend: str = ""
+    codex_model: str = ""
     llm_api_key: str = ""
     llm_model: str = DEFAULT_LLM_MODEL
     llm_base_url: str = ""
@@ -254,7 +257,9 @@ class Config:
     snapshot_fallback_max_age_hours: float | None = None
 
     def has_llm_config(self) -> bool:
-        """Return whether any supported LiteLLM configuration is present."""
+        """Return whether any configured Generation backend can be used."""
+        if self.generation_backend and self.generation_backend != "litellm":
+            return True
         return any([
             bool(self.llm_api_key),
             bool(self.llm_base_url and self.llm_model.startswith("ollama/")),
@@ -281,6 +286,9 @@ class Config:
             or data_dir / "industry_provider_cache"
         )
         return cls(
+            generation_backend=os.getenv("GENERATION_BACKEND", "litellm").strip().lower() or "litellm",
+            generation_fallback_backend=os.getenv("GENERATION_FALLBACK_BACKEND", "").strip().lower(),
+            codex_model=os.getenv("CODEX_MODEL", "").strip(),
             llm_api_key=_resolve_llm_api_key(llm_model),
             llm_model=llm_model,
             llm_base_url=_resolve_llm_base_url(llm_model),

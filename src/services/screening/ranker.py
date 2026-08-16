@@ -7,11 +7,20 @@ import copy
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from src.config import apply_litellm_api_surface
 from src.llm.errors import call_litellm_with_param_recovery
 from src.llm.generation_params import apply_litellm_generation_params
+from src.llm import litellm_transport as _litellm_transport
+from src.llm.generation_backend import (
+    GenerationCapabilities,
+    GenerationError,
+    GenerationErrorCode,
+    GenerationResult,
+)
 from src.services.screening.models import Pick
 from src.services.screening.normalize import (
     bounded_float as _bounded_float,
@@ -61,6 +70,100 @@ class LLMRankingResult:
             self.attempted_models = []
 
 
+class ScreeningLiteLLMGenerationBackend:
+    """Compatibility GenerationBackend for the bundled screening provider.
+
+    The ranker still has a provider-specific implementation for legacy
+    screening settings, but it is now reached through the same Generation
+    contract as Codex/local backends.  This keeps provider dispatch out of the
+    ranking loop while preserving channel, JSON-mode and fallback behavior.
+    """
+
+    backend_id = "litellm"
+    capabilities = GenerationCapabilities(
+        supports_json=True,
+        supports_tools=False,
+        supports_stream=False,
+        supports_vision=False,
+        supports_health_check=False,
+        supports_smoke_test=False,
+    )
+
+    def __init__(self, config: object):
+        self._config = config
+
+    def generate(
+        self,
+        prompt: str,
+        generation_config: dict[str, object],
+        *,
+        system_prompt: str | None = None,
+        stream: bool = False,
+        stream_progress_callback=None,
+        response_validator=None,
+        audit_context=None,
+    ) -> GenerationResult:
+        del system_prompt, stream, stream_progress_callback, response_validator, audit_context
+        model = str(
+            generation_config.get("model")
+            or getattr(self._config, "llm_model", "")
+            or ""
+        ).strip()
+        if not model:
+            raise GenerationError(
+                error_code=GenerationErrorCode.BACKEND_NOT_CONFIGURED,
+                stage="configuration",
+                retryable=False,
+                fallbackable=False,
+                backend=self.backend_id,
+                provider=self.backend_id,
+                details={"reason": "missing_screening_model"},
+            )
+        json_mode = bool(generation_config.get("response_format"))
+        text = _call_llm(
+            prompt,
+            str(getattr(self._config, "llm_api_key", "") or ""),
+            model,
+            str(getattr(self._config, "llm_base_url", "") or ""),
+            fallback_models=[],
+            temperature=float(generation_config.get("temperature", 0.2) or 0.2),
+            json_mode=json_mode,
+            silent=bool(getattr(self._config, "llm_silent", True)),
+            channels=list(getattr(self._config, "llm_channels", []) or []),
+            config_path=str(getattr(self._config, "llm_config_path", "") or ""),
+            timeout_sec=float(generation_config.get("timeout", 60.0) or 60.0),
+            max_tokens=int(generation_config.get("max_output_tokens", 2048) or 2048),
+        )
+        return GenerationResult(
+            text=text,
+            model=model,
+            provider=model.split("/", 1)[0] if "/" in model else "openai",
+            backend=self.backend_id,
+            usage={"usage_available": False, "usage_source": "unavailable", "backend": self.backend_id},
+        )
+
+
+class _LegacyScreeningBackend(ScreeningLiteLLMGenerationBackend):
+    """Request-local compatibility adapter for direct ranker callers."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        silent: bool,
+        channels: list[dict[str, object]],
+        config_path: str,
+    ) -> None:
+        super().__init__(SimpleNamespace(
+            llm_api_key=api_key,
+            llm_base_url=base_url,
+            llm_channels=channels,
+            llm_config_path=config_path,
+            llm_silent=silent,
+        ))
+
+
 def rank_candidates(
     candidates: list[Pick],
     ranking_hints: str,
@@ -81,6 +184,8 @@ def rank_candidates(
     timeout_sec: float = 60.0,
     max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
     max_tokens: int | None = 2048,
+    generation_backend: object | None = None,
+    generation_fallback_backend: object | None = None,
 ) -> list[Pick]:
     """Use LLM to re-rank candidates and add ranking_reason / risk_summary.
 
@@ -105,6 +210,8 @@ def rank_candidates(
         timeout_sec=timeout_sec,
         max_prompt_chars=max_prompt_chars,
         max_tokens=max_tokens,
+        generation_backend=generation_backend,
+        generation_fallback_backend=generation_fallback_backend,
     ).picks
 
 
@@ -129,6 +236,8 @@ def rank_candidates_with_metadata(
     max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
     degradation: list[str] | None = None,
     max_tokens: int | None = 2048,
+    generation_backend: object | None = None,
+    generation_fallback_backend: object | None = None,
 ) -> LLMRankingResult:
     """Use LLM to re-rank candidates and return global research metadata."""
     if not candidates:
@@ -162,12 +271,12 @@ def rank_candidates_with_metadata(
                 # Keep transport/provider retries scoped to one model here. A
                 # syntactically successful but unusable response must also
                 # advance to the configured fallback model chain.
-                response = _call_llm(
+                response = _call_generation_backend(
+                    generation_backend,
                     attempt_prompt,
-                    llm_api_key,
                     candidate_model,
-                    llm_base_url,
-                    fallback_models=[],
+                    llm_api_key=llm_api_key,
+                    llm_base_url=llm_base_url,
                     temperature=temperature,
                     json_mode=json_mode,
                     silent=silent,
@@ -175,6 +284,7 @@ def rank_candidates_with_metadata(
                     config_path=config_path,
                     timeout_sec=timeout_sec,
                     max_tokens=max_tokens,
+                    fallback_backend=generation_fallback_backend,
                 )
             except Exception as exc:
                 failure_reason = "timeout" if _is_timeout_error(exc) else "call_failed"
@@ -514,6 +624,153 @@ def _truncate_text(value: str, limit: int) -> str:
     return text[: max(limit - 1, 0)] + "…"
 
 
+def _call_generation_backend(
+    backend: object | None,
+    prompt: str,
+    model: str,
+    *,
+    llm_api_key: str,
+    llm_base_url: str,
+    temperature: float,
+    json_mode: bool,
+    silent: bool,
+    channels: list[dict[str, object]],
+    config_path: str,
+    timeout_sec: float,
+    max_tokens: int | None,
+    fallback_backend: object | None,
+) -> str:
+    """Generate one ranking response through the injected backend seam."""
+
+    # Existing direct callers/tests do not provide a backend.  Build the
+    # compatibility adapter locally so the ranking algorithm has one call
+    # contract in both old LiteLLM and new Codex modes.
+    primary = backend or _LegacyScreeningBackend(
+        api_key=llm_api_key,
+        base_url=llm_base_url,
+        silent=silent,
+        channels=channels,
+        config_path=config_path,
+    )
+    generation_config: dict[str, object] = {
+        "model": model,
+        "temperature": temperature,
+        "timeout": timeout_sec,
+        "max_output_tokens": max_tokens or 2048,
+    }
+    if json_mode:
+        generation_config["response_format"] = {"type": "json_object"}
+
+    # Diagnostics are context-local and fail open when screening runs outside
+    # a DSA run context (for example, direct CLI usage in tests).
+    from src.services.run_diagnostics import record_llm_run, record_llm_run_started
+
+    primary_id = str(getattr(primary, "backend_id", "generation_backend"))
+    started_at = time.monotonic()
+    record_llm_run_started(
+        provider=primary_id,
+        model=model,
+        call_type="screening_rank",
+        business_entry="screening_rank",
+        primary_backend=primary_id,
+        effective_backend=primary_id,
+    )
+
+    def _record_result(
+        *,
+        success: bool,
+        backend_id: str,
+        attempt: int = 1,
+        fallback_from: str | None = None,
+        fallback_reason: str | None = None,
+        result: object | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        usage = getattr(result, "usage", None)
+        record_llm_run(
+            success=success,
+            provider=backend_id,
+            model=getattr(result, "model", None) or model,
+            call_type="screening_rank",
+            business_entry="screening_rank",
+            primary_backend=primary_id,
+            effective_backend=backend_id,
+            attempt=attempt,
+            status="fallback_success" if success and fallback_from else ("success" if success else "failed"),
+            fallback_from=fallback_from,
+            fallback_to=backend_id if fallback_from else None,
+            fallback_reason=fallback_reason,
+            usage_available=bool(usage),
+            tokens=(usage or {}).get("total_tokens") if isinstance(usage, dict) else None,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+            error_code=getattr(getattr(error, "error_code", None), "value", None),
+            error_type=type(error).__name__ if error is not None else None,
+            error_message=error,
+        )
+
+    result_backend_id = primary_id
+    result_attempt = 1
+    result_fallback_from = None
+    result_fallback_reason = None
+    try:
+        result = primary.generate(prompt, generation_config)
+    except GenerationError as exc:
+        if fallback_backend is None or not exc.fallbackable:
+            _record_result(success=False, backend_id=primary_id, error=exc)
+            raise
+        fallback_id = str(getattr(fallback_backend, "backend_id", "generation_backend"))
+        try:
+            result = fallback_backend.generate(prompt, generation_config)
+        except Exception as fallback_exc:
+            _record_result(
+                success=False,
+                backend_id=fallback_id,
+                attempt=2,
+                fallback_from=primary_id,
+                fallback_reason=exc.error_code.value,
+                error=fallback_exc,
+            )
+            raise
+        result_backend_id = fallback_id
+        result_attempt = 2
+        result_fallback_from = primary_id
+        result_fallback_reason = exc.error_code.value
+    except Exception as exc:
+        _record_result(success=False, backend_id=primary_id, error=exc)
+        raise
+    else:
+        result_backend_id = primary_id
+    text = str(getattr(result, "text", "") or "").strip()
+    if not text:
+        error = GenerationError(
+            error_code=GenerationErrorCode.EMPTY_OUTPUT,
+            stage="execution",
+            retryable=True,
+            fallbackable=True,
+            backend=primary_id,
+            provider=primary_id,
+            details={"reason": "empty_ranking_response"},
+        )
+        _record_result(
+            success=False,
+            backend_id=result_backend_id,
+            attempt=result_attempt,
+            fallback_from=result_fallback_from,
+            fallback_reason=result_fallback_reason,
+            error=error,
+        )
+        raise error
+    _record_result(
+        success=True,
+        backend_id=result_backend_id,
+        attempt=result_attempt,
+        fallback_from=result_fallback_from,
+        fallback_reason=result_fallback_reason,
+        result=result,
+    )
+    return text
+
+
 def _call_llm(
     prompt: str,
     api_key: str,
@@ -530,7 +787,7 @@ def _call_llm(
     max_tokens: int | None = 2048,
 ) -> str:
     """Call LLM via litellm with fallback models and channel configs."""
-    import litellm
+    litellm = _litellm_transport.provider_module()
 
     if silent:
         _silence_litellm_logs(litellm)
@@ -574,7 +831,7 @@ def _call_llm(
             )
             try:
                 response = _call_screening_litellm_completion(
-                    lambda request_kwargs: litellm.completion(**request_kwargs),
+                    lambda request_kwargs: _litellm_transport.completion(**request_kwargs),
                     model=candidate_model,
                     call_kwargs=kwargs,
                 )

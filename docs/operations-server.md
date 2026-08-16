@@ -2,6 +2,8 @@
 
 本文档描述当前仓库的非 Docker、Linux、systemd 部署路径，并补充服务器上的 Codex App Server 和 Caddy 公网反向代理。推荐的安全拓扑是：
 
+先明确 Codex 的部署边界：当前 DSA 的 `codex_app_server` 是**服务器本地启动 App Server、远端使用 ChatGPT OAuth/模型服务**。服务器仍需安装 `codex` 可执行文件；仅把 OAuth URL 或 token 写进 `.env` 不能让现有 DSA 直接调用远程 App Server。官方文档中的 WebSocket remote mode 目前是 experimental，且当前 DSA transport 只实现 stdio，因此不应把它当作本生产方案。
+
 ```text
 浏览器 ── HTTPS ──> Caddy :443/:80
                          │ reverse_proxy
@@ -22,7 +24,7 @@ Uvicorn 只监听 `127.0.0.1`；不要开放 8000，也不要把 Codex App Serve
 - `deploy/daily-stock-analysis.service.in`：普通用户运行、私有监听、自动重启的 unit 模板；
 - Codex App Server Agent、Paper Account、Shadow Research、Market Chart、Evidence 和个人微信 iLink 的代码与离线测试。
 
-仍需在目标服务器真实验收：provider/API 网络、Codex 登录、行情/通知凭据、Paper/Shadow 业务 smoke、域名 DNS、80/443 防火墙和 Caddy 自动证书。`/api/health` 返回成功只证明 Web 进程可响应，不代表 scheduler、模型、Codex、微信或公网代理全部工作。
+仍需在目标服务器真实验收：provider/API 网络、Codex 登录和真实模型、行情/通知凭据、Paper/Shadow 业务 smoke、域名 DNS、80/443 防火墙和 Caddy 自动证书。`/api/health` 返回成功只证明 Web 进程可响应，不代表 scheduler、模型、Codex、微信或公网代理全部工作。
 
 ## 2. SSH 登录、服务器密码和权限
 
@@ -62,6 +64,8 @@ sudo apt install -y git curl python3 python3-venv python3-pip nodejs npm
 ```
 
 推荐 Python 3.10+、Node.js 20.19+（推荐 Node 22 LTS）、npm 10+。如果发行版自带 Node 版本过旧，先按发行版规范升级 Node，再执行 DSA 部署。
+
+如果选择 `GENERATION_BACKEND=codex_app_server`、`AGENT_BACKEND=codex_app_server` 或 `GENERATION_BACKEND=codex_cli`，还要按官方 Codex CLI 安装方式给 `SERVICE_USER` 安装 `codex`；`scripts/deploy_personal.sh` 只安装 DSA/Python/前端依赖，不安装 Codex，也不会替你登录。
 
 创建应用目录并确保权限：
 
@@ -109,12 +113,24 @@ AGENT_BACKEND=auto
 AGENT_ARCH=single
 AGENT_ORCHESTRATOR_TIMEOUT_S=600
 
+# 如果使用 ChatGPT 订阅而不是 LiteLLM API，请改用第 7 节的统一 Codex 配置。
+# GENERATION_BACKEND=codex_app_server
+# GENERATION_FALLBACK_BACKEND=
+# GENERATION_BACKEND_TIMEOUT_SECONDS=300
+# GENERATION_BACKEND_MAX_OUTPUT_BYTES=1048576
+# GENERATION_BACKEND_MAX_CONCURRENCY=1
+# CODEX_MODEL=
+# AGENT_BACKEND=codex_app_server
+# AGENT_ARCH=single
+# CODEX_HOME=/home/dsa_user/.codex
+# PATH=/usr/local/bin:/usr/bin:/bin:/home/dsa_user/.local/bin
+
 DATABASE_PATH=./data/stock_analysis.db
 LOG_DIR=./logs
 LOG_LEVEL=INFO
 ```
 
-至少补齐：
+LiteLLM 基线至少补齐：
 
 1. `STOCK_LIST` 或其他股票列表来源；
 2. 一个经过验证的 LiteLLM/provider 渠道及 API key；
@@ -127,10 +143,11 @@ LOG_LEVEL=INFO
 
 | 分组 | 主要变量 | 服务器建议 |
 | --- | --- | --- |
-| 普通生成 | `GENERATION_BACKEND`、`GENERATION_FALLBACK_BACKEND`、`LITELLM_CONFIG`、`LLM_CHANNELS`、provider key | 先验证单个 provider，再启用 scheduler。 |
-| Agent App Server | `AGENT_BACKEND`、`AGENT_ARCH`、`AGENT_ORCHESTRATOR_TIMEOUT_S`、可选 `CODEX_HOME`/`PATH` | `AGENT_BACKEND=codex_app_server` 影响问股 Chat/Paper proposal；systemd 用户必须有自己的登录态。 |
-| Codex CLI generation | `GENERATION_BACKEND=codex_cli`、`GENERATION_BACKEND_TIMEOUT_SECONDS`、`GENERATION_FALLBACK_BACKEND` | 可以替换日报、个股分析和大盘复盘；generation-only、experimental/limited。 |
-| Paper/Shadow | `PAPER_AUTO_MODE_ENABLED`、`PAPER_SCHEDULER_ENABLED`、`EXTENDED_MARKET_DATA_ENABLED` | 先人工审批和单次 cycle；确认日志后再无人值守。 |
+| 普通生成 | `GENERATION_BACKEND`、`GENERATION_FALLBACK_BACKEND`、`GENERATION_BACKEND_TIMEOUT_SECONDS`、`GENERATION_BACKEND_MAX_OUTPUT_BYTES`、`GENERATION_BACKEND_MAX_CONCURRENCY`、`LITELLM_CONFIG`、`LLM_CHANNELS` | `litellm` 需要 provider/API key；`codex_app_server` 需要服务器本地 `codex` 和 ChatGPT managed login。 |
+| Codex 账号/进程 | `CODEX_MODEL`、`CODEX_HOME`、`PATH` | 只写模型覆盖、账号目录和 CLI 目录，不写 access/refresh token。systemd 的 `User=` 必须能读取 `CODEX_HOME`。 |
+| Agent App Server | `AGENT_BACKEND`、`AGENT_ARCH`、`AGENT_ORCHESTRATOR_TIMEOUT_S` | `AGENT_BACKEND=codex_app_server` 影响问股 Chat/Paper proposal；systemd 用户必须有自己的登录态。 |
+| Codex CLI generation | `GENERATION_BACKEND=codex_cli`、`GENERATION_BACKEND_TIMEOUT_SECONDS`、`GENERATION_FALLBACK_BACKEND` | 可以替换日报、个股分析和大盘复盘；需要 CLI，generation-only、experimental/limited。 |
+| Paper/Shadow | `PAPER_AUTO_MODE_ENABLED`、`PAPER_SCHEDULER_ENABLED`、`EXTENDED_MARKET_DATA_ENABLED`、`SHADOW_RESEARCH_SOURCE_PRIORITY`、`SHADOW_RESEARCH_SOURCE_TIMEOUT_SECONDS` | 先人工审批和单次 cycle；Shadow 默认跳过 Pytdx、每个日线源最多等待 15 秒；确认日志后再无人值守。 |
 | Runtime scheduler | `SCHEDULE_ENABLED`、`SCHEDULE_TIME(S)`、`SCHEDULE_RUN_IMMEDIATELY` | `full` 才会读取；只运行一个 service 实例。 |
 | Web/代理 | `WEBUI_HOST=127.0.0.1`、`WEBUI_PORT=8000`、`ADMIN_AUTH_ENABLED=true`、`TRUST_X_FORWARDED_FOR` | Caddy 是唯一公网入口；不开放 8000。 |
 | 数据/日志 | `DATABASE_PATH`、SQLite WAL/重试、`LOG_DIR`、`LOG_LEVEL` | 做备份，保证服务用户可写。 |
@@ -224,92 +241,99 @@ bash scripts/deploy_personal.sh
 
 ## 7. 在服务器上使用 Codex
 
-### 7.1 用 Codex CLI 生成日报/分析（可以）
+### 7.1 当前支持的服务器模式
 
-如果服务器上的目标是让普通日报、个股分析和大盘复盘也走 Codex，可以在 `.env` 中使用 generation backend：
+服务器上有三种选择：
+
+| 模式 | 服务器是否安装 `codex` | 账号/模型来源 | 适用范围 |
+| --- | ---: | --- | --- |
+| `GENERATION_BACKEND=litellm` | 否 | API provider/key | 不使用 ChatGPT 订阅，最容易自动化 |
+| `GENERATION_BACKEND=codex_cli` | 是 | CLI 当前登录态 | 普通 Generation，实验性、无 Agent ToolSurface |
+| `GENERATION_BACKEND=codex_app_server` | 是 | 官方 App Server managed ChatGPT OAuth/订阅 | 日报/复盘/筛选/轻量 Generation + Agent Chat/Paper |
+
+`codex_app_server` 不是把 DSA 直接连到一个公开“Codex OAuth API”；DSA 会在服务器上启动 `codex app-server --stdio`，由该进程与 ChatGPT 服务通信。因此服务器不安装 `codex` 时，当前实现无法运行 Generation 或 Agent 的 App Server 路径。
+
+### 7.2 统一 Codex（服务器推荐配置）
+
+如果服务器使用 ChatGPT 订阅而不是 LiteLLM API，在 `.env` 中写：
 
 ```dotenv
-GENERATION_BACKEND=codex_cli
+GENERATION_BACKEND=codex_app_server
 GENERATION_FALLBACK_BACKEND=
-GENERATION_BACKEND_TIMEOUT_SECONDS=600
+GENERATION_BACKEND_TIMEOUT_SECONDS=300
 GENERATION_BACKEND_MAX_OUTPUT_BYTES=1048576
-LOCAL_CLI_BACKEND_MAX_CONCURRENCY=1
+GENERATION_BACKEND_MAX_CONCURRENCY=1
+CODEX_MODEL=
 
-# 问股 Chat 仍是独立开关；需要 App Server Chat 时再设为 codex_app_server
-AGENT_BACKEND=auto
-```
+AGENT_BACKEND=codex_app_server
+AGENT_MODE=true
+AGENT_ARCH=single
+AGENT_ORCHESTRATOR_TIMEOUT_S=600
 
-这条路径每次启动受限的 Codex CLI 子进程，读取 DSA 已准备好的分析 prompt，返回文本/JSON 后由 DSA 继续解析和落库。它不会在生成过程中调用 DSA Tool Surface，不等同于 App Server Agent；当前没有完整 streaming/usage telemetry，并且 CLI 参数和版本属于 experimental/limited。服务器服务用户必须能找到并登录 `codex`，因此仍需完成下面的 CLI 可执行文件、PATH 和登录态检查。
-
-`GENERATION_FALLBACK_BACKEND=` 为空表示失败时不切回 LiteLLM；如果服务器同时配置了可用 API provider，可以写 `litellm` 作为兜底。修改后重启 systemd。
-
-### 7.2 服务器与本机是两个登录域
-
-Codex 必须安装、登录在**运行 DSA systemd 服务的服务器用户**上。桌面电脑的 Codex 登录态不会因为 Caddy、SSH 或 `.env` 自动复制到服务器；不要复制 credential 文件或 OAuth token。
-
-按照官方 Codex CLI 安装方式安装后，用服务用户验证：
-
-```bash
-sudo -u dsa_user -H sh -lc 'command -v codex && codex --version'
-```
-
-如果 systemd 用户不是 `dsa_user`，替换为 unit 中的 `User=`。`codex` 必须在该用户和 systemd 进程的 PATH 中；例如 CLI 装在用户目录时，可以在 `.env` 写目录路径（不要写 token）：
-
-```dotenv
-# 仅在 command -v codex 显示的路径不在 systemd 默认 PATH 时设置
+# 只在 CLI 不在 systemd 默认 PATH 时设置；不要写 $PATH 或 token
 PATH=/usr/local/bin:/usr/bin:/bin:/home/dsa_user/.local/bin
-# 仅指定 Codex 登录目录；token 仍由 Codex 自己保存
 CODEX_HOME=/home/dsa_user/.codex
 ```
 
-改动 PATH/CODEX_HOME 后重启 systemd，并再次验证：
+这组配置使受支持的普通生成走 `CodexAppServerGenerationBackend`，问股/Paper 走 `CodexAgentBackend`。普通问股 Chat 使用 `portfolio_readonly` 只读工具；Paper proposal 使用冻结 Observation 的独立 profile，输出后仍需人工审批。`GENERATION_FALLBACK_BACKEND=` 显式为空时 Codex 失败会 fail closed；只有明确接受 API 费用时才把它改为 `litellm`。
+
+### 7.3 安装并验证服务器 Codex（必须与 systemd 用户一致）
+
+按照官方 Codex CLI 安装方式安装到服务器，然后用 unit 中的 `User=` 验证。不要在桌面用户登录后复制 credential 文件：
 
 ```bash
+SERVICE_USER="$(sudo systemctl show -p User --value daily-stock-analysis)"
+sudo -u "$SERVICE_USER" -H sh -lc 'command -v codex && codex --version'
+sudo -u "$SERVICE_USER" -H sh -lc 'printf "CODEX_HOME=%s\n" "${CODEX_HOME:-<default>}"'
+```
+
+如果 CLI 位于用户目录，确认 `/etc/systemd/system/daily-stock-analysis.service` 的 `EnvironmentFile` 能读到 `.env` 中的绝对 `PATH`/`CODEX_HOME`，然后：
+
+```bash
+sudo systemctl daemon-reload
 sudo systemctl restart daily-stock-analysis
-sudo -u dsa_user -H env PATH="/usr/local/bin:/usr/bin:/bin:/home/dsa_user/.local/bin" codex --version
+sudo systemctl show daily-stock-analysis -p User -p Environment --no-pager
+sudo -u "$SERVICE_USER" -H env PATH="/usr/local/bin:/usr/bin:/bin:/home/dsa_user/.local/bin" codex --version
 ```
 
-### 7.3 启用 App Server 配置
+### 7.4 从公网 Web 完成远程 OAuth 登录
 
-在服务器 `.env` 中加入：
+OAuth 授权页面可以在你自己的电脑完成，但账号最终保存在服务器 `SERVICE_USER` 对应的 App Server/Codex 登录目录：
 
-```dotenv
-AGENT_BACKEND=codex_app_server
-AGENT_ARCH=single
-AGENT_ORCHESTRATOR_TIMEOUT_S=600
-```
-
-这只改变 Agent Chat；日报、复盘和 scheduler 仍由 `GENERATION_BACKEND` 控制。不要写 `GENERATION_BACKEND=codex_app_server`。
-
-### 7.4 从公网 Web 设置 App Server 登录
-
-Caddy 和 DSA 登录可用后，在自己的电脑浏览器完成：
-
-1. 打开 `https://<your-domain>/`，首次访问按页面提示设置管理员密码并登录。
-2. 进入「设置 → Agent 设置」，选择 Codex 本地 Agent，确认 single-agent 和 timeout。
-3. 查看账户状态；“可以尝试”不是“已登录”。
-4. 点击浏览器登录，若服务器不能打开浏览器则使用 device-code；把页面返回的授权 URL/验证码在自己的电脑完成。
-5. 登录成功后回到问股页发送一个无副作用的历史分析问题；成功完成才算真实链路通过。
+1. 先完成 Caddy、DSA 管理员登录和 `/api/health` 验证。
+2. 打开 `https://<your-domain>/`，进入「设置 → Generation/Agent 状态」。
+3. 点击 **quick check**；确认 `codex` binary、protocol、account/rate-limit 检查通过。它不发送模型 turn。
+4. 公网服务器优先选择 **device-code login**，在自己的浏览器打开返回的 `verification_url` 并输入 `user_code`。browser flow 需要 App Server 的本地 callback，跨机器时可能因 `localhost` 回调位置不一致而失败。
+5. 账号显示 authenticated 后，运行显式 Generation JSON smoke；页面会先提示额度风险，必须确认后才发送一次真实模型请求。
+6. 再发起无副作用的历史问股，确认 Agent SSE 成功、工具 profile 正确、日志无 token。
 
 App Server 是 DSA 后端启动的 `codex app-server --stdio` 子进程，不监听额外 TCP 端口。Caddy 只代理 DSA 的 HTTP/SSE API，绝不直接代理 Codex 进程。
 
-Codex 工具范围、状态语义、停止/超时清理和 single-agent 限制见 [LLM 配置指南](LLM_CONFIG_GUIDE.md)；官方协议见 [Codex App Server 文档](https://developers.openai.com/codex/app-server/)。
+设置页对应 `POST /api/v1/system/config/generation-backends/quick-check`（无模型）和 `POST /api/v1/system/config/generation-backends/smoke-test`（真实 text/JSON turn）；接口要求管理员会话和同源 CSRF，公网环境不要用未保护的裸 curl 代替设置页操作。
 
-### 7.5 登录态排错
+### 7.5 “服务器不安装 Codex”方案的当前结论
+
+当前不能通过环境变量实现。要实现它，需要新增一层远程 App Server transport：在另一台已登录机器运行 App Server WebSocket listener，DSA 通过 `wss://` 连接，并增加 TLS、bearer/capability token、重连、并发、断线和账号归属设计。
+
+官方文档确实描述了 `codex app-server --listen` / `codex --remote`，但同时明确 WebSocket transport 仍是 experimental、并不支持 production workloads；当前 DSA 代码也没有该 client。不要把 Vibe 的内部 OAuth/refresh-token/Responses endpoint 复制到服务器，这违反 ADR-0001/0006 的安全边界。
+
+### 7.6 服务器 Codex 排错和验收
 
 ```bash
 sudo journalctl -u daily-stock-analysis -n 200 --no-pager
-sudo systemctl show daily-stock-analysis -p User -p WorkingDirectory
-sudo -u dsa_user -H sh -lc 'command -v codex; codex --version; printf "CODEX_HOME=%s\n" "$CODEX_HOME"'
+sudo systemctl show daily-stock-analysis -p User -p WorkingDirectory -p Environment --no-pager
+SERVICE_USER="$(sudo systemctl show -p User --value daily-stock-analysis)"
+sudo ss -ltnp | grep -E ':(8000|4500)\b' || true
+sudo -u "$SERVICE_USER" -H sh -lc 'command -v codex; codex --version; printf "CODEX_HOME=%s\n" "${CODEX_HOME:-<default>}"'
 ```
 
 常见原因：
 
-- 在桌面用户登录了 Codex，但 systemd 用的是 `dsa_user`；
+- 在桌面用户登录了 Codex，但 systemd 用的是 `SERVICE_USER`；
 - `codex` 在 `/home/<user>/.local/bin`，systemd 的 PATH 找不到；
-- 服务器无出站网络/DNS，或 Codex 需要的网络策略被阻断；
-- `AGENT_ARCH` 不是 single，或 `AGENT_ORCHESTRATOR_TIMEOUT_S=0`；
-- 只看了设置页状态，没有发送真实问题验证模型/工具。
+- 服务器无出站网络/DNS，或 ChatGPT 登录回调被防火墙拦截；
+- `AGENT_ARCH` 不是 `single`，或 `AGENT_ORCHESTRATOR_TIMEOUT_S=0`；
+- 只看了设置页“可以尝试”，没有完成 device-code 和真实 Generation/Agent smoke。
 
 ## 8. 安装并配置 Caddy 公网反向代理
 
@@ -454,7 +478,72 @@ workflow 默认 `SERVICE_MODE=web`，不会因为 `.env` 误写 `SCHEDULE_ENABLE
 
 Actions 不会替服务器安装/登录 Codex，不会替个人微信扫码，也不会替你创建 Caddy/TLS；这些都必须在服务器上按本手册完成。
 
-## 11. 服务器上线验收清单
+## 11. 服务器外部验收与上线清单
+
+### 11.1 真实 OAuth / 模型调用
+
+按以下顺序验收，不要把 `/api/health` 当作模型验收：
+
+```bash
+sudo systemctl is-active --quiet daily-stock-analysis
+curl --fail http://127.0.0.1:8000/api/health
+SERVICE_USER="$(sudo systemctl show -p User --value daily-stock-analysis)"
+sudo -u "$SERVICE_USER" -H sh -lc 'command -v codex && codex --version'
+```
+
+然后在公网 Web「设置」中：
+
+1. 运行 Codex **quick check**，确认 binary、protocol、account 和 rate limits；这一步不消耗模型额度。
+2. 用 device-code 完成 ChatGPT OAuth（跨机器优先使用 device-code；browser flow 可能把 localhost callback 指向错误的机器）。
+3. 确认 account 为 authenticated、plan/rate limits 可读，且 UI/日志不出现 token。
+4. 运行显式 JSON smoke，先确认额度风险，再执行一次真实模型请求。
+5. 运行一个关闭通知、单标的的日报/复盘，检查 effective backend 为 `codex_app_server`。
+6. 发送一个只读历史问股，检查 Agent SSE、profile 工具、取消和超时清理。
+
+失败时查看：
+
+```bash
+sudo journalctl -u daily-stock-analysis -n 200 --no-pager
+sudo systemctl show daily-stock-analysis -p User -p WorkingDirectory -p Environment --no-pager
+```
+
+`GENERATION_FALLBACK_BACKEND=` 为空时，未登录、额度耗尽、进程失败和不支持能力都必须 fail closed；若日志出现 LiteLLM 调用，说明配置或路由验收失败。
+
+### 11.2 在线数据源
+
+在服务器本机执行至少一条行情接口，并在 Web Market 页面检查 source/stale/limitations：
+
+```bash
+curl --fail 'http://127.0.0.1:8000/api/v1/market/600519/candles?period=daily&limit=5'
+curl --fail 'http://127.0.0.1:8000/api/v1/market/600519/snapshot'
+```
+
+若启用了 Tushare、TickFlow、Longbridge、Futu 或搜索 provider，再执行一个真实日报/市场复盘并记录实际 source、权限、超时、fallback 和 stale 状态。认证中间件返回 401 时，在已登录 Web 中重复相同操作；不要用 health 代替数据源证据。
+
+### 11.3 CI 验收
+
+从开发机或有 GitHub CLI 权限的环境确认分支对应的 workflow 全部成功：
+
+```bash
+gh run list --workflow ci.yml --branch personal --limit 5
+gh run view <run-id> --log-failed
+gh run list --workflow deploy-personal.yml --branch personal --limit 5
+```
+
+至少确认 `backend-tests` 三个 shard、`backend-gate`、`web-gate`（以及本次变更触发的 Docker gate）为 `success`。CI 默认不需要真实 ChatGPT 凭据；部署 workflow 也不会代服务器安装/登录 Codex、完成微信扫码或配置 Caddy。
+
+### 11.4 systemd/Caddy/生产访问
+
+```bash
+sudo systemctl status daily-stock-analysis --no-pager
+sudo systemctl status caddy --no-pager
+curl --fail http://127.0.0.1:8000/api/health
+curl -I https://<your-domain>/
+curl --fail https://<your-domain>/api/health
+sudo ss -ltnp | grep -E ':(8000|4500)\b' || true
+```
+
+预期：DSA 只监听 `127.0.0.1:8000`，公网只看到 Caddy `:80/:443`，没有 Codex `:4500` 或其他 App Server TCP 监听；浏览器还需验证管理员认证、登录、Generation/Agent、SSE、Paper/Shadow、数据源和 scheduler 单实例。
 
 ```text
 [ ] SSH 普通用户登录成功；sudo -v 可以交互式验证密码
@@ -464,9 +553,12 @@ Actions 不会替服务器安装/登录 Codex，不会替个人微信扫码，�
 [ ] systemd User/Group、WorkingDirectory、SERVICE_MODE 已确认
 [ ] /api/health 本机返回成功，journal 无持续异常
 [ ] ADMIN_AUTH_ENABLED=true，初始密码已设置并能修改/重置
-[ ] LiteLLM/provider 做过最小真实问股或生成 smoke
-[ ] Codex（如启用）由同一 SERVICE_USER 登录，真实问股成功
+[ ] 选择 LiteLLM 时 provider 做过最小真实生成；选择 Codex 时 `codex` 由同一 SERVICE_USER 可执行
+[ ] Codex quick check、OAuth/device-code、额度确认 JSON smoke 和真实问股/日报均成功（如启用）
+[ ] `GENERATION_BACKEND` 与 `AGENT_BACKEND` 的 effective backend 与预期一致
+[ ] 在线行情/搜索/扩展数据按需做过真实调用，并记录 source/stale/fallback
 [ ] Paper/Shadow/Market/扩展数据按需做过最小 smoke
+[ ] CI 的 backend shards、backend-gate、web-gate 和相关 Docker gate 均 success
 [ ] full 模式只有一个 scheduler，SCHEDULE_RUN_IMMEDIATELY 符合预期
 [ ] DNS A/AAAA 指向服务器，云安全组和 UFW 允许 80/443/SSH
 [ ] Caddyfile validate 通过，Caddy active，HTTPS 证书有效
@@ -479,7 +571,7 @@ Actions 不会替服务器安装/登录 Codex，不会替个人微信扫码，�
 
 - DSA 公网入口是 Caddy HTTPS + DSA 管理员认证；不要仅依赖 CORS、隐藏路径或 `/docs` 关闭。
 - `TRUST_X_FORWARDED_FOR=true` 只在“一层可信 Caddy → DSA”时考虑；不要在直连公网时打开。
-- Codex App Server 登录态由 Codex 自己管理；不要上传/复制 credential 文件，不要在 Caddy 中暴露 App Server stdio。
+- Codex App Server 登录态由 Codex 自己管理；不要上传/复制 credential 文件，不要在 Caddy 中暴露 App Server stdio。当前 DSA 不支持远程 `wss://` App Server transport。
 - Paper/Shadow 是虚拟/研究账户，不提供实盘下单授权。
 - Codex 协议：[OpenAI Codex App Server](https://developers.openai.com/codex/app-server/)
 - Caddy 安装：[Install](https://caddyserver.com/docs/install)

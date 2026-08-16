@@ -4,6 +4,7 @@ import { toCamelCase } from './utils';
 import type {
   AgentBackendStatusPreviewRequest,
   AgentBackendStatusResponse,
+  CodexQuickCheckRequest,
   DiscoverLLMChannelModelsRequest,
   DiscoverLLMChannelModelsResponse,
   ExportSystemConfigResponse,
@@ -23,6 +24,7 @@ import type {
   TestGenerationBackendResponse,
   TestNotificationChannelRequest,
   TestNotificationChannelResponse,
+  WeChatChannelStatusResponse,
   UpdateSystemConfigRequest,
   UpdateSystemConfigResponse,
   ValidateSystemConfigRequest,
@@ -165,7 +167,17 @@ function toSnakeGenerationBackendSmokePayload(payload: TestGenerationBackendRequ
   if (payload.timeoutSeconds !== undefined && payload.timeoutSeconds !== null) {
     request.timeout_seconds = payload.timeoutSeconds;
   }
+  if (payload.confirmQuotaRisk !== undefined) {
+    request.confirm_quota_risk = payload.confirmQuotaRisk;
+  }
   return request;
+}
+
+function toSnakeCodexQuickCheckPayload(payload: CodexQuickCheckRequest = {}): Record<string, unknown> {
+  return {
+    items: (payload.items || []).map((item) => ({ key: item.key, value: item.value })),
+    mask_token: payload.maskToken ?? '******',
+  };
 }
 
 function toSnakeAgentBackendPayload(
@@ -217,6 +229,16 @@ export const systemConfigApi = {
     const response = await apiClient.post<Record<string, unknown>>(
       '/api/v1/system/config/generation-backends/status/preview',
       toSnakeGenerationBackendStatusPreviewPayload(payload),
+    );
+    return toCamelCase<GenerationBackendStatusResponse>(response.data);
+  },
+
+  async quickCheckGenerationBackends(
+    payload: CodexQuickCheckRequest = {},
+  ): Promise<GenerationBackendStatusResponse> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/system/config/generation-backends/quick-check',
+      toSnakeCodexQuickCheckPayload(payload),
     );
     return toCamelCase<GenerationBackendStatusResponse>(response.data);
   },
@@ -290,6 +312,13 @@ export const systemConfigApi = {
       toSnakeNotificationTestPayload(payload),
     );
     return toCamelCase<TestNotificationChannelResponse>(response.data);
+  },
+
+  async getWeChatChannelStatus(): Promise<WeChatChannelStatusResponse> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      '/api/v1/system/config/notification/wechat/status',
+    );
+    return toCamelCase<WeChatChannelStatusResponse>(response.data);
   },
 
   async discoverLLMChannelModels(

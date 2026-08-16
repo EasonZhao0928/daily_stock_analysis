@@ -40,6 +40,7 @@ from src.notification_contracts import (
 from src.services.stock_list_parser import split_stock_list
 from src.llm.backend_registry import (
     AUTO_AGENT_BACKEND_ID,
+    CODEX_APP_SERVER_BACKEND_ID,
     GENERATION_ONLY_BACKEND_IDS,
     LOCAL_CLI_GENERATION_BACKEND_IDS,
     LITELLM_BACKEND_ID,
@@ -903,6 +904,7 @@ class Config:
     generation_backend_max_concurrency: int = DEFAULT_GENERATION_BACKEND_MAX_CONCURRENCY
     local_cli_backend_max_concurrency: int = DEFAULT_LOCAL_CLI_BACKEND_MAX_CONCURRENCY
     opencode_cli_model: str = ""
+    codex_model: str = ""
     # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-3.1-pro-preview)
     litellm_model: str = ""  # Primary model; must include provider prefix when set explicitly
     litellm_fallback_models: List[str] = field(default_factory=list)  # Cross-model fallback list
@@ -1410,6 +1412,8 @@ class Config:
                 'szse.cn',         # 深交所
                 'csindex.com.cn',  # 中证指数
                 'cninfo.com.cn',   # 巨潮资讯
+                'gtimg.cn',        # 腾讯行情 (TencentFetcher)
+                '10jqka.com.cn',   # 同花顺 (screening_sources)
                 'localhost',
                 '127.0.0.1'
             ]
@@ -1631,7 +1635,14 @@ class Config:
         )
         _generation_fallback_raw = os.getenv('GENERATION_FALLBACK_BACKEND')
         if _generation_fallback_raw is None:
-            generation_fallback_backend = LITELLM_BACKEND_ID
+            # Preserve the legacy implicit LiteLLM fallback for existing
+            # generation backends, but make a newly selected Codex App Server
+            # fail closed unless the user explicitly opts into LiteLLM.
+            generation_fallback_backend = (
+                ""
+                if generation_backend == CODEX_APP_SERVER_BACKEND_ID
+                else LITELLM_BACKEND_ID
+            )
         else:
             generation_fallback_backend = _generation_fallback_raw.strip().lower()
         agent_generation_backend = (
@@ -1667,6 +1678,7 @@ class Config:
             maximum=MAX_LOCAL_CLI_BACKEND_MAX_CONCURRENCY,
         )
         opencode_cli_model = (os.getenv('OPENCODE_CLI_MODEL', '') or '').strip()
+        codex_model = (os.getenv('CODEX_MODEL', '') or '').strip()
 
         agent_litellm_model = normalize_agent_litellm_model(
             os.getenv('AGENT_LITELLM_MODEL', ''),
@@ -1822,6 +1834,7 @@ class Config:
             generation_backend_max_concurrency=generation_backend_max_concurrency,
             local_cli_backend_max_concurrency=local_cli_backend_max_concurrency,
             opencode_cli_model=opencode_cli_model,
+            codex_model=codex_model,
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
@@ -3222,6 +3235,19 @@ class Config:
                     ),
                     field="OPENCODE_CLI_MODEL",
                 ))
+        codex_model = (self.codex_model or "").strip()
+        if codex_model and (
+            any(ch.isspace() for ch in codex_model)
+            or any(marker in codex_model for marker in ("|", ">", "<", ";", "`", "&&", "||", "$"))
+        ):
+            issues.append(ConfigIssue(
+                severity="error",
+                message=(
+                    "CODEX_MODEL 是可选的 Codex 模型覆盖值，不能包含空白或 shell 元字符。"
+                    "不配置时 DSA 将使用已登录 Codex 账号的默认模型。"
+                ),
+                field="CODEX_MODEL",
+            ))
 
         # --- LLM availability ---
         for raw_issue in self.llm_channel_config_issues or []:
@@ -3236,7 +3262,10 @@ class Config:
         # Other LiteLLM-native providers (for example cohere/*) run through the
         # direct litellm env path and therefore do not populate llm_model_list.
         has_direct_env_model = bool(self.litellm_model) and _uses_direct_env_provider(self.litellm_model)
-        local_generation_backend = generation_backend in LOCAL_CLI_GENERATION_BACKEND_IDS
+        local_generation_backend = (
+            generation_backend in LOCAL_CLI_GENERATION_BACKEND_IDS
+            or generation_backend == CODEX_APP_SERVER_BACKEND_ID
+        )
         if not local_generation_backend and not self.llm_model_list and not has_direct_env_model:
             if self.litellm_config_path:
                 issues.append(ConfigIssue(

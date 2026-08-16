@@ -36,6 +36,8 @@ class ShadowApprovalRequest(BaseModel):
 
 class ShadowScanRequest(BaseModel):
     code: str = Field(..., min_length=1, max_length=16)
-    observations: List[Dict[str, Any]] = Field(..., min_length=1, max_length=5000)
+    observations: Optional[List[Dict[str, Any]]] = Field(None, min_length=1, max_length=5000)
+    market_data_start: Optional[date] = None
+    market_data_end: Optional[date] = None
     run_id: Optional[str] = None
     evidence_refs: List[Dict[str, Any]] = Field(default_factory=list, max_length=200)

@@ -67,6 +67,7 @@ from src.core.config_registry import (
 from src.llm.errors import call_litellm_with_param_recovery
 from src.llm.backend_registry import (
     AUTO_AGENT_BACKEND_ID,
+    CODEX_APP_SERVER_BACKEND_ID,
     CODEX_CLI_BACKEND_ID,
     GENERATION_ONLY_BACKEND_IDS,
     LOCAL_CLI_GENERATION_BACKEND_IDS,
@@ -138,6 +139,7 @@ class SystemConfigService:
         "GENERATION_BACKEND_MAX_CONCURRENCY",
         "LOCAL_CLI_BACKEND_MAX_CONCURRENCY",
         "OPENCODE_CLI_MODEL",
+        "CODEX_MODEL",
         "LITELLM_CONFIG",
         "LITELLM_MODEL",
         "LITELLM_FALLBACK_MODELS",
@@ -625,13 +627,13 @@ class SystemConfigService:
         }
 
     def get_generation_backend_status(self) -> Dict[str, Any]:
-        """Return cheap generation backend status for saved/runtime config only."""
+        """Return generation/Agent/Codex effective status without a model turn."""
         effective_map = self._build_generation_backend_base_map()
         service = GenerationBackendStatusService(
             effective_map=effective_map,
             validation_issues=self._collect_generation_backend_issues_from_map(effective_map),
         )
-        return service.get_status()
+        return service.quick_check()
 
     def preview_generation_backend_status(
         self,
@@ -652,7 +654,7 @@ class SystemConfigService:
             effective_map=effective_map,
             validation_issues=issues,
         )
-        return service.get_status()
+        return service.quick_check()
 
     def test_generation_backend(
         self,
@@ -662,6 +664,7 @@ class SystemConfigService:
         items: Sequence[Dict[str, str]] = (),
         mask_token: str = "******",
         timeout_seconds: Optional[float] = None,
+        confirm_quota_risk: bool = True,
     ) -> Dict[str, Any]:
         """Run an explicit generation backend smoke test without persisting config."""
         issues = self._collect_generation_backend_issues(items=items, mask_token=mask_token)
@@ -680,7 +683,33 @@ class SystemConfigService:
             backend_id=backend_id,
             mode=mode,
             timeout_seconds=timeout_seconds,
+            confirm_quota_risk=confirm_quota_risk,
         )
+
+    def quick_check_generation_backends(
+        self,
+        *,
+        items: Sequence[Dict[str, str]] = (),
+        mask_token: str = "******",
+    ) -> Dict[str, Any]:
+        """Run static/protocol/account checks for a saved or draft config.
+
+        This deliberately shares the status service with the regular status
+        endpoint.  It never calls ``GenerationBackend.generate`` and therefore
+        cannot consume a model request or create a report.
+        """
+        issues = self._collect_generation_backend_issues(items=items, mask_token=mask_token)
+        errors = [issue for issue in issues if issue["severity"] == "error"]
+        if errors:
+            raise ConfigValidationError(issues=errors)
+        effective_map = self._build_generation_backend_effective_map(
+            items=items,
+            mask_token=mask_token,
+        )
+        return GenerationBackendStatusService(
+            effective_map=effective_map,
+            validation_issues=issues,
+        ).quick_check()
 
     def get_agent_backend_status(self) -> Dict[str, Any]:
         """Return cheap Agent Chat backend status for saved/runtime config."""
@@ -3570,6 +3599,27 @@ class SystemConfigService:
             effective_map.get("GENERATION_BACKEND"),
             default=LITELLM_BACKEND_ID,
         )
+        if generation_backend == CODEX_APP_SERVER_BACKEND_ID:
+            if shutil.which("codex"):
+                return self._setup_check(
+                    "llm_primary",
+                    "LLM 主渠道",
+                    "ai_model",
+                    True,
+                    "configured",
+                    "已启用 Codex App Server Generation；将使用当前登录 Codex 账号的订阅额度。",
+                    "首次真实生成前请确认 Codex CLI 已登录；可在 Codex 状态页执行账号检查。",
+                )
+            return self._setup_check(
+                "llm_primary",
+                "LLM 主渠道",
+                "ai_model",
+                True,
+                "needs_action",
+                "已选择 Codex App Server，但后端 PATH 中找不到 codex 可执行文件。",
+                "请在运行 DSA 的后端设备安装并登录 Codex CLI，或将 GENERATION_BACKEND 设回 litellm。",
+            )
+
         if generation_backend in LOCAL_CLI_GENERATION_BACKEND_IDS:
             preset = resolve_local_cli_preset(generation_backend)
             if shutil.which(preset.executable):
@@ -3636,18 +3686,82 @@ class SystemConfigService:
             effective_map.get("GENERATION_BACKEND"),
             default=LITELLM_BACKEND_ID,
         )
+        # ``AGENT_BACKEND`` selects the Chat runtime.  It is intentionally
+        # separate from the legacy ``AGENT_GENERATION_BACKEND`` field, which
+        # only describes the LiteLLM/text route.  The previous setup check
+        # inspected the latter and therefore reported a false "missing Agent
+        # model" even when Codex App Server Agent was selected and healthy.
         agent_backend = normalize_backend_id(
+            effective_map.get("AGENT_BACKEND"),
+            default=AUTO_AGENT_BACKEND_ID,
+        )
+        agent_generation_backend = normalize_backend_id(
             effective_map.get("AGENT_GENERATION_BACKEND"),
             default=AUTO_AGENT_BACKEND_ID,
         )
-        if agent_backend in GENERATION_ONLY_BACKEND_IDS:
+        if agent_backend == CODEX_APP_SERVER_BACKEND_ID:
+            if str(effective_map.get("AGENT_MODE") or "").strip().lower() in {"0", "false", "no", "off"}:
+                return self._setup_check(
+                    "llm_agent",
+                    "Agent 渠道",
+                    "agent",
+                    True,
+                    "needs_action",
+                    "Codex Agent 已选择，但 AGENT_MODE 被显式关闭。",
+                    "将 AGENT_MODE 设为 true 后保存设置。",
+                )
+            if (effective_map.get("AGENT_ARCH") or "single").strip().lower() != "single":
+                return self._setup_check(
+                    "llm_agent",
+                    "Agent 渠道",
+                    "agent",
+                    True,
+                    "needs_action",
+                    "Codex Agent 当前只支持 single Agent 架构。",
+                    "将 AGENT_ARCH 设为 single 后保存设置。",
+                )
+            try:
+                timeout_value = int((effective_map.get("AGENT_ORCHESTRATOR_TIMEOUT_S") or "600").strip())
+            except (TypeError, ValueError):
+                timeout_value = 0
+            if timeout_value <= 0:
+                return self._setup_check(
+                    "llm_agent",
+                    "Agent 渠道",
+                    "agent",
+                    True,
+                    "needs_action",
+                    "Codex Agent 的整体时限必须大于 0。",
+                    "将 AGENT_ORCHESTRATOR_TIMEOUT_S 设为正整数后保存设置。",
+                )
+            if not shutil.which("codex"):
+                return self._setup_check(
+                    "llm_agent",
+                    "Agent 渠道",
+                    "agent",
+                    True,
+                    "needs_action",
+                    "已选择 Codex App Server，但后端 PATH 中找不到 codex 可执行文件。",
+                    "请在运行 DSA 的后端设备安装 Codex CLI；账号/协议状态请在 Agent 设置中刷新检查。",
+                )
+            return self._setup_check(
+                "llm_agent",
+                "Agent 渠道",
+                "agent",
+                True,
+                "configured",
+                "已启用 Codex App Server Agent；问股会使用 DSA 的只读 ToolSurface。",
+                "首次真实问股前请在 Agent 设置确认 Codex 已登录且协议检查通过。",
+            )
+
+        if agent_generation_backend in GENERATION_ONLY_BACKEND_IDS:
             return self._setup_check(
                 "llm_agent",
                 "Agent 渠道",
                 "agent",
                 True,
                 "needs_action",
-                f"Agent 工具调用暂不支持 {agent_backend} text-only backend。",
+                f"Agent 工具调用暂不支持 {agent_generation_backend} text-only backend。",
                 "请将 AGENT_GENERATION_BACKEND 设为 auto 或 litellm，并配置 LiteLLM 工具调用渠道。",
             )
 
@@ -3655,7 +3769,7 @@ class SystemConfigService:
         hermes_routes = set(self._collect_hermes_channel_models_from_map(effective_map))
         non_hermes_routes = set(self._collect_non_hermes_channel_models_from_map(effective_map))
         if not agent_model_raw:
-            if generation_backend in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if generation_backend in {CODEX_APP_SERVER_BACKEND_ID, *LOCAL_CLI_GENERATION_BACKEND_IDS}:
                 litellm_model, _source = self._resolve_setup_primary_model(effective_map)
                 if litellm_model:
                     if litellm_model in hermes_routes and litellm_model not in non_hermes_routes:
@@ -3678,7 +3792,7 @@ class SystemConfigService:
                         "configured",
                         f"普通分析使用 Codex CLI；Agent 工具调用仍使用 LiteLLM 主模型: {litellm_model}",
                     )
-                if agent_backend == LITELLM_BACKEND_ID:
+                if agent_generation_backend == LITELLM_BACKEND_ID:
                     return self._setup_check(
                         "llm_agent",
                         "Agent 渠道",

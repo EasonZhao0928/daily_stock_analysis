@@ -7,6 +7,7 @@ import { useUiLanguage } from '../../contexts/UiLanguageContext';
 import type { GenerationBackendStatus, GenerationBackendStatusResponse, SystemConfigUpdateItem, TestGenerationBackendResponse } from '../../types/systemConfig';
 import { ApiErrorAlert, Badge, Button } from '../common';
 import { SettingsAlert } from './SettingsAlert';
+import { CodexAccountControl } from './CodexAccountControl';
 
 type Translate = ReturnType<typeof useUiLanguage>['t'];
 
@@ -59,7 +60,9 @@ const BackendStatusRow: React.FC<{ title: string; status: GenerationBackendStatu
           <p className="mt-2 text-xs leading-5 text-muted-text">
             {status.backendType === 'local_cli'
               ? t('settings.generationBackendLocalCliDescription')
-              : t('settings.generationBackendLiteLLMDescription')}
+              : status.backendType === 'codex_app_server'
+                ? t('settings.generationBackendCodexDescription')
+                : t('settings.generationBackendLiteLLMDescription')}
           </p>
           {status.lastErrorMessage ? (
             <p className="mt-2 text-xs leading-5 text-warning">
@@ -91,6 +94,7 @@ export const GenerationBackendStatusPanel: React.FC<GenerationBackendStatusPanel
   const [smokeResult, setSmokeResult] = useState<TestGenerationBackendResponse | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isSmoking, setIsSmoking] = useState(false);
+  const [smokeNeedsConfirmation, setSmokeNeedsConfirmation] = useState(false);
   const [error, setError] = useState<ParsedApiError | null>(null);
   const refreshRequestIdRef = useRef(0);
   const smokeRequestIdRef = useRef(0);
@@ -101,6 +105,7 @@ export const GenerationBackendStatusPanel: React.FC<GenerationBackendStatusPanel
   useEffect(() => {
     smokeRequestIdRef.current += 1;
     setSmokeResult(null);
+    setSmokeNeedsConfirmation(false);
     setIsSmoking(false);
   }, [requestItemsFingerprint]);
 
@@ -113,9 +118,11 @@ export const GenerationBackendStatusPanel: React.FC<GenerationBackendStatusPanel
     setError(null);
     setSmokeResult(null);
     try {
-      const next = hasDraft
-        ? await systemConfigApi.previewGenerationBackendStatus({ items: requestItems, maskToken })
-        : await systemConfigApi.getGenerationBackendStatus();
+      const next = systemConfigApi.quickCheckGenerationBackends
+        ? await systemConfigApi.quickCheckGenerationBackends({ items: requestItems, maskToken })
+        : hasDraft
+          ? await systemConfigApi.previewGenerationBackendStatus({ items: requestItems, maskToken })
+          : await systemConfigApi.getGenerationBackendStatus();
       if (refreshRequestIdRef.current !== requestId) {
         return;
       }
@@ -146,17 +153,26 @@ export const GenerationBackendStatusPanel: React.FC<GenerationBackendStatusPanel
     setIsSmoking(true);
     setError(null);
     setSmokeResult(null);
+    setSmokeNeedsConfirmation(false);
     try {
+      const backendId = String(
+        requestItems.find((item) => item.key.toUpperCase() === 'GENERATION_BACKEND')?.value
+          || status?.primaryBackendId
+          || '',
+      ).trim().toLowerCase();
       const result = await systemConfigApi.testGenerationBackend({
         mode: 'json',
         items: requestItems,
         maskToken,
+        ...(backendId === 'codex_app_server' ? { confirmQuotaRisk: false } : {}),
       });
       if (smokeRequestIdRef.current !== requestId) {
         return;
       }
       setSmokeResult(result);
+      setSmokeNeedsConfirmation(Boolean(result.requiresConfirmation));
       setStatus((prev) => ({
+        ...(prev || {}),
         primaryBackendId: result.status.backendId,
         fallbackBackendId: prev?.fallbackBackendId ?? null,
         primary: result.status,
@@ -171,13 +187,49 @@ export const GenerationBackendStatusPanel: React.FC<GenerationBackendStatusPanel
       }
       setStatus(null);
       setSmokeResult(null);
+      setSmokeNeedsConfirmation(false);
       setError(getParsedApiError(err));
     } finally {
       if (smokeRequestIdRef.current === requestId) {
         setIsSmoking(false);
       }
     }
+  }, [maskToken, requestItems, status?.primaryBackendId]);
+
+  const confirmSmoke = useCallback(async () => {
+    setIsSmoking(true);
+    setError(null);
+    try {
+      const result = await systemConfigApi.testGenerationBackend({
+        mode: 'json',
+        items: requestItems,
+        maskToken,
+        confirmQuotaRisk: true,
+      });
+      setSmokeResult(result);
+      setSmokeNeedsConfirmation(Boolean(result.requiresConfirmation));
+      setStatus((prev) => ({
+        ...(prev || {}),
+        primaryBackendId: result.status.backendId,
+        fallbackBackendId: prev?.fallbackBackendId ?? null,
+        primary: result.status,
+        fallback: prev?.fallback ?? null,
+        backends: prev?.backends?.length
+          ? [result.status, ...prev.backends.filter((backend) => backend.backendId !== result.status.backendId)]
+          : [result.status],
+      }));
+    } catch (err: unknown) {
+      setSmokeResult(null);
+      setSmokeNeedsConfirmation(false);
+      setError(getParsedApiError(err));
+    } finally {
+      setIsSmoking(false);
+    }
   }, [maskToken, requestItems]);
+
+  const codexSelected = status?.primaryBackendId === 'codex_app_server'
+    || requestItems.some((item) => item.key.toUpperCase() === 'GENERATION_BACKEND' && item.value.trim().toLowerCase() === 'codex_app_server');
+  const canManageCodexAccount = !hasDraft && codexSelected && status?.primary.available === true;
 
   return (
     <div data-testid="generation-backend-status-panel" className="space-y-3 rounded-xl border settings-border bg-card/70 p-4">
@@ -205,10 +257,30 @@ export const GenerationBackendStatusPanel: React.FC<GenerationBackendStatusPanel
           title={smokeResult.success ? t('settings.generationBackendSmokePassed') : t('settings.generationBackendSmokeFailed')}
           message={smokeResult.success ? t('settings.generationBackendSmokePassedMessage') : smokeResult.message}
           variant={smokeResult.success ? 'success' : 'warning'}
+          actionLabel={smokeNeedsConfirmation ? t('settings.generationBackendConfirmQuota') : undefined}
+          onAction={smokeNeedsConfirmation ? () => void confirmSmoke() : undefined}
         />
+      ) : null}
+      {status?.codex ? (
+        <div data-testid="unified-codex-status" className="rounded-xl border settings-border bg-background/35 px-4 py-3 text-xs text-muted-text">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-foreground">{t('settings.unifiedCodexEffective')}</span>
+            <Badge variant={status.unifiedCodexEffective ? 'success' : 'history'} size="sm">
+              {status.unifiedCodexEffective ? t('settings.unifiedCodexYes') : t('settings.unifiedCodexNo')}
+            </Badge>
+            {status.codexModel ? <Badge variant="default" size="sm">{status.codexModel}</Badge> : null}
+          </div>
+          <p className="mt-2">{t('settings.unifiedCodexStatusDescription')}</p>
+          {status.codex.platform || status.codex.binary ? (
+            <p className="mt-1 font-mono text-[11px]">
+              {JSON.stringify({ platform: status.codex.platform, binary: status.codex.binary })}
+            </p>
+          ) : null}
+        </div>
       ) : null}
       <BackendStatusRow title={t('settings.generationBackendPrimary')} status={status?.primary} t={t} />
       <BackendStatusRow title={t('settings.generationBackendFallback')} status={status?.fallback} t={t} />
+      <CodexAccountControl enabled={canManageCodexAccount} disabled={disabled} />
     </div>
   );
 };

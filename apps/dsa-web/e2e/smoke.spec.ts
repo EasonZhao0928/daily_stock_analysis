@@ -163,6 +163,23 @@ test.describe('web smoke', () => {
     await captureSmokeScreenshot(page, testInfo, 'smoke-settings-page-zh');
   });
 
+  test('settings exposes the unified Codex preset on a narrow viewport', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await login(page);
+
+    await page.getByRole('link', { name: '设置' }).click();
+    await page.waitForLoadState('domcontentloaded');
+    await expect(page.getByRole('heading', { name: '系统设置' })).toBeVisible({ timeout: 10_000 });
+    await page.getByRole('button', { name: 'AI 模型' }).click();
+
+    await expect(page.getByTestId('unified-codex-preset')).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole('button', { name: /应用统一 Codex/ })).toBeVisible();
+    const preset = page.getByTestId('unified-codex-preset');
+    const box = await preset.boundingBox();
+    expect(box?.x ?? -1).toBeGreaterThanOrEqual(0);
+    expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(390);
+  });
+
   test('language switch updates UI copy and persists after page refresh', async ({ page }, testInfo) => {
     await login(page);
 

@@ -767,9 +767,12 @@ def test_production_codex_preparation_matches_the_cancellation_safe_tool_surface
         "get_volume_analysis",
         "analyze_pattern",
         "search_stock_news",
+        "search_comprehensive_intel",
         "get_market_indices",
+        "get_sector_rankings",
         "get_skill_backtest_summary",
         "get_strategy_backtest_summary",
+        "get_stock_backtest_summary",
         # Task 5.2-5.4 capability tools reach Codex on the same terms.
         "get_financial_statement",
         "get_consensus_estimate",
@@ -783,33 +786,25 @@ def test_production_codex_preparation_matches_the_cancellation_safe_tool_surface
         "get_dividends",
     ]
     instructions = _FakeTransport.last.thread_kwargs["developer_instructions"]
-    # The transport receives the complete cancellation-safe surface, while
-    # the prompt only documents the three context/backtest tools used by this
-    # chat flow.
-    for tool_name in (
-        "get_analysis_context",
-        "get_skill_backtest_summary",
-        "get_strategy_backtest_summary",
-    ):
-        assert tool_name in instructions
+    # The transport receives the complete cancellation-safe, profile-bound
+    # surface.  The prompt documents the same read-only capability families;
+    # forbidden execution tools remain absent.
+    assert "get_analysis_context" in instructions
+    assert "回测" in instructions
+    assert "个股明细" in instructions
     for unavailable_tool in (
-        "search_comprehensive_intel",
-        "get_sector_rankings",
-        "get_stock_backtest_summary",
         "execute_broker_order",
         "submit_paper_order",
     ):
         assert unavailable_tool not in instructions
     for unavailable_capability in (
-        "实时行情",
-        "K线",
-        "技术指标",
-        "筹码",
-        "新闻",
-        "热点",
-        "持仓",
+        "真实交易",
+        "Shell",
+        "文件",
+        "MCP",
+        "插件",
     ):
-        assert unavailable_capability not in instructions
+        assert unavailable_capability in instructions
 
 
 def test_litellm_preparation_keeps_the_existing_chat_workflow() -> None:

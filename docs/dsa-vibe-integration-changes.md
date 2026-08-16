@@ -50,9 +50,9 @@ FastAPI + 静态 Web（server:app，默认 127.0.0.1:8000）
 - `AGENT_BACKEND=auto|litellm|codex_app_server`：问股 Chat 与普通生成后端解耦。
 - 新增 Codex App Server transport：受控环境、只读权限配置、MCP 禁用、JSONL stdio、ephemeral thread、超时/停止/回收闭环。
 - 新增 Codex 账户状态、浏览器登录、device-code 登录、取消登录、退出登录 API；设置页显示可尝试状态和 rate limit 摘要。
-- Codex 目前只开放脱敏的历史分析上下文、全局回测汇总、策略回测汇总查询；实时行情、新闻、持仓和交易工具不自动暴露给 Codex。
+- Codex Agent 通过 profile-bound `portfolio_readonly` ToolSurface 暴露实时行情、历史/技术、新闻资讯、市场/板块、基本面/研报、回测明细和 Paper/持仓/风险只读工具；Paper/真实交易写入、Shell、文件、MCP 和插件仍不暴露。普通 Generation 仍保持空工具面。
 - Codex App Server 仅支持 `AGENT_ARCH=single`，并且 `AGENT_ORCHESTRATOR_TIMEOUT_S` 必须大于 0。
-- `GENERATION_BACKEND=codex_app_server` 不是有效替代方案：Codex App Server 是 Agent Chat 路径；普通日报/调度仍走 LiteLLM 或 generation-only 的 `codex_cli`。
+- `GENERATION_BACKEND=codex_app_server` 现在是正式的普通 Generation 路径，可覆盖日报、复盘、筛选和已登记的文本/JSON 旁路；它与 `AGENT_BACKEND=codex_app_server` 独立配置。前者故意为空工具面，后者才注册 DSA 的 Agent ToolSurface。
 
 ### 2.2 工具、技能与数据源
 

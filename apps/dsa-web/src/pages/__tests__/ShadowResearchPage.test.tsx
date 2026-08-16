@@ -99,14 +99,22 @@ describe('ShadowResearchPage', () => {
     expect(await screen.findByText('成交量突破研究')).toBeInTheDocument();
     expect(screen.getByText('尚未执行回测')).toBeInTheDocument();
 
+    fireEvent.change(screen.getByLabelText('股票代码'), { target: { value: '600519' } });
     fireEvent.click(screen.getByRole('button', { name: '执行回测' }));
 
     await waitFor(() => expect(runBacktest).toHaveBeenCalledWith(
       profile.profileId,
-      expect.objectContaining({ code: '600519', splitDate: '2025-01-03' }),
+      expect.objectContaining({
+        code: '600519',
+        splitDate: '2025-01-01',
+        marketDataStart: '2024-01-01',
+        marketDataEnd: expect.any(String),
+      }),
     ));
     expect(await screen.findByText('最近一次回测')).toBeInTheDocument();
     expect(screen.getByText('snapshot: snapshot-hash')).toBeInTheDocument();
+    expect(screen.getByText('3')).toBeInTheDocument();
+    expect(screen.getByText('1.20')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /批准 profile/ }));
     await waitFor(() => expect(approveProfile).toHaveBeenCalledWith(profile.profileId));
@@ -127,6 +135,7 @@ describe('ShadowResearchPage', () => {
   it('enables scanning only after approval and renders idempotent signals', async () => {
     render(<ShadowResearchPage />);
     await screen.findByText('成交量突破研究');
+    fireEvent.change(screen.getByLabelText('股票代码'), { target: { value: '600519' } });
     fireEvent.click(screen.getByRole('button', { name: '执行回测' }));
     await screen.findByText('最近一次回测');
     fireEvent.click(screen.getByRole('button', { name: /批准 profile/ }));
@@ -142,5 +151,14 @@ describe('ShadowResearchPage', () => {
     ));
     expect(await screen.findByText('600519 · 2025-01-06')).toBeInTheDocument();
     expect(screen.getByText('cutoff 2025-01-06 · rule_matched')).toBeInTheDocument();
+  });
+
+  it('does not query a hard-coded symbol before the user enters one', async () => {
+    render(<ShadowResearchPage />);
+
+    await screen.findByText('成交量突破研究');
+    expect(screen.getByLabelText('股票代码')).toHaveValue('');
+    expect(listSignals).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: '执行回测' })).toBeDisabled();
   });
 });

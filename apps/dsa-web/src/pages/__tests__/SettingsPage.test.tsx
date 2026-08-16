@@ -157,6 +157,19 @@ vi.mock('../../components/settings', () => ({
       {items.map((item) => `${item.key}=${item.value}`).join('|')}
     </div>
   ),
+  UnifiedCodexPreset: ({
+    active,
+    disabled,
+    onApply,
+  }: {
+    active: boolean;
+    disabled?: boolean;
+    onApply: () => void;
+  }) => (
+    <button type="button" data-testid="unified-codex-preset" disabled={disabled || active} onClick={onApply}>
+      {active ? 'Applied to draft' : 'Apply unified Codex'}
+    </button>
+  ),
   AgentBackendStatusPanel: ({
     items,
     selectedBackend,
@@ -179,6 +192,7 @@ vi.mock('../../components/settings', () => ({
   NotificationTestPanel: ({ items }: { items: Array<{ key: string; value: string }> }) => (
     <div>通知测试面板:{items.map((item) => item.key).join(',')}</div>
   ),
+  WeChatChannelStatusPanel: () => <div>个人微信 iLink 状态面板</div>,
   SettingsAlert: ({
     title,
     message,
@@ -1250,6 +1264,37 @@ describe('SettingsPage', () => {
       expect(statusItems).not.toHaveTextContent('GENERATION_BACKEND=codex_cli');
       expect(statusItems).not.toHaveTextContent('WECHAT_WEBHOOK_URL=not-a-url');
     });
+  });
+
+  it('applies the unified Codex preset through existing draft keys without saving', () => {
+    const configState = buildSystemConfigState();
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'ai_model',
+      itemsByCategory: {
+        ...configState.itemsByCategory,
+        ai_model: [
+          ...configState.itemsByCategory.ai_model,
+          buildAgentItem('GENERATION_BACKEND', 'litellm', 2, 'select'),
+          buildAgentItem('GENERATION_FALLBACK_BACKEND', 'litellm', 3, 'select'),
+        ],
+        agent: [
+          buildAgentItem('AGENT_BACKEND', 'auto', 1, 'select'),
+          buildAgentItem('AGENT_ARCH', 'multi', 2, 'select'),
+          buildAgentItem('AGENT_MODE', 'false', 3, 'select'),
+        ],
+      },
+    }));
+
+    render(<SettingsPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Apply unified Codex|应用统一 Codex/ }));
+
+    expect(setDraftValue).toHaveBeenCalledWith('GENERATION_BACKEND', 'codex_app_server');
+    expect(setDraftValue).toHaveBeenCalledWith('GENERATION_FALLBACK_BACKEND', '');
+    expect(setDraftValue).toHaveBeenCalledWith('AGENT_BACKEND', 'codex_app_server');
+    expect(setDraftValue).toHaveBeenCalledWith('AGENT_ARCH', 'single');
+    expect(setDraftValue).toHaveBeenCalledWith('AGENT_MODE', 'true');
+    expect(save).not.toHaveBeenCalled();
   });
 
   it('clears llm channel draft items after llm channel editor saves', async () => {

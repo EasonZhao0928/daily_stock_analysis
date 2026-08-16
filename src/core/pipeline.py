@@ -105,6 +105,36 @@ from bot.models import BotMessage
 logger = logging.getLogger(__name__)
 
 
+def _generation_diagnostic_metadata(analyzer: Any, config: Any, result: Any = None) -> Dict[str, Any]:
+    """Resolve backend attribution without exposing prompts or provider payloads."""
+    metadata = {}
+    getter = getattr(analyzer, "get_generation_call_metadata", None)
+    if callable(getter):
+        try:
+            candidate = getter()
+            if isinstance(candidate, dict):
+                metadata.update(candidate)
+        except Exception:
+            metadata = {}
+    primary = (
+        metadata.get("primary_backend")
+        or getattr(result, "generation_primary_backend", None)
+        or getattr(config, "generation_backend", None)
+        or "litellm"
+    )
+    effective = (
+        metadata.get("effective_backend")
+        or getattr(result, "generation_backend_used", None)
+        or primary
+    )
+    metadata["primary_backend"] = str(primary)
+    metadata["effective_backend"] = str(effective) if effective else None
+    metadata["attempt"] = metadata.get("attempt") or getattr(result, "generation_attempt", None) or 1
+    if metadata.get("fallback_reason") is not None:
+        metadata["fallback_reason"] = str(metadata["fallback_reason"])[:120]
+    return metadata
+
+
 def _share_image_payload(result: Any) -> Optional[Dict[str, Any]]:
     """Return structured poster data when the result exposes the real contract."""
 
@@ -517,6 +547,24 @@ class StockAnalysisPipeline:
                     use_agent = True
                     logger.info(f"{stock_name}({code}) Auto-enabled agent mode due to configured skills: {configured_skills}")
 
+            # ``AGENT_MODE`` is a legacy switch for the LiteLLM stock-analysis
+            # Agent.  The Codex App Server backend currently owns the separate
+            # Agent Chat/Paper execution profile; regular stock/ETF reports
+            # must stay on ``GENERATION_BACKEND``.  Without this guard, the
+            # unified Codex preset set ``AGENT_MODE=true`` and routed reports
+            # into the old LiteLLM adapter, producing a false "No LLM
+            # configured" error even though Codex was logged in.
+            configured_agent_backend = str(
+                getattr(self.config, "agent_backend", "auto") or "auto"
+            ).strip().lower()
+            if use_agent and configured_agent_backend == "codex_app_server":
+                logger.info(
+                    "%s(%s) AGENT_BACKEND=codex_app_server: regular analysis remains on GENERATION_BACKEND",
+                    stock_name,
+                    code,
+                )
+                use_agent = False
+
             self._emit_progress(32, f"{stock_name}：正在聚合基本面与趋势数据")
 
             # Step 2.5: 基本面能力聚合（统一入口，异常降级）
@@ -746,10 +794,17 @@ class StockAnalysisPipeline:
 
             self._emit_progress(64, f"{stock_name}：正在请求 LLM 生成报告")
             llm_started_at = time.monotonic()
+            generation_metadata = _generation_diagnostic_metadata(self.analyzer, self.config)
             try:
                 record_llm_run_started(
-                    model=getattr(self.config, "litellm_model", None),
+                    provider=generation_metadata.get("primary_backend"),
+                    model=getattr(self.config, "codex_model", None)
+                    or getattr(self.config, "litellm_model", None),
                     call_type="analysis",
+                    business_entry="stock_analysis",
+                    primary_backend=generation_metadata.get("primary_backend"),
+                    effective_backend=generation_metadata.get("effective_backend"),
+                    attempt=generation_metadata.get("attempt"),
                 )
                 result = self.analyzer.analyze(
                     enhanced_context,
@@ -758,11 +813,31 @@ class StockAnalysisPipeline:
                     stream_progress_callback=_on_llm_stream,
                     analysis_context_pack_summary=analysis_context_pack_summary,
                 )
+                generation_metadata = _generation_diagnostic_metadata(self.analyzer, self.config, result)
                 llm_duration_ms = int((time.monotonic() - llm_started_at) * 1000)
                 record_llm_run(
                     success=bool(result and getattr(result, "success", True)),
+                    provider=generation_metadata.get("effective_backend"),
                     model=getattr(result, "model_used", None) if result else None,
                     call_type="analysis",
+                    business_entry="stock_analysis",
+                    primary_backend=generation_metadata.get("primary_backend"),
+                    effective_backend=generation_metadata.get("effective_backend"),
+                    attempt=generation_metadata.get("attempt"),
+                    usage_available=generation_metadata.get("usage_available"),
+                    tokens=generation_metadata.get("tokens"),
+                    cost_status=(
+                        "unknown"
+                        if generation_metadata.get("effective_backend") == "codex_app_server"
+                        else None
+                    ),
+                    status=generation_metadata.get("status"),
+                    fallback_from=generation_metadata.get("fallback_from"),
+                    fallback_to=generation_metadata.get("effective_backend")
+                    if generation_metadata.get("fallback_from")
+                    else None,
+                    fallback_reason=generation_metadata.get("fallback_reason"),
+                    error_code=generation_metadata.get("error_code"),
                     duration_ms=llm_duration_ms,
                     error_type=(
                         None
@@ -776,10 +851,19 @@ class StockAnalysisPipeline:
                     ),
                 )
             except Exception as exc:
+                generation_metadata = _generation_diagnostic_metadata(self.analyzer, self.config, result=None)
                 record_llm_run(
                     success=False,
-                    model=getattr(self.config, "litellm_model", None),
+                    provider=generation_metadata.get("effective_backend"),
+                    model=getattr(self.config, "codex_model", None)
+                    or getattr(self.config, "litellm_model", None),
                     call_type="analysis",
+                    business_entry="stock_analysis",
+                    primary_backend=generation_metadata.get("primary_backend"),
+                    effective_backend=generation_metadata.get("effective_backend"),
+                    attempt=generation_metadata.get("attempt"),
+                    status="failed",
+                    error_code=getattr(getattr(exc, "error_code", None), "value", None),
                     duration_ms=int((time.monotonic() - llm_started_at) * 1000),
                     error_type=type(exc).__name__,
                     error_message=exc,
@@ -1432,17 +1516,29 @@ class StockAnalysisPipeline:
             else:
                 message = f"请分析股票 {code} ({stock_name})，并生成决策仪表盘报告。"
             llm_started_at = time.monotonic()
+            agent_backend_id = str(getattr(self.config, "agent_backend", None) or "unknown")
             try:
                 record_llm_run_started(
+                    provider=agent_backend_id,
                     model=getattr(self.config, "agent_litellm_model", None),
                     call_type="agent_analysis",
+                    business_entry="agent_stock_analysis",
+                    primary_backend=agent_backend_id,
+                    effective_backend=agent_backend_id,
                 )
                 agent_result = executor.run(message, context=initial_context)
+                agent_backend_id = str(getattr(agent_result, "backend", None) or agent_backend_id)
             except Exception as exc:
                 record_llm_run(
                     success=False,
+                    provider=agent_backend_id,
                     model=getattr(self.config, "agent_litellm_model", None),
                     call_type="agent_analysis",
+                    business_entry="agent_stock_analysis",
+                    primary_backend=agent_backend_id,
+                    effective_backend=agent_backend_id,
+                    status="failed",
+                    error_code=getattr(getattr(exc, "error_code", None), "value", None),
                     duration_ms=int((time.monotonic() - llm_started_at) * 1000),
                     error_type=type(exc).__name__,
                     error_message=exc,
@@ -1460,8 +1556,19 @@ class StockAnalysisPipeline:
             )
             record_llm_run(
                 success=bool(result and getattr(result, "success", True)),
+                provider=agent_backend_id,
                 model=getattr(result, "model_used", None) if result else getattr(agent_result, "model", None),
                 call_type="agent_analysis",
+                business_entry="agent_stock_analysis",
+                primary_backend=agent_backend_id,
+                effective_backend=agent_backend_id,
+                usage_available=bool(getattr(agent_result, "usage", None)),
+                cost_status="unknown" if agent_backend_id == "codex_app_server" else None,
+                status="success" if result and getattr(result, "success", True) else "failed",
+                tokens=(getattr(agent_result, "usage", None) or {}).get("total_tokens")
+                if isinstance(getattr(agent_result, "usage", None), dict)
+                else None,
+                error_code=getattr(agent_result, "error_code", None),
                 duration_ms=int((time.monotonic() - llm_started_at) * 1000),
                 error_type=(
                     None

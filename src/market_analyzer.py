@@ -669,9 +669,15 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             )
             record_llm_run(
                 success=False,
-                provider="litellm",
-                model=getattr(self.config, "litellm_model", None),
+                provider=getattr(backend_error, "backend", None),
+                model=getattr(self.config, "codex_model", None)
+                or getattr(self.config, "litellm_model", None),
                 call_type="market_review",
+                business_entry="market_review",
+                primary_backend=getattr(self.config, "generation_backend", None) or "litellm",
+                effective_backend=getattr(backend_error, "backend", None),
+                status="failed",
+                error_code=getattr(getattr(backend_error, "error_code", None), "value", None),
                 error_type=type(backend_error).__name__,
                 error_message=backend_error,
             )
@@ -690,30 +696,72 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         logger.info("[大盘] %s action=generate_review status=start", self._log_context())
         # Use the public generate_text() entry point - never access private analyzer attributes.
         llm_started_at = time.perf_counter()
+        primary_backend = str(getattr(self.config, "generation_backend", None) or "litellm")
         try:
             record_llm_run_started(
-                provider="litellm",
-                model=getattr(self.config, "litellm_model", None),
+                provider=primary_backend,
+                model=getattr(self.config, "codex_model", None)
+                or getattr(self.config, "litellm_model", None),
                 call_type="market_review",
+                business_entry="market_review",
+                primary_backend=primary_backend,
+                effective_backend=primary_backend,
             )
             review = self.analyzer.generate_text(prompt, max_tokens=8192, temperature=0.7)
         except Exception as exc:
+            metadata = {}
+            getter = getattr(self.analyzer, "get_generation_call_metadata", None)
+            if callable(getter):
+                try:
+                    metadata = getter()
+                except Exception:
+                    metadata = {}
             record_llm_run(
                 success=False,
-                provider="litellm",
-                model=getattr(self.config, "litellm_model", None),
+                provider=metadata.get("effective_backend") or primary_backend,
+                model=getattr(self.config, "codex_model", None)
+                or getattr(self.config, "litellm_model", None),
                 call_type="market_review",
+                business_entry="market_review",
+                primary_backend=metadata.get("primary_backend") or primary_backend,
+                effective_backend=metadata.get("effective_backend") or primary_backend,
+                attempt=metadata.get("attempt"),
+                status="failed",
+                fallback_from=metadata.get("fallback_from"),
+                fallback_to=metadata.get("effective_backend") if metadata.get("fallback_from") else None,
+                fallback_reason=metadata.get("fallback_reason"),
+                error_code=getattr(getattr(exc, "error_code", None), "value", None),
                 duration_ms=int((time.perf_counter() - llm_started_at) * 1000),
                 error_type=type(exc).__name__,
                 error_message=exc,
             )
             raise
 
+        metadata = {}
+        getter = getattr(self.analyzer, "get_generation_call_metadata", None)
+        if callable(getter):
+            try:
+                metadata = getter()
+            except Exception:
+                metadata = {}
+        effective_backend = metadata.get("effective_backend") or primary_backend
         record_llm_run(
             success=bool(review),
-            provider="litellm",
-            model=getattr(self.config, "litellm_model", None),
+            provider=effective_backend,
+            model=getattr(self.config, "codex_model", None)
+            or getattr(self.config, "litellm_model", None),
             call_type="market_review",
+            business_entry="market_review",
+            primary_backend=metadata.get("primary_backend") or primary_backend,
+            effective_backend=effective_backend,
+            attempt=metadata.get("attempt"),
+            usage_available=metadata.get("usage_available"),
+            tokens=metadata.get("tokens"),
+            cost_status="unknown" if effective_backend == "codex_app_server" else None,
+            status=metadata.get("status") or ("success" if review else "failed"),
+            fallback_from=metadata.get("fallback_from"),
+            fallback_to=effective_backend if metadata.get("fallback_from") else None,
+            fallback_reason=metadata.get("fallback_reason"),
             duration_ms=int((time.perf_counter() - llm_started_at) * 1000),
             error_type=None if review else "EmptyResponse",
             error_message=None if review else "empty market review response",

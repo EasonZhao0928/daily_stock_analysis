@@ -26,7 +26,11 @@ ETF = "etf"
 # historical BSE special-instrument ranges.  R2.3 specifically needs 43/83/87
 # and the new 92xxxx range in addition to those legacy forms.
 BSE_CODE_PREFIXES = ("43", "81", "82", "83", "87", "88", "92")
-ETF_SH_PREFIXES = ("51", "52", "56", "58")
+# Shanghai-listed fund/ETF codes include the legacy 50xxxx range in addition
+# to the newer 51/52/56/58 families.  Keep this canonical list shared by all
+# provider routes so an ETF is not misclassified as a stock at the identity
+# boundary.
+ETF_SH_PREFIXES = ("50", "51", "52", "56", "58")
 ETF_SZ_PREFIXES = ("15", "16", "18")
 ETF_PREFIXES = ETF_SH_PREFIXES + ETF_SZ_PREFIXES
 

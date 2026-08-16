@@ -7,11 +7,12 @@ import type {
   ShadowProfileCreateRequest,
   ShadowProfileDetail,
   ShadowProfileListResponse,
+  ShadowObservation,
   ShadowScanRequest,
   ShadowSignalListResponse,
 } from '../types/shadow';
 
-function toSnakeObservation(observation: ShadowBacktestRequest['observations'][number]): Record<string, unknown> {
+function toSnakeObservation(observation: ShadowObservation): Record<string, unknown> {
   return {
     date: observation.date,
     features: observation.features,
@@ -23,10 +24,11 @@ function toSnakeObservation(observation: ShadowBacktestRequest['observations'][n
 }
 
 function toSnakeBacktestPayload(payload: ShadowBacktestRequest): Record<string, unknown> {
-  return {
+  const request: Record<string, unknown> = {
     code: payload.code.trim().toUpperCase(),
-    observations: payload.observations.map(toSnakeObservation),
     split_date: payload.splitDate,
+    market_data_start: payload.marketDataStart,
+    market_data_end: payload.marketDataEnd,
     fee_bps: payload.feeBps,
     slippage_bps: payload.slippageBps,
     source_refs: payload.sourceRefs,
@@ -34,15 +36,24 @@ function toSnakeBacktestPayload(payload: ShadowBacktestRequest): Record<string, 
     ledger_start_date: payload.ledgerStartDate,
     ledger_end_date: payload.ledgerEndDate,
   };
+  if (payload.observations?.length) {
+    request.observations = payload.observations.map(toSnakeObservation);
+  }
+  return request;
 }
 
 function toSnakeScanPayload(payload: ShadowScanRequest): Record<string, unknown> {
-  return {
+  const request: Record<string, unknown> = {
     code: payload.code.trim().toUpperCase(),
-    observations: payload.observations.map(toSnakeObservation),
+    market_data_start: payload.marketDataStart,
+    market_data_end: payload.marketDataEnd,
     run_id: payload.runId,
     evidence_refs: payload.evidenceRefs,
   };
+  if (payload.observations?.length) {
+    request.observations = payload.observations.map(toSnakeObservation);
+  }
+  return request;
 }
 
 export const shadowApi = {

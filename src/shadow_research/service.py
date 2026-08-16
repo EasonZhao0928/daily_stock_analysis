@@ -12,7 +12,7 @@ from src.shadow_research.backtest import ShadowBacktestRunner
 from src.shadow_research.dsl import CompiledShadowRule, ShadowRuleError, compile_shadow_rule
 from src.shadow_research.ledger import freeze_account_ledger
 from src.shadow_research.repository import ShadowResearchRepository
-from src.shadow_research.snapshot import build_feature_snapshot
+from src.shadow_research.snapshot import build_feature_snapshot, build_market_observations
 
 
 class ShadowStateError(ValueError):
@@ -214,7 +214,10 @@ class ShadowResearchService:
         profile_id: str,
         *,
         code: str,
-        observations: Sequence[Mapping[str, Any]],
+        observations: Optional[Sequence[Mapping[str, Any]]] = None,
+        market_data_start: Optional[date] = None,
+        market_data_end: Optional[date] = None,
+        market_data_manager: Any = None,
         run_id: Optional[str] = None,
         evidence_refs: Sequence[Mapping[str, Any]] = (),
     ) -> List[Dict[str, Any]]:
@@ -227,6 +230,19 @@ class ShadowResearchService:
         run = self.repository.get_run(run_id) if run_id else self.repository.get_latest_run(profile_id)
         if rule_row is None or run is None or run["status"] != "completed":
             raise ShadowStateError("a completed backtest run is required for signal scan")
+        if observations is None:
+            if market_data_start is None or market_data_end is None:
+                raise ShadowStateError("observations or market_data_start/market_data_end is required")
+            if market_data_manager is None:
+                from data_provider.runtime import get_market_data_manager
+
+                market_data_manager = get_market_data_manager()
+            observations, _source_snapshot = build_market_observations(
+                code=code,
+                start_date=market_data_start,
+                end_date=market_data_end,
+                market_data_manager=market_data_manager,
+            )
         compiled = compile_shadow_rule(rule_row["dsl"], version=rule_row["version"])
         output = []
         for observation in observations:

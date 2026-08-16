@@ -65,6 +65,16 @@ class ResearchCommand(BotCommand):
                 "⚠️ Agent 模式未开启，无法使用深度研究功能。\n请在配置中设置 `AGENT_MODE=true`。"
             )
 
+        # Deep Research owns a multi-agent/tool orchestration loop.  The
+        # Codex App Server Agent backend currently guarantees one bounded DSA
+        # Agent turn only, so do not silently route this command through the
+        # LiteLLM adapter when the user selected Codex.
+        if str(getattr(config, "agent_backend", "auto") or "auto").strip().lower() == "codex_app_server":
+            return BotResponse.text_response(
+                "unsupported_capability: 当前 Codex Agent 仅支持单 Agent 问股，暂不支持 Deep Research。"
+                "请切换 AGENT_BACKEND=litellm 后重试。"
+            )
+
         # Parse arguments — first arg may be stock code, rest is the question
         query_parts = list(args)
         stock_code: Optional[str] = None

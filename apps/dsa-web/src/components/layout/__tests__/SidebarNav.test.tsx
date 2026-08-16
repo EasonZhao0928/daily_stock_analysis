@@ -139,6 +139,18 @@ describe('SidebarNav', () => {
     expect(signalsLink).toHaveClass('font-medium');
   });
 
+  it('keeps an active navigation item inside the sidebar width', () => {
+    render(
+      <MemoryRouter initialEntries={['/paper-workbench']}>
+        <SidebarNav />
+      </MemoryRouter>,
+    );
+
+    const paperLink = screen.getByRole('link', { name: 'Paper 工作台' });
+    expect(paperLink).toHaveClass('min-w-0', 'max-w-full', 'box-border');
+    expect(paperLink.querySelector('span')).toHaveClass('min-w-0', 'truncate');
+  });
+
   it('opens the logout confirmation and confirms logout', async () => {
     render(
       <MemoryRouter initialEntries={['/chat']}>

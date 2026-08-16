@@ -79,6 +79,18 @@ _THINKING_TOOL_LABELS: Dict[str, str] = {
     "get_skill_backtest_summary": "技能回测概览",
     "get_strategy_backtest_summary": "策略回测概览",
     "get_stock_backtest_summary": "个股回测数据",
+    "get_portfolio_snapshot": "持仓快照",
+    "get_capital_flow": "资金流向获取",
+    "get_financial_statement": "财务报表获取",
+    "get_consensus_estimate": "一致预期获取",
+    "get_announcements": "公司公告获取",
+    "get_research_reports": "研报获取",
+    "get_dragon_tiger": "龙虎榜获取",
+    "get_margin_trading": "融资融券获取",
+    "get_block_trades": "大宗交易获取",
+    "get_shareholder_counts": "股东户数获取",
+    "get_share_unlocks": "解禁信息获取",
+    "get_dividends": "分红信息获取",
 }
 
 

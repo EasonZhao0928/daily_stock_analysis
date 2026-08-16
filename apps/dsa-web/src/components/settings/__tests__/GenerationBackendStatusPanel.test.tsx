@@ -139,6 +139,64 @@ describe('GenerationBackendStatusPanel', () => {
     expect(await screen.findByText('冒烟测试通过')).toBeInTheDocument();
   });
 
+  it('requires explicit quota confirmation before a Codex smoke turn', async () => {
+    const codexStatus: GenerationBackendStatusResponse = {
+      ...localCliStatus,
+      primaryBackendId: 'codex_app_server',
+      primary: {
+        ...localCliStatus.primary,
+        backendId: 'codex_app_server',
+        backendType: 'codex_app_server',
+        providerId: 'codex_app_server',
+        usageAvailable: true,
+        costStatus: 'unknown',
+      },
+      unifiedCodexEffective: true,
+      codexModel: 'gpt-5-codex',
+      codex: { effective: true, accountStatus: 'authenticated' },
+    };
+    testGenerationBackend
+      .mockResolvedValueOnce({
+        success: false,
+        mode: 'json',
+        message: 'Codex smoke requires quota confirmation',
+        status: codexStatus.primary,
+        requiresConfirmation: true,
+        quotaRisk: { mayConsumeSubscriptionQuota: true, estimatedModelRequests: 1 },
+        scope: { toolsEnabled: false, marketDataAccess: false, persistReport: false },
+      })
+      .mockResolvedValueOnce({ ...smokePassed, status: codexStatus.primary });
+
+    render(
+      <GenerationBackendStatusPanel
+        items={[{ key: 'GENERATION_BACKEND', value: 'codex_app_server' }]}
+        maskToken="******"
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /JSON 冒烟测试/ }));
+    await waitFor(() => {
+      expect(testGenerationBackend).toHaveBeenCalledWith({
+        mode: 'json',
+        items: [{ key: 'GENERATION_BACKEND', value: 'codex_app_server' }],
+        maskToken: '******',
+        confirmQuotaRisk: false,
+      });
+    });
+    expect(await screen.findByRole('button', { name: '确认额度并执行' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '确认额度并执行' }));
+    await waitFor(() => {
+      expect(testGenerationBackend).toHaveBeenLastCalledWith({
+        mode: 'json',
+        items: [{ key: 'GENERATION_BACKEND', value: 'codex_app_server' }],
+        maskToken: '******',
+        confirmQuotaRisk: true,
+      });
+    });
+    expect(await screen.findByText('冒烟测试通过')).toBeInTheDocument();
+  });
+
   it('clears stale smoke result when draft items change', async () => {
     const { rerender } = render(
       <GenerationBackendStatusPanel

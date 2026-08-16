@@ -32,12 +32,6 @@ const DEFAULT_RULE = JSON.stringify({
   ],
 }, null, 2);
 
-const DEFAULT_OBSERVATIONS = JSON.stringify([
-  { date: '2025-01-02', features: { close: 10, volume_ratio: 1.2 }, next_return_pct: 1.5 },
-  { date: '2025-01-03', features: { close: 11, volume_ratio: 0.8 }, next_return_pct: -0.4 },
-  { date: '2025-01-06', features: { close: 12, volume_ratio: 1.4 }, next_return_pct: 2.1 },
-], null, 2);
-
 const STATUS_LABELS: Record<string, string> = {
   draft: '草稿',
   degraded: '已退化',
@@ -62,7 +56,8 @@ function parseJsonObject(value: string, label: string): Record<string, unknown> 
   return parsed as Record<string, unknown>;
 }
 
-function parseObservations(value: string): ShadowObservation[] {
+function parseObservations(value: string): ShadowObservation[] | undefined {
+  if (!value.trim()) return undefined;
   const parsed: unknown = JSON.parse(value);
   if (!Array.isArray(parsed) || parsed.length === 0) {
     throw new Error('观测数据必须是非空 JSON 数组');
@@ -99,7 +94,7 @@ const ProfileCard: React.FC<{
       {profile.description ? <p className="mt-3 line-clamp-2 text-xs text-secondary-text">{profile.description}</p> : null}
       {detail.latestRun ? (
         <p className="mt-3 text-xs text-secondary-text">
-          最近回测：{detail.latestRun.status} · OOS {formatMetric(detail.latestRun.metrics, 'out_sample_count')} 条
+          最近回测：{detail.latestRun.status} · OOS {formatMetric(detail.latestRun.metrics, 'outSampleCount')} 条
         </p>
       ) : (
         <p className="mt-3 text-xs text-secondary-text">尚未执行回测</p>
@@ -121,9 +116,11 @@ const ShadowResearchPage: React.FC = () => {
   const [profileName, setProfileName] = useState('成交量突破研究');
   const [profileDescription, setProfileDescription] = useState('只生成可审计的研究信号，不连接真实账户。');
   const [ruleText, setRuleText] = useState(DEFAULT_RULE);
-  const [code, setCode] = useState('600519');
-  const [splitDate, setSplitDate] = useState('2025-01-03');
-  const [observationText, setObservationText] = useState(DEFAULT_OBSERVATIONS);
+  const [code, setCode] = useState('');
+  const [splitDate, setSplitDate] = useState('2025-01-01');
+  const [marketDataStart, setMarketDataStart] = useState('2024-01-01');
+  const [marketDataEnd, setMarketDataEnd] = useState(() => new Date().toISOString().slice(0, 10));
+  const [observationText, setObservationText] = useState('');
   const selected = useMemo(
     () => profiles.find((item) => item.profile.profileId === selectedProfileId) ?? null,
     [profiles, selectedProfileId],
@@ -157,16 +154,24 @@ const ShadowResearchPage: React.FC = () => {
       setSignals([]);
       return;
     }
+    const normalizedCode = code.trim();
+    if (normalizedCode.length < 4) {
+      setSignals([]);
+      return;
+    }
     let active = true;
-    void shadowApi.listSignals(selectedProfileId, code)
-      .then((response) => {
-        if (active) setSignals(response.items ?? []);
-      })
-      .catch(() => {
-        if (active) setSignals([]);
-      });
+    const timer = window.setTimeout(() => {
+      void shadowApi.listSignals(selectedProfileId, normalizedCode)
+        .then((response) => {
+          if (active) setSignals(response.items ?? []);
+        })
+        .catch(() => {
+          if (active) setSignals([]);
+        });
+    }, 300);
     return () => {
       active = false;
+      window.clearTimeout(timer);
     };
   }, [code, selectedProfileId]);
 
@@ -207,18 +212,29 @@ const ShadowResearchPage: React.FC = () => {
   const handleBacktest = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!selected) return;
+    if (!code.trim()) {
+      setLocalError('请先填写股票或 ETF 代码。');
+      return;
+    }
     setBusy('backtest');
     setLocalError(null);
     setNotice(null);
     try {
       const payload: ShadowBacktestRequest = {
-        code,
+        code: code.trim(),
         splitDate,
-        observations: parseObservations(observationText),
+        marketDataStart,
+        marketDataEnd,
       };
+      const observations = parseObservations(observationText);
+      if (observations) payload.observations = observations;
       const response = await shadowApi.runBacktest(selected.profile.profileId, payload);
       updateDetail({ ...selected, latestRun: response.run });
-      setNotice(response.run.status === 'completed' ? '样本外回测完成，可以提交批准。' : '回测已降级：没有足够的样本外数据。');
+      const metrics = response.run.metrics ?? {};
+      const sampleMessage = `观测 ${String(metrics.observationCount ?? '--')} 条，样本外 ${String(metrics.outSampleCount ?? '--')} 条，可执行收益 ${String(metrics.outSampleReturnCount ?? '--')} 条`;
+      setNotice(response.run.status === 'completed'
+        ? `样本外回测完成（${sampleMessage}），可以提交批准。`
+        : `回测已降级（${sampleMessage}）。请扩大历史日期范围，或检查数据源是否返回了有效日线。`);
     } catch (caught) {
       if (caught instanceof SyntaxError || caught instanceof Error && !('response' in caught)) {
         setLocalError(caught instanceof Error ? caught.message : '观测数据 JSON 无效');
@@ -249,15 +265,24 @@ const ShadowResearchPage: React.FC = () => {
   const handleScan = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!selected) return;
+    if (!code.trim()) {
+      setLocalError('请先填写股票或 ETF 代码。');
+      return;
+    }
     setBusy('scan');
     setLocalError(null);
     setNotice(null);
     try {
-      const response = await shadowApi.scanSignals(selected.profile.profileId, {
-        code,
-        observations: parseObservations(observationText),
+      const payload = {
+        code: code.trim(),
+        marketDataStart,
+        marketDataEnd,
         runId: selected.latestRun?.runId,
-      });
+      } as const;
+      const observations = parseObservations(observationText);
+      const response = await shadowApi.scanSignals(selected.profile.profileId, observations
+        ? { ...payload, observations }
+        : payload);
       setSignals(response.items ?? []);
       setNotice(`扫描完成：${response.items?.length ?? 0} 条可审计影子信号。`);
     } catch (caught) {
@@ -337,19 +362,32 @@ const ShadowResearchPage: React.FC = () => {
               <div className="grid gap-3 sm:grid-cols-2">
                 <label className="block text-sm text-secondary-text">
                   股票代码
-                  <input className={`${INPUT_CLASS} mt-2`} value={code} onChange={(event) => setCode(event.target.value)} required />
+                  <input className={`${INPUT_CLASS} mt-2`} value={code} onChange={(event) => setCode(event.target.value)} placeholder="600519 / 159202" required />
                 </label>
                 <label className="block text-sm text-secondary-text">
                   样本外起点
                   <input className={`${INPUT_CLASS} mt-2`} type="date" value={splitDate} onChange={(event) => setSplitDate(event.target.value)} required />
                 </label>
               </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="block text-sm text-secondary-text">
+                  历史数据起点
+                  <input className={`${INPUT_CLASS} mt-2`} type="date" value={marketDataStart} onChange={(event) => setMarketDataStart(event.target.value)} required />
+                </label>
+                <label className="block text-sm text-secondary-text">
+                  历史数据终点
+                  <input className={`${INPUT_CLASS} mt-2`} type="date" value={marketDataEnd} onChange={(event) => setMarketDataEnd(event.target.value)} required />
+                </label>
+              </div>
+              <p className="text-xs leading-5 text-secondary-text">
+                冻结观测 JSON 可以留空；留空时后端会按上面的日期调用统一 Market Data，并逐日重算可见指标。手工 JSON 适合复盘已冻结的数据。
+              </p>
               <label className="block text-sm text-secondary-text">
                 冻结观测 JSON
-                <textarea className={`${TEXTAREA_CLASS} mt-2 min-h-52`} value={observationText} onChange={(event) => setObservationText(event.target.value)} aria-label="冻结观测 JSON" />
+                <textarea className={`${TEXTAREA_CLASS} mt-2 min-h-40`} value={observationText} onChange={(event) => setObservationText(event.target.value)} placeholder="留空以使用日期范围获取历史行情" aria-label="冻结观测 JSON" />
               </label>
               <div className="flex flex-wrap gap-2">
-                <Button type="submit" isLoading={busy === 'backtest'} loadingText="回测中...">
+                <Button type="submit" isLoading={busy === 'backtest'} disabled={!code.trim()} loadingText="回测中...">
                   <Play className="h-4 w-4" /> 执行回测
                 </Button>
                 <Button
@@ -370,10 +408,10 @@ const ShadowResearchPage: React.FC = () => {
                   <Badge variant={selected.latestRun.status === 'completed' ? 'success' : 'warning'}>{selected.latestRun.status}</Badge>
                 </div>
                 <div className="mt-3 grid grid-cols-2 gap-3 text-xs text-secondary-text sm:grid-cols-4">
-                  <Metric label="样本数" value={formatMetric(selected.latestRun.metrics, 'observation_count')} />
-                  <Metric label="样本外信号" value={formatMetric(selected.latestRun.metrics, 'out_sample_signal_count')} />
-                  <Metric label="平均收益" value={formatMetric(selected.latestRun.metrics, 'out_sample_avg_return_pct')} />
-                  <Metric label="胜率" value={formatMetric(selected.latestRun.metrics, 'out_sample_win_rate_pct')} />
+                  <Metric label="样本数" value={formatMetric(selected.latestRun.metrics, 'observationCount')} />
+                  <Metric label="样本外信号" value={formatMetric(selected.latestRun.metrics, 'outSampleSignalCount')} />
+                  <Metric label="平均收益" value={formatMetric(selected.latestRun.metrics, 'outSampleAvgReturnPct')} />
+                  <Metric label="胜率" value={formatMetric(selected.latestRun.metrics, 'outSampleWinRatePct')} />
                 </div>
                 <p className="mt-3 break-all font-mono text-[11px] text-secondary-text">snapshot: {selected.latestRun.sourceSnapshotHash}</p>
               </div>
@@ -383,8 +421,8 @@ const ShadowResearchPage: React.FC = () => {
           <Card title="扫描影子信号" subtitle="仅 approved profile">
             <form className="space-y-4" onSubmit={handleScan}>
               <p className="text-sm text-secondary-text">当前状态：<Badge variant={statusVariant(selected.profile.status)}>{STATUS_LABELS[selected.profile.status] ?? selected.profile.status}</Badge></p>
-              <p className="text-xs text-secondary-text">扫描复用上面的冻结观测；数据 cutoff、rule version、source snapshot hash 会随 signal 保存。</p>
-              <Button type="submit" variant="gradient" isLoading={busy === 'scan'} disabled={selected.profile.status !== 'approved'} loadingText="扫描中...">
+              <p className="text-xs text-secondary-text">扫描复用上面的冻结观测；观测 JSON 留空时按同一日期范围重新生成 point-in-time 数据。数据 cutoff、rule version、source snapshot hash 会随 signal 保存。</p>
+              <Button type="submit" variant="gradient" isLoading={busy === 'scan'} disabled={selected.profile.status !== 'approved' || !code.trim()} loadingText="扫描中...">
                 <FlaskConical className="h-4 w-4" /> 生成影子信号
               </Button>
             </form>

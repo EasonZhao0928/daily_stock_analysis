@@ -4,7 +4,7 @@
 Generate Stock Index from CSV File
 
 Input:
-  - Tushare format: data/stock_list_{a,hk,us}.csv
+  - Tushare format: data/stock_list_{a,hk,us}.csv; optional data/fund_list_etf.csv
   - Seed format: scripts/stock_index_seeds/stock_list_{jp,kr}.csv
   - AkShare format: logs/stock_basic_*.csv
 
@@ -106,6 +106,10 @@ def load_tushare_data(data_dir: Path) -> List[Dict[str, Any]]:
 
     market_files = {
         'CN': data_dir / 'stock_list_a.csv',
+        # ``fund_basic(market='E')`` can be exported separately because ETF
+        # permissions are independent from stock_basic.  The file is optional
+        # and is deliberately not required for ordinary stock-index builds.
+        'ETF': data_dir / 'fund_list_etf.csv',
         'HK': data_dir / 'stock_list_hk.csv',
         'US': data_dir / 'stock_list_us.csv',
         'JP': _csv_path('stock_list_jp.csv'),
@@ -127,9 +131,11 @@ def load_tushare_data(data_dir: Path) -> List[Dict[str, Any]]:
 
                 for row in reader:
                     # 传入市场参数以优化判断（对于特殊格式如 DUMMY）
-                    parsed = parse_stock_row(row, market_name)
+                    parsed = parse_stock_row(row, 'CN' if market_name == 'ETF' else market_name)
                     if not parsed:
                         continue
+                    if market_name == 'ETF':
+                        parsed['asset_type'] = 'etf'
 
                     if market_name == 'US':
                         # Tushare us_basic may include historical rows for a reused ticker.
@@ -573,6 +579,13 @@ def build_stock_index(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if alias != name and alias not in aliases:
                 aliases.append(alias)
 
+        asset_type = str(stock.get('asset_type') or '').strip().lower()
+        if asset_type not in {'stock', 'index', 'etf'}:
+            # Tushare's stock_basic export does not include funds.  Still
+            # classify bare A-share ETF codes when a supplemental fund list or
+            # another provider places them in the same CSV.
+            asset_type = 'etf' if is_cn_etf_symbol(symbol) else 'stock'
+
         index.append({
             "canonicalCode": ts_code,    # Example: 000001.SZ, AAPL
             "displayCode": symbol,       # Example: 000001, AAPL
@@ -581,12 +594,20 @@ def build_stock_index(stocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "pinyinAbbr": pinyin_abbr,
             "aliases": aliases,
             "market": market,
-            "assetType": "stock",
+            "assetType": asset_type,
             "active": True,
             "popularity": 100,
         })
 
     return index
+
+
+def is_cn_etf_symbol(symbol: str) -> bool:
+    """Return whether a six-digit mainland symbol uses an ETF code range."""
+    normalized = str(symbol or '').strip().upper()
+    return len(normalized) == 6 and normalized.isdigit() and normalized.startswith(
+        ('15', '16', '18', '50', '51', '52', '56', '58')
+    )
 
 
 def compress_index(index: List[Dict[str, Any]]) -> List[List]:

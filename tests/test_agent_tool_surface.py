@@ -488,10 +488,10 @@ _EXPECTED_PRODUCTION_TOOL_SNAPSHOT = {
             "side_effects": ["network_read", "db_write_cache"],
             "permissions": ["intel:read"],
             "policy_status": "declared",
-            "cancellation_safe": False,
+            "cancellation_safe": True,
         },
         "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
-        "codex_visible": False,
+        "codex_visible": True,
     },
     "get_market_indices": {
         "description": (
@@ -546,10 +546,10 @@ _EXPECTED_PRODUCTION_TOOL_SNAPSHOT = {
             "side_effects": ["network_read"],
             "permissions": ["market_data:read"],
             "policy_status": "declared",
-            "cancellation_safe": False,
+            "cancellation_safe": True,
         },
         "scope": {"scope_dimensions": [], "requires_stock_scope": False},
-        "codex_visible": False,
+        "codex_visible": True,
     },
     "get_skill_backtest_summary": {
         "description": (
@@ -645,10 +645,10 @@ _EXPECTED_PRODUCTION_TOOL_SNAPSHOT = {
             "side_effects": ["db_read"],
             "permissions": ["backtest:read"],
             "policy_status": "declared",
-            "cancellation_safe": False,
+            "cancellation_safe": True,
         },
         "scope": {"scope_dimensions": ["stock"], "requires_stock_scope": True},
-        "codex_visible": False,
+        "codex_visible": True,
     },
 }
 
@@ -1483,7 +1483,10 @@ def test_default_production_registry_only_exposes_bounded_tools_to_codex() -> No
         "get_portfolio_snapshot",
         "get_skill_backtest_summary",
         "get_strategy_backtest_summary",
+        "get_stock_backtest_summary",
         "search_stock_news",
+        "search_comprehensive_intel",
+        "get_sector_rankings",
         # Task 5.2-5.4 capability tools: bounded, read-only and cancellation-safe.
         "get_financial_statement",
         "get_consensus_estimate",

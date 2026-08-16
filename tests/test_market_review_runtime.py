@@ -217,6 +217,13 @@ class TestMarketReviewRuntimeCompatibility(unittest.TestCase):
 
                 self.assertTrue(has_configured_llm_runtime(config))
 
+    def test_has_configured_llm_runtime_treats_codex_app_server_as_runtime_without_api_keys(self) -> None:
+        config = self._base_config()
+        config.generation_backend = "codex_app_server"
+        config.generation_fallback_backend = ""
+
+        self.assertTrue(has_configured_llm_runtime(config))
+
     def test_has_configured_llm_runtime_supports_legacy_fields(self) -> None:
         base = self._base_config()
         test_configs = [

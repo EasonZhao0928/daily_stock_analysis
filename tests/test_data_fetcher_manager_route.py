@@ -276,8 +276,8 @@ def test_capability_route_forwards_the_query_history_window():
         ),
         SourcePolicy(primary_sources=("primary",)),
     )
-    assert ranged.calls[0][2] == "20250106"
-    assert ranged.calls[0][3] == "20260105"
+    assert ranged.calls[0][2] == "2025-01-06"
+    assert ranged.calls[0][3] == "2026-01-05"
 
 
 def test_capability_route_omits_window_for_narrow_adapters():

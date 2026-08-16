@@ -23,6 +23,7 @@ _PAPER_READ_POLICY = ToolPolicy.declared(
     read_only=True,
     side_effects=["db_read"],
     permissions=["paper:read"],
+    cancellation_safe=True,
     scope_dimensions=["account"],
     allowed_profiles=["paper_proposal"],
 )
@@ -44,6 +45,7 @@ _PAPER_PROPOSAL_READ_POLICY = ToolPolicy.declared(
     read_only=True,
     side_effects=["db_read"],
     permissions=["paper:proposal:read"],
+    cancellation_safe=True,
     scope_dimensions=["account"],
     allowed_profiles=["paper_proposal", "paper_approval"],
 )

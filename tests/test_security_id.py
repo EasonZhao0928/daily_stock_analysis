@@ -73,6 +73,7 @@ def test_security_id_does_not_treat_shanghai_b_share_as_bse() -> None:
         ("SH510300", "SH"),
         ("510300.SH", "SH"),
         ("588000", "SH"),
+        ("501018", "SH"),
         ("159915", "SZ"),
         ("SZ159915", "SZ"),
         ("159915.SZ", "SZ"),

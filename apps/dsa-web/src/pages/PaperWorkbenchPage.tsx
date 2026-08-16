@@ -93,8 +93,15 @@ const ProposalRow: React.FC<{
 
 const PaperWorkbenchPage: React.FC = () => {
   const [symbol, setSymbol] = useState(() => {
-    if (typeof window === 'undefined') return '600519';
-    return new URLSearchParams(window.location.search).get('symbol')?.trim() || '600519';
+    if (typeof window === 'undefined') return '';
+    return new URLSearchParams(window.location.search).get('symbol')?.trim() || '';
+  });
+  // Keep the editable form value separate from the symbol that has actually
+  // been loaded. This prevents typing from opening the live stream or loading
+  // account annotations before the user explicitly submits the form.
+  const [activeSymbol, setActiveSymbol] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    return new URLSearchParams(window.location.search).get('symbol')?.trim() || '';
   });
   const [period, setPeriod] = useState('daily');
   const [candles, setCandles] = useState<MarketCandle[]>([]);
@@ -124,7 +131,14 @@ const PaperWorkbenchPage: React.FC = () => {
 
   const loadMarket = useCallback(async () => {
     const normalized = symbol.trim();
-    if (!normalized) return;
+    if (!normalized) {
+      setActiveSymbol('');
+      setMarketError(null);
+      setCandleMeta(null);
+      setCandles([]);
+      setAnnotations([]);
+      return;
+    }
     setMarketLoading(true);
     setMarketError(null);
     try {
@@ -135,6 +149,7 @@ const PaperWorkbenchPage: React.FC = () => {
       setCandleMeta(candleResponse);
       setCandles(candleResponse.candles ?? []);
       setAnnotations(annotationResponse.items ?? []);
+      setActiveSymbol(normalized);
     } catch (caught) {
       setMarketError(getParsedApiError(caught));
     } finally {
@@ -158,7 +173,7 @@ const PaperWorkbenchPage: React.FC = () => {
         paperApi.listOrders(accountId),
         paperApi.listFills(accountId),
         paperApi.listRuns(accountId),
-        marketApi.getAnnotations(symbol.trim(), { accountId }),
+        activeSymbol.trim() ? marketApi.getAnnotations(activeSymbol, { accountId }) : Promise.resolve({ items: [] }),
       ]);
       const nextProposals = inspect.proposals ?? [];
       setAccount({ ...inspect, proposals: nextProposals });
@@ -181,12 +196,18 @@ const PaperWorkbenchPage: React.FC = () => {
     } finally {
       setAccountLoading(false);
     }
-  }, [accountIdText, symbol]);
+  }, [accountIdText, activeSymbol]);
 
   useEffect(() => {
     document.title = 'Paper Workbench - DSA';
-    void loadMarket();
-  }, [loadMarket]);
+    // Keep the form truly inert until the user submits it. A URL deep-link may
+    // still preload its explicitly supplied symbol, but typing into the empty
+    // form must not start a request or replace the submit button with a loader.
+    const initialSymbol = typeof window === 'undefined'
+      ? ''
+      : new URLSearchParams(window.location.search).get('symbol')?.trim() || '';
+    if (initialSymbol && initialSymbol === symbol.trim()) void loadMarket();
+  }, [loadMarket, symbol]);
 
   useEffect(() => {
     void paperApi.listAccounts().then((response) => setPaperAccounts(response.items ?? [])).catch(() => setPaperAccounts([]));
@@ -194,8 +215,12 @@ const PaperWorkbenchPage: React.FC = () => {
 
   useEffect(() => {
     const eventSourceConstructor = (window as Window & { EventSource?: typeof EventSource }).EventSource;
-    if (!eventSourceConstructor || !symbol.trim()) return undefined;
-    const stream = new eventSourceConstructor(`${API_BASE_URL}${marketApi.streamUrl(symbol, { period, intervalSeconds: 10 })}`);
+    const normalized = activeSymbol.trim();
+    if (!eventSourceConstructor || !normalized) {
+      setStreamDegraded(false);
+      return undefined;
+    }
+    const stream = new eventSourceConstructor(`${API_BASE_URL}${marketApi.streamUrl(normalized, { period, intervalSeconds: 10 })}`);
     const onSnapshot = (event: MessageEvent<string>) => {
       try {
         const payload = JSON.parse(event.data) as MarketCandleResponse;
@@ -213,7 +238,7 @@ const PaperWorkbenchPage: React.FC = () => {
     stream.addEventListener('error', () => setStreamDegraded(true));
     setStreamDegraded(false);
     return () => stream.close();
-  }, [period, symbol]);
+  }, [activeSymbol, period]);
 
   const proposals = account?.proposals ?? [];
   const accountState = account?.config.state ?? 'unknown';
@@ -335,12 +360,12 @@ const PaperWorkbenchPage: React.FC = () => {
       {notice ? <InlineAlert title="操作完成" message={notice} variant="success" /> : null}
 
       <Card title="行情与事件" subtitle="MARKET SNAPSHOT" className="space-y-4">
-        <form className="grid gap-3 md:grid-cols-[minmax(0,1fr)_9rem_auto]" onSubmit={(event) => { event.preventDefault(); void loadMarket(); }}>
-          <label className="space-y-1.5 text-xs text-secondary-text">
+        <form className="grid gap-3 md:grid-cols-[minmax(0,1fr)_9rem_auto] md:items-end" onSubmit={(event) => { event.preventDefault(); void loadMarket(); }}>
+          <label className="min-w-0 space-y-1.5 text-xs text-secondary-text">
             股票代码
             <input className={INPUT_CLASS} value={symbol} onChange={(event) => setSymbol(event.target.value)} placeholder="600519 / AAPL" aria-label="股票代码" />
           </label>
-          <label className="space-y-1.5 text-xs text-secondary-text">
+          <label className="min-w-0 space-y-1.5 text-xs text-secondary-text">
             周期
             <select className={`${INPUT_CLASS} appearance-none`} value={period} onChange={(event) => setPeriod(event.target.value)} aria-label="周期">
               <option value="daily">日线</option>
@@ -348,7 +373,8 @@ const PaperWorkbenchPage: React.FC = () => {
               <option value="monthly">月线</option>
             </select>
           </label>
-          <Button type="submit" className="self-end" isLoading={marketLoading}><RefreshCw className="h-4 w-4" />读取行情</Button>
+          <Button type="submit" className="w-full shrink-0 md:w-auto" isLoading={marketLoading} disabled={!symbol.trim()}><RefreshCw className="h-4 w-4" />读取行情</Button>
+          <p className="text-[11px] leading-5 text-muted-text md:col-span-3 md:-mt-1">留空不会请求行情、事件标注或实时流；填写代码后再点击读取行情。</p>
         </form>
         <div className="grid gap-5 lg:grid-cols-[minmax(0,1.4fr)_minmax(18rem,0.8fr)]">
           <div>

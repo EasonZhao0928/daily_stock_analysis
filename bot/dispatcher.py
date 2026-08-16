@@ -17,6 +17,11 @@ from typing import Dict, List, Optional, Type, Callable
 
 from bot.models import BotMessage, BotResponse
 from bot.commands.base import BotCommand
+from src.llm.backend_registry import (
+    resolve_generation_backend_id,
+    resolve_generation_fallback_backend_id,
+)
+from src.llm.generation_backend import GenerationError
 
 logger = logging.getLogger(__name__)
 
@@ -605,21 +610,8 @@ User: "analyze TSLA and NVDA using trend strategy"
     async def _parse_intent_via_llm(text: str, config) -> Optional[dict]:
         """Call LLM to parse user intent.  Returns parsed dict or None on failure."""
         try:
-            from src.agent.llm_adapter import LLMToolAdapter
-
-            messages = [
-                {"role": "system", "content": CommandDispatcher._NL_PARSE_PROMPT},
-                {"role": "user", "content": text},
-            ]
-            adapter = LLMToolAdapter(config)
-            resp = await asyncio.to_thread(
-                adapter.call_text,
-                messages,
-                temperature=0,
-                max_tokens=200,
-                timeout=10,
-            )
-            return CommandDispatcher._parse_intent_payload(resp.content or "")
+            raw = await asyncio.to_thread(CommandDispatcher._generate_intent_text, text, config)
+            return CommandDispatcher._parse_intent_payload(raw)
         except Exception as exc:
             logger.debug("[Dispatcher] NL parse LLM call failed: %s", exc)
             return None
@@ -628,23 +620,131 @@ User: "analyze TSLA and NVDA using trend strategy"
     def _parse_intent_via_llm_sync(text: str, config) -> Optional[dict]:
         """Synchronous variant for webhook/stream integrations."""
         try:
-            from src.agent.llm_adapter import LLMToolAdapter
-
-            messages = [
-                {"role": "system", "content": CommandDispatcher._NL_PARSE_PROMPT},
-                {"role": "user", "content": text},
-            ]
-            adapter = LLMToolAdapter(config)
-            resp = adapter.call_text(
-                messages,
-                temperature=0,
-                max_tokens=200,
-                timeout=10,
-            )
-            return CommandDispatcher._parse_intent_payload(resp.content or "")
+            raw = CommandDispatcher._generate_intent_text(text, config)
+            return CommandDispatcher._parse_intent_payload(raw)
         except Exception as exc:
             logger.debug("[Dispatcher] NL parse LLM call failed: %s", exc)
             return None
+
+    @staticmethod
+    def _generate_intent_text(text: str, config) -> str:
+        """Generate the small NL-router JSON payload through GenerationBackend."""
+        from src.analyzer import GeminiAnalyzer
+        from src.services.run_diagnostics import record_llm_run, record_llm_run_started
+
+        analyzer = GeminiAnalyzer(config=config)
+        primary_id = resolve_generation_backend_id(config)
+        primary = analyzer._get_generation_backend(primary_id)
+        fallback = None
+        fallback_id = resolve_generation_fallback_backend_id(config)
+        if fallback_id:
+            fallback = analyzer._get_generation_backend(fallback_id)
+
+        generation_config = {
+            "model": (
+                getattr(config, "codex_model", "")
+                or getattr(config, "litellm_model", "")
+                or None
+            ),
+            "temperature": 0,
+            "max_output_tokens": 200,
+            "timeout": 10,
+            "response_format": {"type": "json_object"},
+        }
+        started_at = time.monotonic()
+        model_name = generation_config.get("model")
+        record_llm_run_started(
+            provider=primary_id,
+            model=model_name,
+            call_type="bot_intent",
+            business_entry="bot_intent",
+            primary_backend=primary_id,
+            effective_backend=primary_id,
+        )
+        try:
+            result = primary.generate(
+                text,
+                generation_config,
+                system_prompt=CommandDispatcher._NL_PARSE_PROMPT,
+            )
+        except GenerationError as exc:
+            if fallback is None or not exc.fallbackable:
+                record_llm_run(
+                    success=False,
+                    provider=primary_id,
+                    model=model_name,
+                    call_type="bot_intent",
+                    business_entry="bot_intent",
+                    primary_backend=primary_id,
+                    effective_backend=primary_id,
+                    status="failed",
+                    error_code=exc.error_code.value,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    error_type=type(exc).__name__,
+                    error_message=exc,
+                )
+                raise
+            try:
+                result = fallback.generate(
+                    text,
+                    generation_config,
+                    system_prompt=CommandDispatcher._NL_PARSE_PROMPT,
+                )
+            except Exception as fallback_exc:
+                record_llm_run(
+                    success=False,
+                    provider=fallback_id,
+                    model=model_name,
+                    call_type="bot_intent",
+                    business_entry="bot_intent",
+                    primary_backend=primary_id,
+                    effective_backend=fallback_id,
+                    status="failed",
+                    attempt=2,
+                    fallback_from=primary_id,
+                    fallback_to=fallback_id,
+                    fallback_reason=exc.error_code.value,
+                    error_code=getattr(getattr(fallback_exc, "error_code", None), "value", None),
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    error_type=type(fallback_exc).__name__,
+                    error_message=fallback_exc,
+                )
+                raise
+            record_llm_run(
+                success=True,
+                provider=fallback_id,
+                model=getattr(result, "model", None) or model_name,
+                call_type="bot_intent",
+                business_entry="bot_intent",
+                primary_backend=primary_id,
+                effective_backend=fallback_id,
+                status="fallback_success",
+                attempt=2,
+                fallback_from=primary_id,
+                fallback_to=fallback_id,
+                fallback_reason=exc.error_code.value,
+                usage_available=bool(getattr(result, "usage", None)),
+                tokens=(getattr(result, "usage", None) or {}).get("total_tokens")
+                if isinstance(getattr(result, "usage", None), dict)
+                else None,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
+            return str(getattr(result, "text", "") or "")
+        record_llm_run(
+            success=True,
+            provider=primary_id,
+            model=getattr(result, "model", None) or model_name,
+            call_type="bot_intent",
+            business_entry="bot_intent",
+            primary_backend=primary_id,
+            effective_backend=primary_id,
+            usage_available=bool(getattr(result, "usage", None)),
+            tokens=(getattr(result, "usage", None) or {}).get("total_tokens")
+            if isinstance(getattr(result, "usage", None), dict)
+            else None,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        )
+        return str(getattr(result, "text", "") or "")
 
     @staticmethod
     def _parse_intent_payload(raw: str) -> Optional[dict]:

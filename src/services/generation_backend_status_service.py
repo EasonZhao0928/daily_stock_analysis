@@ -26,6 +26,7 @@ from src.config import (
     resolve_llm_channel_protocol,
 )
 from src.llm.backend_registry import (
+    CODEX_APP_SERVER_BACKEND_ID,
     LOCAL_CLI_GENERATION_BACKEND_IDS,
     LITELLM_BACKEND_ID,
     SUPPORTED_GENERATION_BACKENDS,
@@ -33,6 +34,7 @@ from src.llm.backend_registry import (
     resolve_generation_backend_id,
     resolve_generation_fallback_backend_id,
 )
+from src.llm.codex_app_server_backend import CodexAppServerGenerationBackend
 from src.llm.generation_backend import GenerationCapabilities, GenerationError, GenerationErrorCode
 from src.llm.hermes import (
     HERMES_DEFAULT_BASE_URL,
@@ -101,6 +103,7 @@ _LOCAL_CLI_NUMERIC_SPECS = (
         MAX_LOCAL_CLI_BACKEND_MAX_CONCURRENCY,
     ),
 )
+_CODEX_NUMERIC_SPECS = _LOCAL_CLI_NUMERIC_SPECS[:3]
 _LITELLM_NUMERIC_SPECS = (_GENERATION_BACKEND_MAX_CONCURRENCY_SPEC,)
 
 
@@ -187,12 +190,19 @@ class GenerationBackendStatusService:
         effective_map: Dict[str, str],
         validation_issues: Optional[List[Dict[str, Any]]] = None,
         analyzer_factory: Optional[Callable[[Config], GeminiAnalyzer]] = None,
+        account_probe: Optional[Callable[[Any], Dict[str, Any]]] = None,
     ) -> None:
         self._effective_map = {str(k).upper(): "" if v is None else str(v) for k, v in effective_map.items()}
         self._validation_issues = list(validation_issues or [])
         self._analyzer_factory = analyzer_factory or (lambda config: GeminiAnalyzer(config=config))
+        self._account_probe = account_probe or self._default_account_probe
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(
+        self,
+        *,
+        include_agent_status: bool = False,
+        include_account: bool = False,
+    ) -> Dict[str, Any]:
         config = self._build_backend_config()
         try:
             primary_id = resolve_generation_backend_id(config)
@@ -204,13 +214,14 @@ class GenerationBackendStatusService:
                 fallback_target=None,
                 error=exc,
             )
-            return {
+            return self._with_unified_status({
                 "primary_backend_id": primary["backend_id"],
                 "fallback_backend_id": None,
                 "primary": primary,
                 "fallback": None,
                 "backends": [primary],
-            }
+            }, config=config, primary_id=primary["backend_id"], fallback_id=None,
+                include_agent_status=include_agent_status, include_account=include_account)
 
         fallback_error: Optional[GenerationError] = None
         try:
@@ -249,13 +260,209 @@ class GenerationBackendStatusService:
         backends = [primary]
         if fallback is not None:
             backends.append(fallback)
-        return {
+        return self._with_unified_status({
             "primary_backend_id": primary_id,
             "fallback_backend_id": fallback_id,
             "primary": primary,
             "fallback": fallback,
             "backends": backends,
+        }, config=config, primary_id=primary_id, fallback_id=fallback_id,
+            include_agent_status=include_agent_status, include_account=include_account)
+
+    def quick_check(self) -> Dict[str, Any]:
+        """Run static/protocol/account checks without sending a model turn."""
+        return self.get_status(include_agent_status=True, include_account=True)
+
+    def _with_unified_status(
+        self,
+        payload: Dict[str, Any],
+        *,
+        config: Any,
+        primary_id: str,
+        fallback_id: Optional[str],
+        include_agent_status: bool,
+        include_account: bool,
+    ) -> Dict[str, Any]:
+        """Add the cross-backend status projection without changing old fields."""
+        agent_status: Dict[str, Any]
+        capability: Dict[str, Any] = {}
+        if include_agent_status:
+            from src.services.agent_backend_status_service import (
+                AgentBackendStatusService,
+                evaluate_agent_backend_config,
+            )
+
+            agent_service = AgentBackendStatusService(effective_map=self._effective_map)
+            try:
+                evaluation = evaluate_agent_backend_config(
+                    agent_service._build_config()
+                )
+            except Exception:
+                evaluation = {"backend": "unknown", "available": False}
+
+            if evaluation.get("backend") == CODEX_APP_SERVER_BACKEND_ID and evaluation.get("available"):
+                try:
+                    capability = agent_service.codex_capability_status()
+                except Exception:
+                    capability = {
+                        "backend": CODEX_APP_SERVER_BACKEND_ID,
+                        "available": False,
+                        "error_code": "capability_unsupported",
+                        "message": "Codex capability check failed",
+                    }
+                agent_status = {
+                    key: capability.get(key)
+                    for key in ("backend", "available", "experimental", "version", "error_code", "message")
+                }
+            else:
+                try:
+                    agent_status = agent_service.get_status()
+                except Exception:
+                    agent_status = {
+                        "backend": str(evaluation.get("backend") or "unknown"),
+                        "available": False,
+                        "experimental": False,
+                        "version": None,
+                        "error_code": "capability_unsupported",
+                        "message": "Agent backend status is unavailable",
+                    }
+        else:
+            configured_agent = (self._effective_map.get("AGENT_BACKEND") or "auto").strip().lower()
+            agent_status = {
+                "backend": configured_agent,
+                "available": False,
+                "experimental": configured_agent == CODEX_APP_SERVER_BACKEND_ID,
+                "version": None,
+                "error_code": "not_checked",
+                "message": "Agent backend status was not requested",
+            }
+
+        agent_id = str(agent_status.get("backend") or "")
+        generation_codex = primary_id == CODEX_APP_SERVER_BACKEND_ID
+        fallback_codex = fallback_id == CODEX_APP_SERVER_BACKEND_ID
+        agent_codex = agent_id == CODEX_APP_SERVER_BACKEND_ID
+        codex_selected = generation_codex or fallback_codex or agent_codex
+
+        if codex_selected and not capability:
+            from src.services.agent_backend_status_service import AgentBackendStatusService
+
+            capability_map = dict(self._effective_map)
+            capability_map.update(
+                {
+                    "AGENT_BACKEND": CODEX_APP_SERVER_BACKEND_ID,
+                    "AGENT_ARCH": "single",
+                    "AGENT_MODE": "true",
+                }
+            )
+            try:
+                capability = AgentBackendStatusService(effective_map=capability_map).codex_capability_status()
+            except Exception:
+                capability = {
+                    "backend": CODEX_APP_SERVER_BACKEND_ID,
+                    "available": False,
+                    "error_code": "capability_unsupported",
+                    "message": "Codex capability check failed",
+                }
+
+        account_payload: Dict[str, Any]
+        if codex_selected and include_account:
+            try:
+                account_payload = self._account_probe(config)
+            except Exception:
+                account_payload = {
+                    "status": "unavailable",
+                    "account": None,
+                    "rate_limits": None,
+                    "error_code": "capability_unsupported",
+                    "message": "Codex account quick check failed",
+                }
+        else:
+            account_payload = {
+                "status": "not_checked" if codex_selected else "not_applicable",
+                "account": None,
+                "rate_limits": None,
+                "error_code": None,
+                "message": None,
+            }
+
+        generation_available = bool(payload.get("primary", {}).get("available"))
+        agent_available = bool(agent_status.get("available"))
+        unified_effective = generation_codex and agent_codex and generation_available and agent_available
+        codex_status = {
+            "effective": unified_effective,
+            "selected": codex_selected,
+            "model": (self._effective_map.get("CODEX_MODEL") or "").strip() or None,
+            "platform": capability.get("platform"),
+            "binary": capability.get("binary"),
+            "protocol": capability.get("protocol"),
+            "account_status": ((account_payload.get("account") or {}).get("status")
+                               if isinstance(account_payload.get("account"), dict) else None),
+            "account": account_payload.get("account"),
+            "rate_limits": account_payload.get("rate_limits"),
+            "rate_limit_error_code": account_payload.get("rate_limit_error_code"),
+            "error_code": capability.get("error_code") or account_payload.get("error_code"),
+            "message": capability.get("message") or account_payload.get("message"),
         }
+        payload.update(
+            {
+                "generation": {
+                    "primary": primary_id,
+                    "fallback": fallback_id,
+                    "backends": payload.get("backends", []),
+                },
+                "agent": agent_status,
+                "fallback_policy": {
+                    "generation": {
+                        "primary": primary_id,
+                        "fallback": fallback_id,
+                        "explicit": "GENERATION_FALLBACK_BACKEND" in self._effective_map,
+                        "fail_closed_when_empty": primary_id == CODEX_APP_SERVER_BACKEND_ID,
+                        "cost_warning": fallback_id == LITELLM_BACKEND_ID
+                        and primary_id == CODEX_APP_SERVER_BACKEND_ID,
+                    },
+                    "agent": {
+                        "primary": agent_id,
+                        "fallback": None,
+                        "policy": "fail_closed",
+                    },
+                },
+                "unified_codex_effective": unified_effective,
+                "codex_model": codex_status["model"],
+                "codex": codex_status,
+                "capability_exceptions": {
+                    "vision": {
+                        "supported": False,
+                        "backend": "VISION_MODEL",
+                        "reason": "independent_vision_provider",
+                    },
+                    "deep_research": {
+                        "supported": False,
+                        "error_code": "unsupported_capability",
+                        "reason": "multi_agent_orchestration_not_adapted",
+                    },
+                },
+            }
+        )
+        return payload
+
+    @staticmethod
+    def _default_account_probe(config: Any) -> Dict[str, Any]:
+        """Read account/rate limits through the official App Server only."""
+        from src.services.codex_account_service import CodexAccountService, CodexAccountServiceError
+
+        service = CodexAccountService(config=config)
+        try:
+            return {"status": "checked", **service.status()}
+        except CodexAccountServiceError as exc:
+            return {
+                "status": "unavailable",
+                "account": None,
+                "rate_limits": None,
+                "error_code": exc.code,
+                "message": "Codex account status is unavailable",
+            }
+        finally:
+            service.close()
 
     def smoke_test(
         self,
@@ -263,6 +470,7 @@ class GenerationBackendStatusService:
         backend_id: Optional[str] = None,
         mode: str = "json",
         timeout_seconds: Optional[float] = None,
+        confirm_quota_risk: bool = True,
     ) -> Dict[str, Any]:
         request: Optional[_SmokeRequest] = None
         try:
@@ -271,6 +479,29 @@ class GenerationBackendStatusService:
                 mode=mode,
                 timeout_seconds=timeout_seconds,
             )
+            if request.backend_id == CODEX_APP_SERVER_BACKEND_ID and not confirm_quota_risk:
+                status = self._build_status(
+                    backend_id=request.backend_id,
+                    is_primary=request.backend_id == self._primary_backend_id(),
+                    fallback_target=None,
+                    health_status="not_tested",
+                )
+                return {
+                    "success": False,
+                    "mode": request.mode,
+                    "message": "Codex smoke 可能消耗一次订阅额度；请确认后再次执行",
+                    "requires_confirmation": True,
+                    "quota_risk": {
+                        "may_consume_subscription_quota": True,
+                        "estimated_model_requests": 1,
+                    },
+                    "scope": {
+                        "tools_enabled": False,
+                        "market_data_access": False,
+                        "persist_report": False,
+                    },
+                    "status": status,
+                }
             self._run_smoke(request)
         except GenerationError as exc:
             failed_backend_id = str(
@@ -293,7 +524,11 @@ class GenerationBackendStatusService:
             return {
                 "success": False,
                 "mode": normalized_mode,
-                "message": exc.message,
+                "message": exc.user_message,
+                "error": exc.to_dict(),
+                "requires_confirmation": False,
+                "quota_risk": self._quota_risk(request.backend_id if request else failed_backend_id),
+                "scope": self._smoke_scope(),
                 "status": status,
             }
         except Exception as exc:
@@ -322,6 +557,10 @@ class GenerationBackendStatusService:
                 "success": False,
                 "mode": normalized_mode,
                 "message": redact_diagnostic_text(str(exc) or error.message, limit=500),
+                "error": error.to_dict(),
+                "requires_confirmation": False,
+                "quota_risk": self._quota_risk(request.backend_id if request else failed_backend_id),
+                "scope": self._smoke_scope(),
                 "status": status,
             }
 
@@ -335,7 +574,25 @@ class GenerationBackendStatusService:
             "success": True,
             "mode": request.mode,
             "message": "生成后端冒烟测试通过",
+            "requires_confirmation": False,
+            "quota_risk": self._quota_risk(request.backend_id),
+            "scope": self._smoke_scope(),
             "status": status,
+        }
+
+    @staticmethod
+    def _smoke_scope() -> Dict[str, bool]:
+        return {
+            "tools_enabled": False,
+            "market_data_access": False,
+            "persist_report": False,
+        }
+
+    @staticmethod
+    def _quota_risk(backend_id: str) -> Dict[str, Any]:
+        return {
+            "may_consume_subscription_quota": backend_id == CODEX_APP_SERVER_BACKEND_ID,
+            "estimated_model_requests": 1,
         }
 
     def _primary_backend_id(self) -> str:
@@ -456,7 +713,12 @@ class GenerationBackendStatusService:
         if health_status == "not_tested" and cheap_error is not None:
             current_health = "failed"
         capabilities = self._capabilities_for_backend(backend_id)
-        backend_type = "local_cli" if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS else "litellm"
+        if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            backend_type = "local_cli"
+        elif backend_id == CODEX_APP_SERVER_BACKEND_ID:
+            backend_type = "codex_app_server"
+        else:
+            backend_type = "litellm"
         return {
             "backend_id": backend_id,
             "backend_type": backend_type,
@@ -470,7 +732,8 @@ class GenerationBackendStatusService:
             "is_primary": is_primary,
             "fallback_target": fallback_target,
             "max_concurrency": self._max_concurrency_for_backend(backend_id, config),
-            "usage_available": backend_id == LITELLM_BACKEND_ID,
+            "usage_available": backend_id in {LITELLM_BACKEND_ID, CODEX_APP_SERVER_BACKEND_ID},
+            "cost_status": "unknown" if backend_id == CODEX_APP_SERVER_BACKEND_ID else None,
             "last_error_code": _as_error_code(status_error.error_code) if status_error else None,
             "last_error_message": status_error.message if status_error else None,
         }
@@ -498,6 +761,8 @@ class GenerationBackendStatusService:
         if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
             preset = resolve_local_cli_preset(backend_id)
             return LocalCliGenerationBackend(config, preset_id=backend_id, preset=preset).get_config_error()
+        if backend_id == CODEX_APP_SERVER_BACKEND_ID:
+            return CodexAppServerGenerationBackend(config).get_config_error()
         if backend_id == LITELLM_BACKEND_ID:
             validation_error = self._validation_issue_error(backend_id)
             if validation_error is not None:
@@ -619,7 +884,12 @@ class GenerationBackendStatusService:
         )
 
     def _numeric_config_error_for_backend(self, backend_id: str) -> Optional[GenerationError]:
-        specs = _LOCAL_CLI_NUMERIC_SPECS if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS else _LITELLM_NUMERIC_SPECS
+        if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            specs = _LOCAL_CLI_NUMERIC_SPECS
+        elif backend_id == CODEX_APP_SERVER_BACKEND_ID:
+            specs = _CODEX_NUMERIC_SPECS
+        else:
+            specs = _LITELLM_NUMERIC_SPECS
         for spec in specs:
             error = _validate_int_config_value(
                 backend_id=backend_id,
@@ -657,6 +927,8 @@ class GenerationBackendStatusService:
     def _capabilities_for_backend(backend_id: str) -> GenerationCapabilities:
         if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
             return LocalCliGenerationBackend.capabilities
+        if backend_id == CODEX_APP_SERVER_BACKEND_ID:
+            return CodexAppServerGenerationBackend.capabilities
         return GenerationCapabilities(
             supports_json=True,
             supports_tools=True,
@@ -711,13 +983,18 @@ class GenerationBackendStatusService:
                 _LOCAL_CLI_NUMERIC_SPECS[3],
             ),
             opencode_cli_model=(self._effective_map.get("OPENCODE_CLI_MODEL") or "").strip(),
+            codex_model=(self._effective_map.get("CODEX_MODEL") or "").strip(),
             litellm_model=litellm_model,
             llm_model_list=model_list,
         )
 
     def _fallback_from_map(self) -> str:
         if "GENERATION_FALLBACK_BACKEND" not in self._effective_map:
-            return LITELLM_BACKEND_ID
+            primary = normalize_backend_id(
+                self._effective_map.get("GENERATION_BACKEND"),
+                default=LITELLM_BACKEND_ID,
+            )
+            return "" if primary == CODEX_APP_SERVER_BACKEND_ID else LITELLM_BACKEND_ID
         return (self._effective_map.get("GENERATION_FALLBACK_BACKEND") or "").strip().lower()
 
     def build_effective_config(
@@ -737,6 +1014,7 @@ class GenerationBackendStatusService:
             generation_backend_max_concurrency=config.generation_backend_max_concurrency,
             local_cli_backend_max_concurrency=config.local_cli_backend_max_concurrency,
             opencode_cli_model=config.opencode_cli_model,
+            codex_model=config.codex_model,
             litellm_model=config.litellm_model,
             litellm_fallback_models=self._split_csv(self._effective_map.get("LITELLM_FALLBACK_MODELS") or ""),
             llm_model_list=config.llm_model_list,

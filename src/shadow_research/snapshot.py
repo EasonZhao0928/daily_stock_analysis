@@ -5,12 +5,52 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import date, datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
 
 class SnapshotError(ValueError):
     """Feature snapshot is not deterministic or violates cutoff visibility."""
+
+
+_DEFAULT_SHADOW_SOURCE_PRIORITY = (
+    "efinance",
+    "akshare",
+    "baostock",
+    "tushare",
+    "tickflow",
+    "yfinance",
+)
+
+
+def _shadow_source_policy() -> Any:
+    """Build the bounded source route used by Shadow Research.
+
+    Pytdx is intentionally opt-in here.  Its multi-host retry strategy can
+    spend tens of seconds on an unreachable network, while Shadow Research
+    only needs deterministic daily bars and already has Baostock/Tushare and
+    other fallbacks.  Operators can add it explicitly through
+    ``SHADOW_RESEARCH_SOURCE_PRIORITY`` when it is the preferred source.
+    """
+    from data_provider.market_data_types import SourcePolicy
+
+    configured = os.getenv("SHADOW_RESEARCH_SOURCE_PRIORITY", "")
+    source_chain = tuple(dict.fromkeys(
+        item.strip().lower()
+        for item in configured.split(",")
+        if item.strip()
+    )) or _DEFAULT_SHADOW_SOURCE_PRIORITY
+    try:
+        timeout = float(os.getenv("SHADOW_RESEARCH_SOURCE_TIMEOUT_SECONDS", "15"))
+    except (TypeError, ValueError):
+        timeout = 15.0
+    timeout = min(max(timeout, 1.0), 60.0)
+    return SourcePolicy(
+        primary_sources=source_chain,
+        timeout_seconds=timeout,
+        allow_stale=False,
+    )
 
 
 def build_market_observations(
@@ -31,8 +71,15 @@ def build_market_observations(
         raise SnapshotError("start_date must not be after end_date")
     from data_provider.market_data_types import DataQuery, DataStatus, SourcePolicy
 
-    policy = source_policy or SourcePolicy(timeout_seconds=15.0, allow_stale=False)
-    envelope = market_data_manager.fetch(DataQuery("daily_data", code, as_of=end_date), policy)
+    policy = source_policy or _shadow_source_policy()
+    # Forward both bounds to the capability route. Without ``start`` a
+    # provider is free to use its own default lookback window, which can omit
+    # the user's requested in-sample period and make a valid OOS run appear
+    # degraded even though the provider has the data.
+    envelope = market_data_manager.fetch(
+        DataQuery("daily_data", code, start=start_date, as_of=end_date),
+        policy,
+    )
     if envelope.status is not DataStatus.OK:
         raise SnapshotError(f"market data unavailable: {envelope.status.value}")
     payload = envelope.data

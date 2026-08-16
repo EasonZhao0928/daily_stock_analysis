@@ -15,12 +15,19 @@ import logging
 import math
 import re
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple, Callable
 
-import litellm
 from json_repair import repair_json
-from litellm import Router
+
+from src.llm import litellm_transport as _litellm_transport
+
+# Compatibility aliases retained for downstream tests/extensions that patch
+# ``src.analyzer.litellm`` or ``src.analyzer.Router``.  Production dispatch is
+# routed through ``src.llm.litellm_transport`` below.
+litellm = _litellm_transport.provider_module()
+Router = _litellm_transport.Router
 
 from src.agent.llm_adapter import (
     get_thinking_extra_body,
@@ -52,6 +59,7 @@ from src.llm.hermes import (
 from src.llm.generation_params import apply_litellm_generation_params
 from src.llm.errors import call_litellm_with_param_recovery
 from src.llm.backend_registry import (
+    CODEX_APP_SERVER_BACKEND_ID,
     LOCAL_CLI_GENERATION_BACKEND_IDS,
     LITELLM_BACKEND_ID,
     resolve_generation_backend_id,
@@ -70,6 +78,7 @@ from src.llm.usage import (
     normalize_litellm_usage,
     should_persist_usage_telemetry,
 )
+
 from src.llm.local_cli_backend import redact_diagnostic_text
 from src.llm.provider_cache import (
     apply_prompt_cache_hints,
@@ -103,6 +112,10 @@ from src.market_context import detect_market, get_market_role, get_market_guidel
 from src.services.daily_market_context import format_daily_market_context_prompt_section
 from src.market_phase_prompt import format_market_phase_prompt_section
 from src.market_structure_prompt import format_market_structure_prompt_section
+
+NON_LITELLM_GENERATION_BACKEND_IDS = frozenset(
+    {*LOCAL_CLI_GENERATION_BACKEND_IDS, CODEX_APP_SERVER_BACKEND_ID}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1730,6 +1743,10 @@ class AnalysisResult:
 
     # ========== 模型标记（Issue #528）==========
     model_used: Optional[str] = None  # 分析使用的 LLM 模型（完整名，如 gemini/gemini-2.0-flash）
+    generation_primary_backend: Optional[str] = None
+    generation_backend_used: Optional[str] = None
+    generation_attempt: Optional[int] = None
+    generation_fallback_reason: Optional[str] = None
 
     # ========== 历史对比（Report Engine P0）==========
     query_id: Optional[str] = None  # 本次分析 query_id，用于历史对比时排除本次记录
@@ -1776,6 +1793,10 @@ class AnalysisResult:
             'current_price': self.current_price,
             'change_pct': self.change_pct,
             'model_used': self.model_used,
+            'generation_primary_backend': self.generation_primary_backend,
+            'generation_backend_used': self.generation_backend_used,
+            'generation_attempt': self.generation_attempt,
+            'generation_fallback_reason': self.generation_fallback_reason,
             'market_structure_context': self.market_structure_context,
         }
 
@@ -2286,6 +2307,11 @@ class GeminiAnalyzer:
         self._resolved_prompt_state: Optional[Dict[str, Any]] = None
         self._router = None
         self._legacy_router_model_list: List[Dict[str, Any]] = []
+        self._generation_backend_cache: Dict[str, GenerationBackend] = {}
+        self._generation_call_metadata: ContextVar[Dict[str, Any]] = ContextVar(
+            "analyzer_generation_call_metadata",
+            default={},
+        )
         self._litellm_available = False
         self._init_litellm()
         if not self._litellm_available:
@@ -2293,7 +2319,7 @@ class GeminiAnalyzer:
                 backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
             except GenerationError:
                 backend_id = ""
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 logger.info(
                     "Analyzer generation backend: %s configured; LiteLLM API keys are not "
                     "required for stock analysis generation",
@@ -2305,6 +2331,22 @@ class GeminiAnalyzer:
     def _get_runtime_config(self) -> Config:
         """Return the runtime config, honoring injected overrides for tests/pipeline."""
         return getattr(self, "_config_override", None) or get_config()
+
+    def get_generation_call_metadata(self) -> Dict[str, Any]:
+        """Return safe metadata for the most recent generation in this context."""
+        context_var = getattr(self, "_generation_call_metadata", None)
+        if not isinstance(context_var, ContextVar):
+            return {}
+        metadata = context_var.get()
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def _store_generation_call_metadata(self, metadata: Dict[str, Any]) -> None:
+        """Store generation metadata, including for legacy ``__new__`` test doubles."""
+        context_var = getattr(self, "_generation_call_metadata", None)
+        if not isinstance(context_var, ContextVar):
+            context_var = ContextVar(f"analyzer_generation_call_metadata_{id(self)}", default={})
+            self._generation_call_metadata = context_var
+        context_var.set(dict(metadata))
 
     def _get_skill_prompt_sections(self) -> tuple[str, str, bool]:
         """Resolve skill instructions + default baseline + prompt mode."""
@@ -2460,7 +2502,7 @@ class GeminiAnalyzer:
                 backend_id = resolve_generation_backend_id(config)
             except GenerationError:
                 pass
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 logger.info(
                     "Analyzer LiteLLM: LITELLM_MODEL not configured; using %s generation backend",
                     backend_id,
@@ -2489,7 +2531,8 @@ class GeminiAnalyzer:
                     logger.info("Analyzer LLM: Hermes-only route will use direct no-proxy completion")
                     return
             try:
-                self._router = Router(
+                self._router = _litellm_transport.build_router(
+                    router_cls=Router,
                     model_list=router_model_list,
                     routing_strategy="simple-shuffle",
                     num_retries=2,
@@ -2534,7 +2577,8 @@ class GeminiAnalyzer:
         if len(legacy_model_list) > 1:
             self._legacy_router_model_list = legacy_model_list
             try:
-                self._router = Router(
+                self._router = _litellm_transport.build_router(
+                    router_cls=Router,
                     model_list=legacy_model_list,
                     routing_strategy="simple-shuffle",
                     num_retries=2,
@@ -2563,7 +2607,7 @@ class GeminiAnalyzer:
         if backend_error is not None:
             return self._can_use_generation_fallback(backend_error)
         backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
-        if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+        if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
             return True
         return self._litellm_runtime_available()
 
@@ -2601,7 +2645,7 @@ class GeminiAnalyzer:
                 mixed_error = self._get_mixed_hermes_route_error(config, model)
                 if mixed_error is not None:
                     return mixed_error
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 backend = self._get_generation_backend(backend_id)
                 get_config_error = getattr(backend, "get_config_error", None)
                 if callable(get_config_error):
@@ -2770,7 +2814,7 @@ class GeminiAnalyzer:
             hermes_kwargs.pop("api_base", None)
             with open_hermes_no_proxy_client(api_key=api_key, base_url=base_url, timeout=timeout) as client:
                 hermes_kwargs["client"] = client
-                return litellm.completion(**hermes_kwargs)
+                return _litellm_transport.completion(**hermes_kwargs)
 
         wire_models = resolve_fallback_litellm_wire_models(model, config.llm_model_list)
         register_fallback_model_pricing(wire_models)
@@ -2784,7 +2828,7 @@ class GeminiAnalyzer:
         if keys:
             effective_kwargs["api_key"] = keys[0]
         effective_kwargs.update(extra_litellm_params(model, config))
-        return litellm.completion(**effective_kwargs)
+        return _litellm_transport.completion(**effective_kwargs)
 
     def _normalize_usage(
         self,
@@ -2964,11 +3008,20 @@ class GeminiAnalyzer:
         """Return the configured generation backend."""
         config = self._get_runtime_config()
         resolved_backend_id = backend_id or self._resolve_generation_backend_config()[0]
-        return create_generation_backend(
+        cache = getattr(self, "_generation_backend_cache", None)
+        if cache is None:
+            cache = {}
+            self._generation_backend_cache = cache
+        cached = cache.get(resolved_backend_id)
+        if cached is not None:
+            return cached
+        backend = create_generation_backend(
             resolved_backend_id,
             config=config,
             litellm_completion_callable=self._call_litellm_impl,
         )
+        cache[resolved_backend_id] = backend
+        return backend
 
     def _call_litellm(
         self,
@@ -2984,8 +3037,24 @@ class GeminiAnalyzer:
         """Compatibility wrapper around the configured generation backend."""
         preflight_error = self.get_generation_backend_config_error()
         if preflight_error is not None and not self._can_use_generation_fallback(preflight_error):
+            self._store_generation_call_metadata(
+                {
+                    "primary_backend": preflight_error.backend,
+                    "effective_backend": None,
+                    "attempt": 0,
+                    "status": "failed",
+                    "error_code": preflight_error.error_code.value,
+                }
+            )
             raise preflight_error
         backend_id, fallback_backend_id = self._resolve_generation_backend_config()
+        call_metadata: Dict[str, Any] = {
+            "primary_backend": backend_id,
+            "effective_backend": backend_id,
+            "attempt": 1,
+            "status": "running",
+        }
+        self._store_generation_call_metadata(call_metadata)
         try:
             result = self._get_generation_backend(backend_id).generate(
                 prompt,
@@ -2996,12 +3065,47 @@ class GeminiAnalyzer:
                 response_validator=response_validator,
                 audit_context=audit_context,
             )
+            call_metadata.update(
+                {
+                    "effective_backend": getattr(result, "backend", backend_id),
+                    "model": getattr(result, "model", None),
+                    "attempt": 1,
+                    "status": "success",
+                    "usage_available": bool(getattr(result, "usage", None)),
+                    "tokens": (getattr(result, "usage", None) or {}).get("total_tokens")
+                    if isinstance(getattr(result, "usage", None), dict)
+                    else None,
+                }
+            )
         except GenerationError as exc:
+            call_metadata.update(
+                {
+                    "status": "failed",
+                    "error_code": exc.error_code.value,
+                    "error_backend": exc.backend,
+                    "fallback_from": exc.backend,
+                    "fallback_reason": exc.error_code.value,
+                }
+            )
             if not exc.fallbackable or not fallback_backend_id:
                 raise
+            call_metadata.update(
+                {
+                    "effective_backend": fallback_backend_id,
+                    "attempt": 2,
+                    "status": "fallback",
+                }
+            )
             try:
                 fallback_backend = self._get_generation_backend(fallback_backend_id)
             except GenerationError as fallback_exc:
+                call_metadata.update(
+                    {
+                        "status": "failed",
+                        "error_code": fallback_exc.error_code.value,
+                        "error_backend": fallback_backend_id,
+                    }
+                )
                 raise GenerationError(
                     error_code=fallback_exc.error_code,
                     stage="fallback",
@@ -3030,9 +3134,35 @@ class GeminiAnalyzer:
                     response_validator=response_validator,
                     audit_context=audit_context,
                 )
+                call_metadata.update(
+                    {
+                        "effective_backend": getattr(result, "backend", fallback_backend_id),
+                        "model": getattr(result, "model", None),
+                        "attempt": 2,
+                        "status": "fallback_success",
+                        "usage_available": bool(getattr(result, "usage", None)),
+                        "tokens": (getattr(result, "usage", None) or {}).get("total_tokens")
+                        if isinstance(getattr(result, "usage", None), dict)
+                        else None,
+                    }
+                )
             except _AllModelsFailedError:
+                call_metadata.update(
+                    {
+                        "status": "failed",
+                        "error_code": GenerationErrorCode.UNKNOWN_BACKEND_ERROR.value,
+                        "error_backend": fallback_backend_id,
+                    }
+                )
                 raise
             except GenerationError as fallback_exc:
+                call_metadata.update(
+                    {
+                        "status": "failed",
+                        "error_code": fallback_exc.error_code.value,
+                        "error_backend": fallback_exc.backend,
+                    }
+                )
                 raise GenerationError(
                     error_code=fallback_exc.error_code,
                     stage="fallback",
@@ -3059,6 +3189,13 @@ class GeminiAnalyzer:
                     },
                 ) from fallback_exc
             except Exception as fallback_exc:
+                call_metadata.update(
+                    {
+                        "status": "failed",
+                        "error_code": GenerationErrorCode.UNKNOWN_BACKEND_ERROR.value,
+                        "error_backend": fallback_backend_id,
+                    }
+                )
                 raise GenerationError(
                     error_code=GenerationErrorCode.UNKNOWN_BACKEND_ERROR,
                     stage="fallback",
@@ -3078,6 +3215,7 @@ class GeminiAnalyzer:
                         "fallback_error": str(fallback_exc),
                     },
                 ) from fallback_exc
+        self._store_generation_call_metadata(call_metadata)
         return result.text, result.model, result.usage
 
     def _call_litellm_impl(
@@ -3524,7 +3662,7 @@ class GeminiAnalyzer:
             config = self._get_runtime_config()
             backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
             model_name = config.litellm_model or "unknown"
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            if backend_id in NON_LITELLM_GENERATION_BACKEND_IDS:
                 model_name = backend_id
                 legacy_audit_context["transport"] = backend_id
             logger.info(f"========== AI 分析 {name}({code}) ==========")
@@ -3533,13 +3671,10 @@ class GeminiAnalyzer:
             logger.info(f"[LLM配置] 是否包含新闻: {'是' if news_context else '否'}")
 
             # 本地 CLI backend 是进程执行能力，不记录完整 prompt。
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
-                prompt_preview = redact_diagnostic_text(prompt, limit=500)
-            else:
-                prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
+            # Never log a full prompt.  Even provider-backed legacy generation
+            # may contain account, portfolio, or news details.
+            prompt_preview = redact_diagnostic_text(prompt, limit=500)
             logger.info(f"[LLM Prompt 预览]\n{prompt_preview}")
-            if backend_id not in LOCAL_CLI_GENERATION_BACKEND_IDS:
-                logger.debug(f"=== 完整 Prompt ({len(prompt)}字符) ===\n{prompt}\n=== End Prompt ===")
 
             # 设置生成配置
             generation_config = {
@@ -3585,15 +3720,8 @@ class GeminiAnalyzer:
                 logger.info(
                     f"[LLM返回] {model_name} 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符"
                 )
-                if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
-                    response_preview = redact_diagnostic_text(response_text, limit=300)
-                else:
-                    response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
+                response_preview = redact_diagnostic_text(response_text, limit=300)
                 logger.info(f"[LLM返回 预览]\n{response_preview}")
-                if backend_id not in LOCAL_CLI_GENERATION_BACKEND_IDS:
-                    logger.debug(
-                        f"=== {model_name} 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ==="
-                    )
                 # Keep parser/retry progress monotonic so task progress/message never "goes backward".
                 parse_progress = min(99, 93 + retry_count * 2)
                 _emit_progress(parse_progress, f"{name}：LLM 返回完成，正在解析 JSON")
@@ -3604,6 +3732,11 @@ class GeminiAnalyzer:
                 result.search_performed = bool(news_context)
                 result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
+                generation_metadata = self.get_generation_call_metadata()
+                result.generation_primary_backend = generation_metadata.get("primary_backend") or backend_id
+                result.generation_backend_used = generation_metadata.get("effective_backend") or backend_id
+                result.generation_attempt = generation_metadata.get("attempt") or 1
+                result.generation_fallback_reason = generation_metadata.get("fallback_reason")
                 result.report_language = report_language
                 normalize_chip_structure_availability(result, context.get("chip"))
 

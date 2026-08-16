@@ -72,8 +72,10 @@ export interface ShadowObservation {
 
 export interface ShadowBacktestRequest {
   code: string;
-  observations: ShadowObservation[];
+  observations?: ShadowObservation[];
   splitDate: string;
+  marketDataStart?: string;
+  marketDataEnd?: string;
   feeBps?: number;
   slippageBps?: number;
   sourceRefs?: Array<Record<string, unknown>>;
@@ -93,7 +95,9 @@ export interface ShadowApprovalRequest {
 
 export interface ShadowScanRequest {
   code: string;
-  observations: ShadowObservation[];
+  observations?: ShadowObservation[];
+  marketDataStart?: string;
+  marketDataEnd?: string;
   runId?: string;
   evidenceRefs?: Array<Record<string, unknown>>;
 }

@@ -9,6 +9,7 @@ Tools:
 
 import logging
 
+from src.agent.tools.execution import check_tool_execution
 from src.agent.tools.registry import ToolParameter, ToolDefinition, ToolPolicy
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,10 @@ _INTEL_READ_POLICY = ToolPolicy.declared(
     side_effects=["network_read", "db_write_cache"],
     permissions=["intel:read"],
     scope_dimensions=["stock"],
+    # The search adapter runs inside the isolated Codex tool worker.  Its
+    # network/cache work is bounded by the worker deadline and can therefore
+    # be terminated safely on cancel, just like the adjacent news tool.
+    cancellation_safe=True,
 )
 
 
@@ -152,6 +157,7 @@ search_stock_news_tool = ToolDefinition(
 
 def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict:
     """Multi-dimensional intelligence search."""
+    check_tool_execution()
     service = _get_search_service()
 
     if not service.is_available:
@@ -162,6 +168,7 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
         stock_name=stock_name,
         max_searches=6,
     )
+    check_tool_execution()
 
     if not intel_results:
         return {"error": "Comprehensive intel search returned no results"}

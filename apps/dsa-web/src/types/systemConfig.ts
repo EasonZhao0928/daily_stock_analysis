@@ -108,7 +108,7 @@ export type GenerationBackendSmokeMode = 'text' | 'json';
 
 export interface GenerationBackendStatus {
   backendId: string;
-  backendType: 'litellm' | 'local_cli';
+  backendType: 'litellm' | 'local_cli' | 'codex_app_server';
   providerId: string;
   available: boolean;
   healthStatus: GenerationBackendHealthStatus;
@@ -120,6 +120,7 @@ export interface GenerationBackendStatus {
   fallbackTarget?: string | null;
   maxConcurrency: number;
   usageAvailable: boolean;
+  costStatus?: string | null;
   lastErrorCode?: string | null;
   lastErrorMessage?: string | null;
 }
@@ -130,6 +131,13 @@ export interface GenerationBackendStatusResponse {
   primary: GenerationBackendStatus;
   fallback?: GenerationBackendStatus | null;
   backends: GenerationBackendStatus[];
+  generation?: Record<string, unknown>;
+  agent?: Record<string, unknown>;
+  fallbackPolicy?: Record<string, unknown>;
+  unifiedCodexEffective?: boolean;
+  codexModel?: string | null;
+  codex?: Record<string, unknown>;
+  capabilityExceptions?: Record<string, unknown>;
 }
 
 export interface ExportSystemConfigResponse {
@@ -154,6 +162,7 @@ export interface TestGenerationBackendRequest {
   items?: SystemConfigUpdateItem[];
   maskToken?: string;
   timeoutSeconds?: number | null;
+  confirmQuotaRisk?: boolean;
 }
 
 export interface TestGenerationBackendResponse {
@@ -161,6 +170,14 @@ export interface TestGenerationBackendResponse {
   mode: GenerationBackendSmokeMode;
   message: string;
   status: GenerationBackendStatus;
+  requiresConfirmation?: boolean;
+  quotaRisk?: Record<string, unknown>;
+  scope?: Record<string, boolean>;
+}
+
+export interface CodexQuickCheckRequest {
+  items?: SystemConfigUpdateItem[];
+  maskToken?: string;
 }
 
 export interface AgentBackendStatusResponse {
@@ -323,6 +340,17 @@ export interface TestNotificationChannelResponse {
   retryable: boolean;
   latencyMs?: number | null;
   attempts: NotificationTestAttempt[];
+}
+
+export interface WeChatChannelStatusResponse {
+  enabled: boolean;
+  baseUrlConfigured: boolean;
+  tokenRefConfigured: boolean;
+  credentialConfigured: boolean;
+  allowlistCount: number;
+  pollTimeoutMs: number;
+  ready: boolean;
+  message: string;
 }
 
 export interface DiscoverLLMChannelModelsRequest {

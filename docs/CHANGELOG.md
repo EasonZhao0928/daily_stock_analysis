@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [测试] 完成本轮 Web lint/test/build 与 Paper Workbench 浏览器 smoke；保留真实 Codex OAuth、在线供应商、微信扫码和生产部署为 opt-in 验收。
 - [文档] 新增前后端变更总览，并重写本地/服务器操作手册，补充 `.env` 分组、Codex App Server 登录、systemd、SSH 密码流程和 Caddy HTTPS 反向代理。
 - [文档] 明确区分 `GENERATION_BACKEND=codex_cli`（可用于日报/个股分析/大盘复盘）与 `AGENT_BACKEND=codex_app_server`（问股 Chat/Paper proposal）。
+- [文档] 更新本地/服务器操作手册，明确 `codex_app_server` 是“本地 App Server 进程 + 远端 ChatGPT OAuth/模型”，补充 unified Codex env、device-code 登录、真实模型/在线数据/CI/Caddy 验收；当前不支持仅配置远程 App Server URL 而免装 Codex。
+- [新功能] 增加 `GENERATION_BACKEND=codex_app_server` 普通 Generation adapter，日报、市场复盘和普通文本生成可复用官方 Codex App Server 登录态；未显式配置 `GENERATION_FALLBACK_BACKEND` 时保持 fail-closed。
+- [改进] Generation backend 状态页新增 generation/Agent 组合状态、Codex 平台/协议/账号/rate-limit quick check、vision/Deep Research 能力例外和 Codex smoke 额度确认；quick-check 不发送模型 turn，smoke 默认要求显式确认。
+- [修复] 用户验收问题收敛：Codex Agent 暴露 28 个取消安全的研究/持仓只读工具并修正 setup 状态，Paper 空代码改为显式加载且不因输入打开 SSE，Shadow 查询增加日期范围/防抖/有界数据源，ETF 50xxxx 识别和个人微信状态卡片补齐。
+- [修复] 继续收敛 Paper/Shadow/分析失败路径：Paper 表单和侧栏增加响应式宽度约束，Shadow 日期窗口统一为 ISO 并将单源默认超时设为 15 秒；Codex unified preset 不再把普通个股/ETF 报告误路由到旧 LiteLLM Agent。
 
 ## [3.30.0] - 2026-08-09
 

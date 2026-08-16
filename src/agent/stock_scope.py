@@ -114,7 +114,13 @@ def extract_stock_codes(text: str) -> List[str]:
         (r"(?<![a-zA-Z])(?:SH|SZ|BJ)\d{6}(?!\d)", re.IGNORECASE),
         (r"(?<![a-zA-Z])hk\d{4,5}(?!\d)", re.IGNORECASE),
         (r"(?<![a-zA-Z])\d{1,5}\.HK(?![a-zA-Z])", re.IGNORECASE),
-        (r"(?<!\d)(?:[03648]\d{5}|92\d{4})(?!\d)", 0),
+        # Accept the complete six-digit mainland symbol space.  The old
+        # prefix allow-list covered common stocks/BSE but excluded ETF
+        # prefixes such as 15xxxx (for example 159202), which meant a strict
+        # Codex turn never received a stock scope and could not call any
+        # stock-scoped DSA tool.  Digit boundaries still prevent extracting a
+        # substring from a longer number.
+        (r"(?<!\d)\d{6}(?!\d)", 0),
         (r"(?<!\d)\d{5}(?!\d)", 0),
         (r"(?<![a-zA-Z.])([A-Z]{2,5}(?:\.[A-Z]{1,2})?)(?![a-zA-Z0-9])", 0),
     ):

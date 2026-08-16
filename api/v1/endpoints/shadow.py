@@ -82,7 +82,15 @@ def approve_shadow_profile(profile_id: str, request: ShadowApprovalRequest, db_m
 @router.post("/profiles/{profile_id}/scan")
 def scan_shadow_signals(profile_id: str, request: ShadowScanRequest, db_manager: DatabaseManager = Depends(get_database_manager)):
     try:
-        return {"items": _service(db_manager).scan_signals(profile_id, code=request.code, observations=request.observations, run_id=request.run_id, evidence_refs=request.evidence_refs)}
+        return {"items": _service(db_manager).scan_signals(
+            profile_id,
+            code=request.code,
+            observations=request.observations,
+            market_data_start=request.market_data_start,
+            market_data_end=request.market_data_end,
+            run_id=request.run_id,
+            evidence_refs=request.evidence_refs,
+        )}
     except ShadowStateError as exc:
         raise HTTPException(status_code=409, detail={"error": "shadow_state_error", "message": str(exc)})
     except ValueError as exc:

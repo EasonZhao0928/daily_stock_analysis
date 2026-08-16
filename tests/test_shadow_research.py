@@ -83,9 +83,14 @@ def test_backtest_rejects_future_feature_and_duplicate_dates() -> None:
 
 
 def test_market_snapshot_builder_calculates_only_visible_features() -> None:
+    seen_policy = {}
+
     class Manager:
         def fetch(self, query, policy):
+            seen_policy["value"] = policy
             assert isinstance(query, DataQuery)
+            assert query.start == date(2026, 8, 10)
+            assert query.as_of == date(2026, 8, 12)
             return DataEnvelope(
                 capability="daily_data",
                 security_id=query.security_id,
@@ -112,6 +117,8 @@ def test_market_snapshot_builder_calculates_only_visible_features() -> None:
     assert observations[0]["features"]["ma20"] == pytest.approx(10)
     assert observations[0]["next_return_pct"] == pytest.approx(10)
     assert snapshot["snapshot_hash"]
+    assert seen_policy["value"].timeout_seconds == pytest.approx(15.0)
+    assert "pytdx" not in seen_policy["value"].source_chain
 
 
 def test_backtest_attributes_halted_and_price_limit_failures() -> None:

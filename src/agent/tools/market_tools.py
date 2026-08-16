@@ -9,6 +9,7 @@ Tools:
 
 import logging
 
+from src.agent.tools.execution import check_tool_execution
 from src.agent.tools.registry import ToolParameter, ToolDefinition, ToolPolicy
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ _MARKET_READ_POLICY = ToolPolicy.declared(
     read_only=True,
     side_effects=["network_read"],
     permissions=["market_data:read"],
+    cancellation_safe=True,
 )
 _MARKET_INDEX_POLICY = ToolPolicy.declared(
     read_only=True,
@@ -78,8 +80,10 @@ get_market_indices_tool = ToolDefinition(
 
 def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     """Get sector performance rankings."""
+    check_tool_execution()
     manager = _get_fetcher_manager()
     result = manager.get_sector_rankings(n=top_n)
+    check_tool_execution()
 
     if result is None:
         return {"error": "No sector ranking data available"}

@@ -161,9 +161,17 @@ def controlled_environment(source: Optional[Dict[str, str]] = None) -> Dict[str,
     return {name: environment[name] for name in _ALLOWED_ENV_NAMES if environment.get(name)}
 
 
-def dynamic_tool_specs(surface: ToolSurface, names: Iterable[str]) -> list[dict]:
-    """Convert ToolSurface MCP descriptors into App Server dynamic tools."""
-    descriptors = {item["name"]: item for item in surface.list_tools("mcp_descriptor")}
+def dynamic_tool_specs(
+    surface: ToolSurface,
+    names: Iterable[str],
+    *,
+    profile: Optional[Any] = None,
+) -> list[dict]:
+    """Convert profile-visible ToolSurface descriptors into App Server tools."""
+    descriptors = {
+        item["name"]: item
+        for item in surface.list_tools("mcp_descriptor", profile=profile)
+    }
     specs = []
     for name in names:
         descriptor = descriptors.get(name)
@@ -462,22 +470,31 @@ class CodexAppServerTransport:
         tool_names: Sequence[str],
         base_instructions: str,
         developer_instructions: str,
+        model: Optional[str] = None,
     ) -> str:
         if self.safe_cwd is None:
             raise RuntimeError("transport not started")
+        thread_params = {
+            "approvalPolicy": "never",
+            "baseInstructions": base_instructions,
+            "cwd": str(self.safe_cwd),
+            "developerInstructions": developer_instructions,
+            "dynamicTools": dynamic_tool_specs(
+                self.tool_surface,
+                tool_names,
+                profile=self.execution_profile,
+            ),
+            "environments": [],
+            "ephemeral": True,
+            "permissions": PERMISSION_PROFILE,
+            "runtimeWorkspaceRoots": [str(self.safe_cwd)],
+        }
+        normalized_model = str(model or "").strip()
+        if normalized_model:
+            thread_params["model"] = normalized_model
         result = self.request(
             "thread/start",
-            {
-                "approvalPolicy": "never",
-                "baseInstructions": base_instructions,
-                "cwd": str(self.safe_cwd),
-                "developerInstructions": developer_instructions,
-                "dynamicTools": dynamic_tool_specs(self.tool_surface, tool_names),
-                "environments": [],
-                "ephemeral": True,
-                "permissions": PERMISSION_PROFILE,
-                "runtimeWorkspaceRoots": [str(self.safe_cwd)],
-            },
+            thread_params,
         )
         thread = result.get("thread") or {}
         thread_id = thread.get("id")
@@ -579,7 +596,22 @@ class CodexAppServerTransport:
                 code = "cancelled"
             else:
                 normalized_info = str(info or "").strip().casefold()
-                code = "login_required" if normalized_info == "unauthorized" else "unknown_backend_error"
+                normalized_message = str(error.get("message") or "").strip().casefold()
+                if normalized_info in {"unauthorized", "authentication_required"}:
+                    code = "login_required"
+                elif any(
+                    marker in f"{normalized_info} {normalized_message}"
+                    for marker in (
+                        "rate_limit",
+                        "ratelimit",
+                        "quota_exceeded",
+                        "usage_limit",
+                        "too_many_requests",
+                    )
+                ):
+                    code = "rate_limit_exceeded"
+                else:
+                    code = "unknown_backend_error"
             message = redact_diagnostic_value(
                 error.get("message", f"Turn ended with status {status}"),
                 limit=500,

@@ -20,6 +20,7 @@ from src.agent.codex_app_server_transport import (
     ToolCallRecord,
     build_hardened_command,
 )
+from src.agent.codex_app_server_runtime import CodexAppServerRuntimeFactory
 from src.agent.codex_tool_process import MAX_TOOL_RESULT_BYTES
 from src.agent.stream_events import stream_event
 from src.agent.tool_surface import ToolSurface
@@ -63,10 +64,18 @@ class CodexAgentBackend(AgentBackend):
         tool_surface: ToolSurface,
         config: Any,
         transport_factory: Callable[..., CodexAppServerTransport] = CodexAppServerTransport,
+        runtime_factory: Optional[CodexAppServerRuntimeFactory] = None,
     ) -> None:
         self.tool_surface = tool_surface
         self.config = config
         self.transport_factory = transport_factory
+        # Resolve the module-level command builder at session time so existing
+        # tests and controlled deployments can patch it without bypassing the
+        # shared RuntimeFactory seam.
+        self.runtime_factory = runtime_factory or CodexAppServerRuntimeFactory(
+            transport_factory=transport_factory,
+            command_factory=lambda **kwargs: build_hardened_command(**kwargs),
+        )
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         timeout = request.max_wall_clock_seconds
@@ -121,22 +130,15 @@ class CodexAgentBackend(AgentBackend):
                 )
 
         try:
-            command = build_hardened_command(
-                timeout=remaining_timeout(),
-                deadline=deadline,
-                cancel_event=request.cancel_event,
-            )
-            with self.transport_factory(
-                command,
+            with self.runtime_factory.session(
+                mode="agent",
+                request_timeout=remaining_timeout(),
                 tool_surface=self.tool_surface,
                 tool_context=tool_context,
-                request_timeout=remaining_timeout(),
                 tool_event_callback=on_tool_event,
                 deadline=deadline,
                 cancel_event=request.cancel_event,
                 tool_profile=PERMISSION_PROFILE,
-                # The DSA Execution Profile comes from the surface itself, so
-                # this transport authorizes exactly like the LiteLLM one.
                 execution_profile=self.tool_surface.default_profile,
                 max_tool_calls=request.max_steps,
             ) as client:
@@ -146,6 +148,7 @@ class CodexAgentBackend(AgentBackend):
                     for item in self.tool_surface.list_tools(
                         "public",
                         cancellation_safe_only=True,
+                        profile=self.tool_surface.default_profile,
                     )
                 ]
                 if not tool_names:

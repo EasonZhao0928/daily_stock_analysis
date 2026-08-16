@@ -126,6 +126,9 @@ describe('PaperWorkbenchPage', () => {
     render(<PaperWorkbenchPage />);
 
     expect(await screen.findByText('市场与 Paper 交易工作台')).toBeInTheDocument();
+    expect(getCandles).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText('股票代码'), { target: { value: '600519' } });
+    fireEvent.click(screen.getByRole('button', { name: '读取行情' }));
     expect(await screen.findByText('最新收盘')).toBeInTheDocument();
     expect(screen.getByText('paper_proposal')).toBeInTheDocument();
 
@@ -134,6 +137,40 @@ describe('PaperWorkbenchPage', () => {
     expect(await screen.findByText(/策略账户/)).toBeInTheDocument();
     expect(screen.getByText('趋势与成交量同步改善')).toBeInTheDocument();
     expect(inspect).toHaveBeenCalledWith(7);
+  });
+
+  it('keeps the market form empty and does not request a default symbol', async () => {
+    render(<PaperWorkbenchPage />);
+
+    expect(await screen.findByText('市场与 Paper 交易工作台')).toBeInTheDocument();
+    expect(screen.getByLabelText('股票代码')).toHaveValue('');
+    expect(screen.getByRole('button', { name: '读取行情' })).toBeDisabled();
+    expect(screen.getByText('留空不会请求行情、事件标注或实时流；填写代码后再点击读取行情。')).toHaveClass('md:col-span-3');
+    expect(getCandles).not.toHaveBeenCalled();
+    expect(getAnnotations).not.toHaveBeenCalled();
+  });
+
+  it('does not open the live stream until the symbol is explicitly loaded', async () => {
+    const previousEventSource = window.EventSource;
+    const eventSource = vi.fn(class MockEventSource {
+      readonly url: string;
+      constructor(url: string) { this.url = url; }
+      addEventListener = vi.fn();
+      close = vi.fn();
+    });
+    Object.defineProperty(window, 'EventSource', { configurable: true, writable: true, value: eventSource });
+
+    try {
+      render(<PaperWorkbenchPage />);
+      fireEvent.change(screen.getByLabelText('股票代码'), { target: { value: '600519' } });
+      expect(eventSource).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole('button', { name: '读取行情' }));
+      await waitFor(() => expect(getCandles).toHaveBeenCalledWith('600519', expect.anything()));
+      await waitFor(() => expect(eventSource).toHaveBeenCalledWith('/api/v1/market/600519/stream'));
+    } finally {
+      Object.defineProperty(window, 'EventSource', { configurable: true, writable: true, value: previousEventSource });
+    }
   });
 
   it('approves a proposal and lets the server create its virtual order', async () => {
