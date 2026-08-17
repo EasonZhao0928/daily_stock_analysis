@@ -880,6 +880,14 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    # Promax 聚合网关（Tushare 兼容响应体，配置后作为最高优先级数据源）
+    promax_api_key: Optional[str] = None
+    promax_base_url: str = "https://pcd.mobcvb.cn/tushare/pro"
+    promax_priority: int = -2
+    promax_verify_ssl: bool = False
+    promax_rate_limit_per_minute: int = 200
+    promax_timeout: int = 30
+    promax_max_retries: int = 3
     tickflow_api_key: Optional[str] = None
     tickflow_kline_adjust: str = "none"
     tickflow_priority: int = 2
@@ -1407,6 +1415,7 @@ class Config:
                 'sina.com.cn',     # 新浪财经 (Akshare)
                 '163.com',         # 网易财经 (Akshare)
                 'tushare.pro',     # Tushare
+                'mobcvb.cn',       # Promax 聚合网关 (PromaxFetcher)
                 'baostock.com',    # Baostock
                 'sse.com.cn',      # 上交所
                 'szse.cn',         # 深交所
@@ -1812,6 +1821,21 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            promax_api_key=os.getenv('PROMAX_API_KEY') or None,
+            promax_base_url=(os.getenv('PROMAX_BASE_URL') or '').strip() or 'https://pcd.mobcvb.cn/tushare/pro',
+            # 允许负数：优先级数字越小越优先，-2 需排在 Tushare 的 -1 之前
+            promax_priority=parse_env_int(os.getenv('PROMAX_PRIORITY'), -2, field_name='PROMAX_PRIORITY'),
+            promax_verify_ssl=parse_env_bool(os.getenv('PROMAX_VERIFY_SSL'), default=False),
+            promax_rate_limit_per_minute=parse_env_int(
+                os.getenv('PROMAX_RATE_LIMIT_PER_MINUTE'), 200,
+                field_name='PROMAX_RATE_LIMIT_PER_MINUTE', minimum=1,
+            ),
+            promax_timeout=parse_env_int(
+                os.getenv('PROMAX_TIMEOUT'), 30, field_name='PROMAX_TIMEOUT', minimum=1,
+            ),
+            promax_max_retries=parse_env_int(
+                os.getenv('PROMAX_MAX_RETRIES'), 3, field_name='PROMAX_MAX_RETRIES', minimum=0,
+            ),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             tickflow_kline_adjust=normalize_tickflow_kline_adjust(os.getenv('TICKFLOW_KLINE_ADJUST')),
             tickflow_priority=parse_env_int(os.getenv('TICKFLOW_PRIORITY'), 2, field_name='TICKFLOW_PRIORITY', minimum=0),
@@ -2959,11 +2983,12 @@ class Config:
     @classmethod
     def _resolve_realtime_source_priority(cls) -> str:
         """
-        Resolve realtime source priority with automatic tushare injection.
+        Resolve realtime source priority with automatic promax/tushare injection.
 
-        When TUSHARE_TOKEN is configured but REALTIME_SOURCE_PRIORITY is not
-        explicitly set, automatically prepend 'tushare' to the default priority
-        so that the paid data source is utilized for realtime quotes as well.
+        When PROMAX_API_KEY or TUSHARE_TOKEN is configured but
+        REALTIME_SOURCE_PRIORITY is not explicitly set, prepend the paid
+        sources to the default priority so they are used for realtime quotes
+        as well.  Promax goes first because it is the primary gateway.
         """
         explicit = os.getenv('REALTIME_SOURCE_PRIORITY')
         default_priority = 'tencent,akshare_sina,efinance,akshare_em'
@@ -2972,15 +2997,20 @@ class Config:
             # User explicitly set priority, respect it
             return explicit
 
-        tushare_token = os.getenv('TUSHARE_TOKEN', '').strip()
-        if tushare_token:
-            # Token configured but no explicit priority override
-            # Prepend tushare so the paid source is tried first
+        prefixes = []
+        if os.getenv('PROMAX_API_KEY', '').strip():
+            prefixes.append('promax')
+        if os.getenv('TUSHARE_TOKEN', '').strip():
+            prefixes.append('tushare')
+
+        if prefixes:
             import logging
             logger = logging.getLogger(__name__)
-            resolved = f'tushare,{default_priority}'
+            resolved = ','.join(prefixes + [default_priority])
             logger.info(
-                f"TUSHARE_TOKEN detected, auto-injecting tushare into realtime priority: {resolved}"
+                "Paid data source credentials detected (%s), "
+                "auto-injecting into realtime priority: %s",
+                ', '.join(prefixes), resolved,
             )
             return resolved
 

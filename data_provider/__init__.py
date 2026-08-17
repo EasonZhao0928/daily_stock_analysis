@@ -10,6 +10,10 @@
 3. 防封禁流控策略
 
 数据源优先级（动态调整）：
+【配置了 PROMAX_API_KEY 时】
+0. PromaxFetcher (Priority -2) - 🔥 最高优先级，Tushare 兼容聚合网关
+   （美股不走此源，父类对美股代码直接抛错并回落到 yfinance/finnhub/longbridge）
+
 【配置了 TUSHARE_TOKEN 时】
 1. TushareFetcher (Priority 0) - 🔥 最高优先级（动态提升）
 2. EfinanceFetcher (Priority 0) - 同优先级
@@ -37,6 +41,7 @@ from .efinance_fetcher import EfinanceFetcher
 from .tencent_fetcher import TencentFetcher
 from .akshare_fetcher import AkshareFetcher, is_hk_stock_code
 from .tushare_fetcher import TushareFetcher
+from .promax_fetcher import PromaxFetcher
 from .pytdx_fetcher import PytdxFetcher
 from .baostock_fetcher import BaostockFetcher
 from .yfinance_fetcher import YfinanceFetcher
@@ -79,6 +84,7 @@ __all__ = [
     'TencentFetcher',
     'AkshareFetcher',
     'TushareFetcher',
+    'PromaxFetcher',
     'PytdxFetcher',
     'BaostockFetcher',
     'YfinanceFetcher',

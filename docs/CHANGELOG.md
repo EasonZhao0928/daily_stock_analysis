@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 更新 DSA × Vibe-Trading 实施任务与最终一致性审计，记录离线门禁、未在线验证项和回滚边界。
 - [修复] Codex 子进程不再把沙箱权限名当作 DSA Execution Profile，profile 无效时硬失败；LiteLLM 与 Codex 现在按同一 profile 授权工具。
 - [修复] `approval_mode=auto_paper` 必须显式开启 `PAPER_AUTO_MODE_ENABLED` 才可创建与自动建单；扩展行情能力受 `EXTENDED_MARKET_DATA_ENABLED` 控制，移除无消费者的 `SHADOW_BACKGROUND_SCAN_ENABLED`。
+- [新功能] 新增 Promax 聚合网关数据源 `PromaxFetcher`：配置 `PROMAX_API_KEY` 后以优先级 `-2` 作为 A 股/港股日线、实时行情、股票列表与筹码数据的首选源，现有免费源与 Tushare 官方降为兜底；美股不参与该源，仍走 YFinance / Finnhub / Longbridge。
+- [新功能] Promax 数据源接入大盘涨跌统计（`daily`+`limit_list_d`，新增炸板家数）、概念题材涨跌榜（`dc_index`，此前该能力全链路失败）与个股所属板块（`ths_member`+`ths_index`）。
+- [改进] Promax 实时行情改用 `rt_k` 并由 `daily_basic` 自行补齐量比/换手率/市盈率/市值，不再跨源调用腾讯；网关不可用时返回空并回落下游，不再静默降级到 Tushare 官方 SDK。
+- [修复] Promax 大盘统计不再沿用父类的通配符 `ts_code` 写法（网关不支持、静默返回空并连带触发 `stock_basic` 长时间卡死），改按交易日取数并按交易日缓存；全市场重型调用改为快速失败，避免重试放大成分钟级阻塞。
+- [文档] 新增 `docs/promax-capability-survey.md`，逐项记录项目各数据能力在 Promax 网关上的可用性、耗时与失效模式。
 - [修复] Paper Proposal 工具面收敛为冻结上下文与提案工具，不再暴露实时行情等未来数据来源。
 - [修复] Paper Observation 对行情与账户输入同样执行 cutoff 校验，时间戳缺失或不可解析时拒绝而非放行。
 - [修复] K 线能力路由转发起止时间与条数，修复 `limit`/`start` 被丢弃导致的图表只返回约 30 天数据。

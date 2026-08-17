@@ -639,6 +639,8 @@ class DataFetcherManager:
         "TencentFetcher": {"cn"},
         "AkshareFetcher": {"cn", "hk"},
         "TushareFetcher": {"cn", "hk"},
+        # 与 Tushare 同源：网关 us_daily 传日期区间会 5xx，实时也不覆盖美股
+        "PromaxFetcher": {"cn", "hk"},
         "TickFlowFetcher": {"cn"},
         "PytdxFetcher": {"cn"},
         "BaostockFetcher": {"cn"},
@@ -1222,6 +1224,14 @@ class DataFetcherManager:
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
         optional_fetchers: List[BaseFetcher] = []
+
+        promax_api_key = (getattr(config, "promax_api_key", None) or "").strip()
+        if promax_api_key:
+            from .promax_fetcher import PromaxFetcher
+            # Promax 聚合网关，默认优先级 -2，排在所有数据源之前
+            optional_fetchers.append(PromaxFetcher())
+        else:
+            logger.debug("[数据源初始化] 跳过未配置的 PromaxFetcher")
 
         tushare_token = (getattr(config, "tushare_token", None) or "").strip()
         if tushare_token:
@@ -2209,6 +2219,16 @@ class DataFetcherManager:
                         )
                         quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', stock_code, source="tencent")
                 
+                elif source == "promax":
+                    fetcher = self._get_fetcher_by_name("PromaxFetcher", capability="realtime_quote")
+                    if fetcher is not None and hasattr(fetcher, 'get_realtime_quote'):
+                        record_provider_run_started(
+                            data_type="realtime_quote",
+                            provider=fetcher.name,
+                            operation="get_realtime_quote",
+                        )
+                        quote = self._call_fetcher_method(fetcher, 'get_realtime_quote', raw_stock_code or stock_code)
+
                 elif source == "tushare":
                     fetcher = self._get_fetcher_by_name("TushareFetcher", capability="realtime_quote")
                     if fetcher is not None and hasattr(fetcher, 'get_realtime_quote'):

@@ -133,6 +133,11 @@ DEFAULT_SUPPLIER_POLICIES: Mapping[str, SupplierPolicy] = {
     "eastmoney": SupplierPolicy(max_concurrency=2, min_interval_seconds=0.15, jitter_seconds=0.05),
     "tencent": SupplierPolicy(max_concurrency=3, min_interval_seconds=0.05, jitter_seconds=0.02),
     "tushare": SupplierPolicy(max_concurrency=2, min_interval_seconds=0.1, jitter_seconds=0.02),
+    # 网关实测存在瞬时 5xx 抖动，冷却期放短一些以便尽快恢复主数据源。
+    "promax": SupplierPolicy(
+        max_concurrency=4, min_interval_seconds=0.05, jitter_seconds=0.02,
+        failure_threshold=5, cooldown_seconds=30.0,
+    ),
     "yahoo": SupplierPolicy(max_concurrency=3, min_interval_seconds=0.05, jitter_seconds=0.02),
     "tickflow": SupplierPolicy(max_concurrency=3, min_interval_seconds=0.05, jitter_seconds=0.02),
     "cninfo": SupplierPolicy(max_concurrency=2, min_interval_seconds=0.2, jitter_seconds=0.05),
@@ -147,6 +152,9 @@ def supplier_family_for_name(name: str) -> str:
         return "eastmoney"
     if "tencent" in normalized or normalized in {"akshare_qq", "akshareqqfetcher"}:
         return "tencent"
+    # Promax 是独立的第三方网关，与 Tushare 官方共享熔断状态会互相误伤。
+    if "promax" in normalized:
+        return "promax"
     if "tushare" in normalized:
         return "tushare"
     if "yfinance" in normalized or "alphavantage" in normalized or "finnhub" in normalized:

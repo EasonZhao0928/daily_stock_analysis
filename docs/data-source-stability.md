@@ -17,13 +17,15 @@
 
 | 场景 | 已接入源 | 默认使用方式 | 失败处理 |
 | --- | --- | --- | --- |
-| A 股日线 / 技术面 | Efinance、Tencent、AkShare、Tushare、Pytdx、Baostock、YFinance | `DataFetcherManager` 按优先级尝试；配置 `TUSHARE_TOKEN` 后 Tushare 自动进入候选源 | 单源失败后尝试下一个源；连续失败会短期熔断该源 |
-| A 股实时行情 | Tencent、AkShare Sina、Efinance、AkShare EM、Tushare | `REALTIME_SOURCE_PRIORITY` 控制顺序，默认偏向 Tencent / Sina 这类轻量源 | 失败源记录 `fallback_from`，成功源继续返回 |
+| A 股日线 / 技术面 | Promax、Efinance、Tencent、AkShare、Tushare、Pytdx、Baostock、YFinance | `DataFetcherManager` 按优先级尝试；配置 `PROMAX_API_KEY` 后 Promax 以 `-2` 居首，配置 `TUSHARE_TOKEN` 后 Tushare 以 `-1` 次之 | 单源失败后尝试下一个源；连续失败会短期熔断该源 |
+| A 股实时行情 | Promax、Tencent、AkShare Sina、Efinance、AkShare EM、Tushare | `REALTIME_SOURCE_PRIORITY` 控制顺序；未显式配置时，检测到 `PROMAX_API_KEY` / `TUSHARE_TOKEN` 会自动前插 `promax` / `tushare` | 失败源记录 `fallback_from`，成功源继续返回 |
 | A 股大盘复盘 | TickFlow、AkShare、Tushare、Efinance | 配置 `TICKFLOW_API_KEY` 后，主指数和市场宽度优先尝试 TickFlow | TickFlow 权限不足或失败时回退 AkShare / Tushare / Efinance 链路 |
+| A 股大盘复盘新闻 | 财联社电报（AkShare `stock_info_global_cls`，零 Key）+ 已配置的搜索引擎（Tavily/SerpAPI/Bocha/Anspire/MiniMax/Brave/SearXNG） | 仅 `region=cn` 启用；财联社电报作为补充追加到搜索结果里，不替代通用搜索 | 财联社失败或返回空不影响已有搜索结果；未配置任何搜索引擎时财联社电报仍可独立提供基础新闻，不再是"没配搜索 Key 就完全没有市场新闻" |
 | 选股快照 | Tushare、Sina、Efinance、AkShare EM、EastMoney Datacenter | 有 `TUSHARE_TOKEN` 时自动把 `tushare` 放入快照优先级；否则使用免费源链路 | 选股引擎维护 source health；状态接口透出 snapshot/daily health |
 | 选股日线补特征 | `DataFetcherManager` | 选股引擎优先复用现有日线与缓存链路 | 现有链路失败后才回到引擎自身的日线源 |
 | 选股热点题材 | EastMoney provider、参考 AlphaSift 的 hotspot 实现、last-good cache | 未指定 provider 时默认使用 EastMoney provider | 实时失败时回退热点缓存；无缓存时返回稳定空态和可读错误 |
-| 港股 / 美股 | Longbridge、YFinance、AkShare、Tushare、Finnhub、AlphaVantage、Stooq | 配置 Longbridge 凭证后参与港美股日线/实时兜底；YFinance 保持基础兜底 | Longbridge 冷却或失败时回退 YFinance / 其他可用源 |
+| 港股 | Promax、Longbridge、YFinance、AkShare、Tushare | Promax 覆盖港股日线（`hk_daily`），配置后优先于其他源 | 网关抖动时回退 Longbridge / YFinance / AkShare |
+| 美股 | Longbridge、YFinance、Finnhub、AlphaVantage、Stooq | **Promax 不参与美股**：`us_daily` 传日期区间会触发网关 5xx，实时行情也不覆盖美股，已在 `_DAILY_MARKET_FETCHER_SUPPORT` 中限定为 `{cn, hk}` | Longbridge 冷却或失败时回退 YFinance / 其他可用源 |
 
 ## 总体链路图
 
@@ -129,6 +131,32 @@ flowchart TD
 REALTIME_SOURCE_PRIORITY=tencent,akshare_sina,efinance,akshare_em
 ENABLE_EASTMONEY_PATCH=true
 ```
+
+### Promax 网关模式（A 股 / 港股优先）
+
+适合希望用单一聚合网关覆盖 A 股与港股主链路的场景。Promax 聚合 Tushare Pro 多类接口，
+响应体与 Tushare 官方完全一致，配置后以优先级 `-2` 排在所有数据源之前；
+免费源与 Tushare 官方继续作为兜底，网关抖动时自动回落。
+
+```env
+PROMAX_API_KEY=your_promax_key
+# 以下均为可选，留空使用默认值
+# PROMAX_BASE_URL=https://pcd.mobcvb.cn/tushare/pro
+# PROMAX_PRIORITY=-2
+# PROMAX_VERIFY_SSL=false      # 默认关闭校验；实测网关证书可信，建议改 true
+# PROMAX_MAX_RETRIES=2         # 瞬时读超时 / 5xx 的重试次数
+```
+
+注意事项：
+
+- **美股不走此源。** 网关 `us_daily` 传 `start_date` / `end_date` 会稳定返回 5xx，
+  实时行情接口也不覆盖美股，因此美股仍由 YFinance / Finnhub / Longbridge 提供。
+- **网关存在瞬时抖动。** 实测存在偶发读超时与 5xx，客户端内置有限重试
+  （轻量接口默认 3 次，线性退避）；全市场重型调用则不重试、超时即让位，避免
+  重试把一次失败放大成分钟级阻塞。重试耗尽后交由 `DataFetcherManager` 回落下游源。
+- **默认关闭 TLS 证书校验。** 这会让 `X-API-Key` 与行情数据面临中间人风险；
+  实测网关证书可信，可设 `PROMAX_VERIFY_SSL=true` 开启校验。
+- Promax 使用独立的熔断家族 `promax`，不与 Tushare 官方共享熔断状态。
 
 ### A 股稳定模式
 
